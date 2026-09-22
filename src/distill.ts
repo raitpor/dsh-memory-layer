@@ -88,6 +88,12 @@ const FIELD_LIMITS = {
   items: 20,
   files: 40,
   tags: 8,
+  /** 摘要里「请求」一行的字符上限。 */
+  request: 200,
+  /** 摘要里「结果」一行的字符上限。 */
+  result: 240,
+  /** 摘要里「过程」一行最多列出几类工具。 */
+  processTools: 8,
   techniqueName: 160,
   techniqueWhen: 240,
   techniqueSummary: 600,
@@ -355,7 +361,37 @@ const TODO_MARKERS = ['下一步', '接下来', '待办', 'todo', '剩下', '后
 const FILE_RE = /(?:^|[\s“"'([])((?:[\w.@-]+\/)*[\w.@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|yml|yaml|toml|py|go|rs|java|kt|sh|sql|css|html|vue))(?=[\s”"'),:;]|$)/gu
 
 /**
+ * 宿主注入块的起始标记。
+ *
+ * dsh 会把运行时快照、本插件的召回块、失败预警都作为 `user/message` 事件发出 ——
+ * 它们是框架输出，不是用户说的话，捕获端必须整条挡掉。
+ */
+const INJECTED_CONTEXT_MARKERS = [
+  'Current runtime context.',
+  'Recalled memory from earlier sessions',
+  'Mistakes that already happened repeatedly',
+] as const
+
+/**
+ * 判断一条 user/message 是否整条都是宿主注入的上下文块。
+ *
+ * 只认开头：真正的用户请求可能**提到**这些词（例如「刚才那段 Recalled memory 是什么意思」），
+ * 但不会以块首标记起头。按前缀判定既能挡住注入块，也不会误伤这类提问。
+ *
+ * @param text - 该条 user/message 的纯文本。
+ * @returns 整条都是注入块时为 true。
+ */
+export function isInjectedContext(text: string): boolean {
+  const head = text.trimStart()
+  return head.length > 0 && INJECTED_CONTEXT_MARKERS.some(marker => head.startsWith(marker))
+}
+
+/**
  * 本地规则提炼：不调用模型，从轮次要点的文本里抽取结构化记忆。
+ *
+ * 摘要按「请求 → 过程 → 结果」组织，三者都可能是跨会话有用的信息：请求说明要做什么，
+ * 过程记录动了哪些工具，结果给出最后落点。**过程只留去重后的工具类别**，重复调用不重复
+ * 记账 —— 原始工具流水既撑爆注入窗口，又会在召回后被下一轮会话重新捕获、逐次放大。
  *
  * 规则只做「有明确措辞标记」的抽取，宁可少记也不臆造；因此它产出的
  * `facts` 通常比模型路径少，但绝不引入会话里没出现过的内容。
@@ -368,7 +404,7 @@ export function distillWithRules(transcript: Transcript): DistilledMemory {
   const decisions: string[] = []
   const todos: string[] = []
   const facts: SemanticDraft[] = []
-  const tags = new Set<string>()
+  const tools = new Set<string>()
   const userTexts: string[] = []
   const assistantTexts: string[] = []
 
@@ -376,7 +412,7 @@ export function distillWithRules(transcript: Transcript): DistilledMemory {
     if (turn.user.length > 0) userTexts.push(turn.user)
     if (turn.assistant.length > 0) assistantTexts.push(turn.assistant)
     for (const file of turn.files) files.add(file)
-    for (const tool of turn.tools) tags.add(tool.toLowerCase())
+    for (const tool of turn.tools) tools.add(tool)
 
     for (const sentence of sentences(turn.user)) {
       if (push(facts.map(item => item.text), sentence, PREFERENCE_MARKERS)) {
@@ -393,15 +429,18 @@ export function distillWithRules(transcript: Transcript): DistilledMemory {
     }
   }
 
-  const titlesFrom = userTexts[0] ?? assistantTexts[0] ?? ''
-  const title = clip(firstLine(titlesFrom), FIELD_LIMITS.title) || 'untitled session'
+  const request = userTexts[0] ?? ''
+  const result = assistantTexts.at(-1) ?? ''
+  const title = clip(firstLine(request), FIELD_LIMITS.title) || 'untitled session'
   const summary = clip(
     [
       `会话共 ${transcript.turns.length} 轮。`,
-      titlesFrom.length > 0 ? `首个请求：${clip(firstLine(titlesFrom), 200)}` : '',
-      files.size > 0 ? `涉及文件：${[...files].slice(0, 8).join(', ')}` : '',
+      request.length > 0 ? `请求：${clip(collapse(request), FIELD_LIMITS.request)}` : '',
+      processLine(tools),
+      result.length > 0 ? `结果：${clip(collapse(result), FIELD_LIMITS.result)}` : '',
       decisions.length > 0 ? `决定：${decisions.slice(0, 3).join(' ｜ ')}` : '',
       todos.length > 0 ? `待办：${todos.slice(0, 3).join(' ｜ ')}` : '',
+      files.size > 0 ? `文件：${[...files].slice(0, 8).join(', ')}` : '',
     ]
       .filter(part => part.length > 0)
       .join(' '),
@@ -414,11 +453,35 @@ export function distillWithRules(transcript: Transcript): DistilledMemory {
     decisions: dedupe(decisions).slice(0, FIELD_LIMITS.items),
     todos: dedupe(todos).slice(0, FIELD_LIMITS.items),
     files: [...files].slice(0, FIELD_LIMITS.files),
-    tags: [...tags].slice(0, FIELD_LIMITS.tags),
+    // 检索标签只放技术栈这类稳定、可复用的关键词。工具名不再进 tags：过程信息已经作为
+    // 「过程」一行进入摘要（`episodicText` 会索引 summary），再进 tags 只会让召回块被
+    // bash/read/edit 这类通用词淹没，并随「召回 → 再捕获」循环自我放大。
+    tags: stackTags(transcript.stack),
     facts: facts.slice(0, FIELD_LIMITS.items),
     // 规则路径不产出技巧：技巧需要跨会话可复用的抽象，靠会话末的模型反思或代码挖掘产出。
     techniques: [],
   })
+}
+
+/** 「过程」一行：只列去重后的工具类别，超出上限时补一个总数。 */
+function processLine(tools: ReadonlySet<string>): string {
+  const list = [...tools]
+  if (list.length === 0) return ''
+  const shown = list.slice(0, FIELD_LIMITS.processTools)
+  const rest = list.length - shown.length
+  return `过程：${shown.join('、')}${rest > 0 ? ` 等 ${list.length} 类工具` : ''}`
+}
+
+/** 规则路径的检索标签：只取技术栈语言，画像缺失时留空。 */
+function stackTags(stack: StackProfile | undefined): string[] {
+  return (stack?.languages ?? [])
+    .map(language => language.toLowerCase())
+    .slice(0, FIELD_LIMITS.tags)
+}
+
+/** 把一段文本压成单行：折叠全部空白，便于放进摘要的一行里。 */
+function collapse(text: string): string {
+  return text.replace(/\s+/gu, ' ').trim()
 }
 
 /** 命中任一标记即返回 true，用于把一句话归入某一类。 */

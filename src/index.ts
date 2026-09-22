@@ -38,7 +38,7 @@ import type { StoreCodec } from './crypto.js'
 import { MemoryStore, MAX_SUMMARY_CHARS, MINE_CACHE_FILE, emptyMetrics, techniqueText } from './store.js'
 import { recall, recallTechniques, toDocs, toTechniqueDocs, tokenize } from './recall.js'
 import type { RecallDoc } from './recall.js'
-import { distill } from './distill.js'
+import { distill, isInjectedContext } from './distill.js'
 import type { LlmTextCaller, Transcript } from './distill.js'
 import { redact, sanitizeForPrompt, sanitizeForText } from './redact.js'
 import { abstractTechniqueDraft, abstractText, identifiersFromPaths } from './abstract.js'
@@ -1465,8 +1465,13 @@ export function apply(ctx: Context, config: Config): void {
         turnOf(state, event.data.turn)
         break
       case 'user/message': {
-        const turn = turnOf(state, state.turns.at(-1)?.turn ?? 0)
+        // dsh 把运行时快照、本插件的召回块、失败预警也作为 user/message 事件发出。
+        // 它们是框架输出，不是用户说的话，必须整条丢弃：旧实现把它们当用户输入、
+        // 又按「保留尾部」截断，于是真正的请求被挤出 captureUserChars 窗口，
+        // 提炼出的「请求」变成上一轮的召回流水，并随「召回 → 再捕获」逐会话放大。
+        if (isInjectedUserMessage(event.data)) break
         const text = messageText(event.data)
+        const turn = turnOf(state, state.turns.at(-1)?.turn ?? 0)
         turn.user = clipTail(`${turn.user}${text}\n`, settings.captureUserChars)
         // 用户纠偏是高价值学习信号：把「用户说了什么是对的」直接记成一条失败经验。
         if (settings.failures && CORRECTION_MARKERS.some(marker => text.toLowerCase().includes(marker))) {
@@ -1861,6 +1866,24 @@ function messageText(message: { content?: unknown }): string {
     if (record.type === 'text' && typeof record.text === 'string') parts.push(record.text)
   }
   return parts.join('\n')
+}
+
+/**
+ * 判断一条 `user/message` 是宿主注入的上下文块，还是用户自己说的话。
+ *
+ * 主判据是**结构性**的：用户输入由前端以 `source.kind === 'user'` 发出，而运行时快照 /
+ * 召回块 / 失败预警由 `@deepseek-ai/dsh-system-prompt` 以 `source.kind === 'plugin'`
+ * 注入。按结构判定不依赖宿主的具体措辞，宿主改写或本地化那句提示也不会让过滤失效。
+ *
+ * 结构信息缺失（或换了一个宿主实现）时退回按块首标记判定；两条都判不出时**保留**这条
+ * 消息 —— 宁可多记一点噪声，也不能丢掉真正的用户请求。
+ *
+ * @param data - `user/message` 事件的数据。
+ * @returns 该消息由宿主注入时为 true。
+ */
+function isInjectedUserMessage(data: { source?: { kind?: unknown }; content?: unknown }): boolean {
+  if (data.source?.kind === 'plugin') return true
+  return isInjectedContext(messageText(data))
 }
 
 /**

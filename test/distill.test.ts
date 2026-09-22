@@ -6,7 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { distill, distillWithModel, distillWithRules } from '../src/distill.js'
+import { distill, distillWithModel, distillWithRules, isInjectedContext } from '../src/distill.js'
 import type { Transcript } from '../src/distill.js'
 import type { LiveTurn } from '../src/types.js'
 
@@ -36,7 +36,53 @@ test('规则提炼抽取偏好、待办与文件', () => {
   assert.ok(memory.files.includes('src/store.ts'))
   assert.ok(memory.files.includes('test/store.test.ts'))
   assert.ok(memory.title.includes('pnpm'))
-  assert.ok(memory.summary.includes('涉及文件'))
+  assert.ok(memory.summary.includes('文件：'))
+})
+
+test('规则摘要按「请求 → 过程 → 结果」组织', () => {
+  const memory = distillWithRules(transcript)
+  assert.ok(memory.summary.includes('请求：我喜欢用 pnpm'), '请求取自首轮用户输入')
+  assert.ok(memory.summary.includes('过程：read_file、edit_file'), '过程列出去重后的工具类别')
+  assert.ok(memory.summary.includes('结果：已按 JSONL 落盘。'), '结果取自最后一条助手输出')
+  // 顺序：请求 → 过程 → 结果。
+  assert.ok(
+    memory.summary.indexOf('请求：') < memory.summary.indexOf('过程：')
+    && memory.summary.indexOf('过程：') < memory.summary.indexOf('结果：'),
+  )
+})
+
+test('过程只记一次工具，重复调用不重复记账，且不再污染检索标签', () => {
+  const memory = distillWithRules({
+    turns: [
+      turn({ turn: 1, user: '先跑一遍测试。', tools: ['bash', 'read'] }),
+      turn({ turn: 2, user: '再跑一遍。', tools: ['bash', 'read', 'edit'] }),
+      turn({ turn: 3, user: '继续。', tools: ['bash'] }),
+    ],
+  })
+  assert.ok(memory.summary.includes('过程：bash、read、edit'))
+  assert.equal(memory.summary.match(/bash/gu)?.length, 1, '同一工具重复调用只记一次')
+  assert.deepEqual(memory.tags, [], '工具名不再作为检索标签')
+})
+
+test('检索标签只取技术栈语言并小写', () => {
+  const memory = distillWithRules({
+    stack: { languages: ['TypeScript', 'TSX'] },
+    turns: [turn({ user: '随便聊聊。' })],
+  })
+  assert.deepEqual(memory.tags, ['typescript', 'tsx'])
+})
+
+test('宿主注入块被识别，用户提问不会被误伤', () => {
+  assert.equal(
+    isInjectedContext('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nCurrent DSH file policy: …'),
+    true,
+  )
+  assert.equal(isInjectedContext('Recalled memory from earlier sessions (stored locally by dsh-memory-layer).\n…'), true)
+  assert.equal(isInjectedContext('Mistakes that already happened repeatedly in earlier sessions'), true)
+  assert.equal(isInjectedContext('  \n  Current runtime context. …'), true, '前导空白不影响判定')
+  assert.equal(isInjectedContext('你刚在另一个会话做了什么'), false)
+  assert.equal(isInjectedContext('刚才那段 Recalled memory 是什么意思？'), false, '只匹配开头，不误伤提问')
+  assert.equal(isInjectedContext(''), false)
 })
 
 test('规则提炼不臆造会话里没有的文件', () => {

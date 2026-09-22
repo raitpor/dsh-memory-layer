@@ -156,9 +156,25 @@ function event(type: string, data: unknown): never {
   return { type, seq: 1, time: Date.now(), data } as never
 }
 
-/** 一条用户消息事件。 */
+/** 一条用户消息事件（真实 dsh 的 `source.kind` 是 `user`）。 */
 function userMessage(text: string): never {
-  return event('user/message', { id: 'm1', role: 'user', content: [{ type: 'text', text }], source: { kind: 'human' } })
+  return event('user/message', { id: 'm1', role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
+}
+
+/**
+ * 一条宿主注入的上下文消息。
+ *
+ * 复刻真实 dsh：运行时快照 / 召回块 / 失败预警由 `@deepseek-ai/dsh-system-prompt`
+ * 以 `source.kind === 'plugin'` 作为 `user/message` 发出。
+ * @param text - 注入的纯文本。
+ */
+function injectedMessage(text: string): never {
+  return event('user/message', {
+    id: 'm-injected',
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' },
+  })
 }
 
 /** 一条助手消息事件。 */
@@ -354,6 +370,43 @@ test('会话 dispose 时兜底提炼', async () => {
 
     const records = await new MemoryStore(root).readEpisodic('project', '/work/demo')
     assert.equal(records.length, 1, 'dispose 也应落盘')
+  } finally {
+    await dispose()
+  }
+})
+
+test('宿主注入的上下文块不会顶掉真正的用户请求', async () => {
+  // 回归用例：dsh 把运行时快照、本插件的召回块、失败预警都作为独立的
+  // `user/message` 事件发出。旧实现把它们当用户输入、又按「保留尾部」截断，
+  // 真正的请求被挤出 captureUserChars 窗口，提炼出的请求于是变成上一轮的
+  // 召回流水，并随「召回 → 再捕获」逐会话放大。
+  const { fake, root, dispose } = await setup()
+  try {
+    const session = fakeSession()
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('帮我把提炼规则里的工具流水去掉。'))
+    // 结构化注入：正文刻意不含任何已知标记词，只有 `source.kind` 能识别它。
+    fake.emit('session/event', session, injectedMessage('宿主上下文：bash todo_write read write edit src/index.ts package.json'))
+    // 措辞兜底：模拟结构信息缺失、只能靠块首标记识别的宿主实现。
+    fake.emit('session/event', session, userMessage([
+      'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.',
+      '',
+      'Recalled memory from earlier sessions (stored locally by dsh-memory-layer).',
+      '--- BEGIN UNTRUSTED MEMORY ---',
+      '1. (past session) 涉及文件：bash todo_write read write edit src/index.ts package.json',
+      '--- END UNTRUSTED MEMORY ---',
+    ].join('\n')))
+    fake.emit('session/event', session, assistantMessage(1, '已把过程压成去重后的工具类别。'))
+    fake.emit('session/event', session, event('turn/end', { turn: 1, reason: 'completed' }))
+    await fake.flush()
+
+    const records = await new MemoryStore(root).readEpisodic('project', '/work/demo')
+    const summary = records.at(-1)?.summary ?? ''
+    assert.ok(summary.includes('请求：帮我把提炼规则里的工具流水去掉。'), summary)
+    assert.ok(!summary.includes('宿主上下文'), 'source.kind=plugin 的注入块不应被当成用户请求')
+    assert.ok(!summary.includes('Current runtime context'), '运行时快照不应进入摘要')
+    assert.ok(!summary.includes('todo_write'), '召回块不应被当成用户请求')
   } finally {
     await dispose()
   }

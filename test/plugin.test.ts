@@ -11,14 +11,15 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { apply } from '../src/index.js'
 import type { Config } from '../src/index.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
+import { parseSkillFrontmatter, verifySkill } from '../src/skill.js'
 
 /** 一段注入到 system prompt 的注册记录。 */
 interface PromptEntry {
@@ -304,7 +305,8 @@ test('注册四个记忆工具并可实际检索', async () => {
       [
         'failure_forgive', 'failure_list', 'failure_resolve',
         'memory_forget', 'memory_save', 'memory_search', 'memory_stats',
-        'technique_apply', 'technique_forget', 'technique_get', 'technique_save', 'technique_search',
+        'technique_apply', 'technique_export', 'technique_forget', 'technique_get',
+        'technique_learn', 'technique_save', 'technique_search',
       ],
     )
 
@@ -1132,6 +1134,198 @@ test('P2-④b 完全缺少 tools 服务时仍记录失败且不抛错', async ()
     assert.equal(fake.guards.length, 0, '没有 tools 服务就不登记守卫')
     assert.ok(fake.logs.some(line => line.includes('tools service is absent')))
   } finally {
+    await dispose()
+  }
+})
+
+// ---- 代码挖掘：P3 端到端（工具 → 扫描 → 候选 → 落盘 → 缓存） ----------------
+
+test('technique_learn 从真实代码库挖掘并落盘为草稿，且不泄露项目路径', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-mine-repo-'))
+  try {
+    await mkdir(join(repo, 'src/app'), { recursive: true })
+    await mkdir(join(repo, 'src/client'), { recursive: true })
+    await writeFile(join(repo, 'src/app/handler.ts'), [
+      "import { client } from '../client/client'",
+      'export function handle(event: Event) {',
+      '  client.send(event.payload)',
+      '  client.send(event.payload, { retry: true })',
+      '  AuditLog.record("handled")',
+      '  AuditLog.record("handled.again")',
+      '}',
+    ].join('\n'), 'utf8')
+    await writeFile(join(repo, 'src/client/client.ts'), [
+      'export const client = {',
+      '  send: (payload: unknown) => Transport.post(payload),',
+      '}',
+      'export const ping = () => Transport.post({})',
+    ].join('\n'), 'utf8')
+
+    const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+    try {
+      fake.emit('session/created', fakeSession('s1', repo))
+      await fake.flush()
+
+      const report = String(await toolOf(fake, 'technique_learn').execute(
+        { path: repo } as never, undefined as never,
+      ))
+      assert.match(report, /candidates: [1-9]/u, `应产出候选：${report}`)
+      assert.match(report, /stored as drafts: [1-9]/u, `应落盘草稿：${report}`)
+
+      const records = await new MemoryStore(root).readTechniques('global')
+      assert.ok(records.length > 0)
+      assert.ok(records.every(record => record.status === 'draft'), '挖掘产出的是草稿，不参与自动注入')
+      assert.ok(records.some(record => record.kind === 'api-usage'))
+      assert.ok(records.every(record => record.evidence.some(item => item.kind === 'code')))
+      assert.ok(
+        !JSON.stringify(records).includes(repo),
+        '真实仓库路径不得进入技巧库（证据必须是抽象描述 + 仓库别名）',
+      )
+
+      // 二次挖掘：未变文件应命中缓存，不再重复分析。
+      const second = String(await toolOf(fake, 'technique_learn').execute(
+        { path: repo } as never, undefined as never,
+      ))
+      assert.match(second, /\(2 cached/u, `二次挖掘应命中全部未变文件：${second}`)
+      assert.match(second, /clusters: 0/u, '全部命中缓存时不再产生候选，这正是增量挖掘的目的')
+    } finally {
+      await dispose()
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true })
+  }
+})
+
+// ---- 生命周期与导出：P4 验收（设计 §16 P4 行） ------------------------------
+
+test('P4-① technique_apply 的成功/失败计数驱动状态迁移', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create',
+      when: 'integrating the orders client',
+      summary: 'Call authorize first.',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    assert.ok(id !== '', saved)
+
+    const before = await new MemoryStore(root).readTechniques('global')
+    assert.equal(before[0]?.status, 'draft')
+
+    assert.match(String(await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success' } as never, undefined as never,
+    )), /validated/u)
+    assert.equal((await new MemoryStore(root).readTechniques('global'))[0]?.status, 'validated')
+
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'failure' } as never, undefined as never)
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'failure' } as never, undefined as never)
+    const deprecated = await new MemoryStore(root).readTechniques('global')
+    assert.equal(deprecated[0]?.status, 'deprecated', '连续失败应废弃，避免继续误导')
+    assert.equal(deprecated[0]?.successes, 1)
+    assert.equal(deprecated[0]?.failures, 2)
+  } finally {
+    await dispose()
+  }
+})
+
+test('P4-② technique_export 产出合法 SKILL.md，描述含可检索的触发词', async () => {
+  const skillDir = await mkdtemp(join(tmpdir(), 'dsh-skill-export-'))
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, skillExportDir: skillDir })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create',
+      when: 'integrating the orders client',
+      summary: 'Call authorize before create, otherwise the client returns 401 instead of throwing.',
+      kind: 'api-usage',
+      apiSymbols: ['OrdersClient.authorize'],
+      tags: ['orders'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success' } as never, undefined as never)
+
+    const report = String(await toolOf(fake, 'technique_export').execute({ id } as never, undefined as never))
+    assert.match(report, /Exported/u, report)
+    const file = /Path: (.+)$/mu.exec(report)?.[1]?.trim() ?? ''
+    assert.ok(file.endsWith('SKILL.md'), report)
+
+    const markdown = await readFile(file, 'utf8')
+    const front = parseSkillFrontmatter(markdown)
+    assert.ok(front !== undefined, '导出产物必须有合法前言')
+    assert.match(front.values.name ?? '', /^[A-Za-z0-9_-]{1,64}$/u)
+    // 描述是唯一被语义检索索引的字段，必须带上「做什么」与「何时用」。
+    assert.match(front.values.description ?? '', /authorize before create/u)
+    assert.match(front.values.description ?? '', /integrating the orders client/u)
+    assert.deepEqual(verifySkill(markdown), { ok: true })
+
+    // 目录布局必须是 <目录>/<name>/SKILL.md —— 加载器按这个约定发现技能。
+    assert.equal(basename(dirname(file)), front.values.name)
+  } finally {
+    await rm(skillDir, { recursive: true, force: true })
+    await dispose()
+  }
+})
+
+test('P4-②b 草稿不得导出为 skill', async () => {
+  const skillDir = await mkdtemp(join(tmpdir(), 'dsh-skill-draft-'))
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, skillExportDir: skillDir })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'unverified guess', when: 'some trigger', summary: 'not verified yet',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    const refused = String(await toolOf(fake, 'technique_export').execute({ id } as never, undefined as never))
+    assert.match(refused, /Refused/u)
+    assert.match(refused, /draft/u)
+    assert.deepEqual(await readdir(skillDir), [], '拒绝时不得写入任何文件')
+  } finally {
+    await rm(skillDir, { recursive: true, force: true })
+    await dispose()
+  }
+})
+
+test('P4-③ confidential 技巧无法导出为 skill', async () => {
+  const skillDir = await mkdtemp(join(tmpdir(), 'dsh-skill-conf-'))
+  const counter = { calls: 0 }
+  const payload = techniquePayload({
+    kind: 'business-rule',
+    name: '订单在已发货状态下不可取消',
+    when: '处理取消请求时',
+    summary: '只有未发货订单允许取消。',
+    sensitivity: 'confidential',
+  })
+  // 技巧留在项目域，因此 confidential 记录能落盘（默认不能进全局域）。
+  const { fake, root, dispose } = await setup(
+    { provider: 'test', model: 'test', reflectMinTurns: 1, skillExportDir: skillDir, layerScopes: { technique: 'project' } },
+    true,
+    { llm: fakeLlm(payload, counter) },
+  )
+  try {
+    await runSession(fake, fakeSession('s1', '/work/demo'), '记一下订单取消规则。', ['src/OrderPolicy.java'])
+    fake.emit('session/disposed', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+
+    const records = await new MemoryStore(root).readTechniques('project', '/work/demo')
+    assert.equal(records.length, 1)
+    assert.equal(records[0]?.sensitivity, 'confidential')
+
+    // 先让它变成已验证，确认拒绝的原因是敏感级别而不是状态。
+    await toolOf(fake, 'technique_apply').execute(
+      { id: records[0]?.id ?? '', outcome: 'success' } as never, undefined as never,
+    )
+    const refused = String(await toolOf(fake, 'technique_export').execute(
+      { id: records[0]?.id ?? '' } as never, undefined as never,
+    ))
+    assert.match(refused, /Refused/u)
+    assert.match(refused, /confidential/u, '业务机密一旦进入共享域就不可撤回，必须拒绝')
+    assert.deepEqual(await readdir(skillDir), [], '拒绝时不得写入任何文件')
+  } finally {
+    await rm(skillDir, { recursive: true, force: true })
     await dispose()
   }
 })

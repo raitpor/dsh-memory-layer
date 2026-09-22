@@ -131,6 +131,9 @@ export function techniqueIndexLine(record: TechniqueRecord): string {
     `id ${record.id}`,
   ]
   if (record.status !== 'draft') parts.splice(1, 0, `[${record.status}]`)
+  if (record.conflictsWith !== undefined && record.conflictsWith.length > 0) {
+    parts.push(`同一触发下另有做法: ${record.conflictsWith.join(', ')}`)
+  }
   return parts.filter(part => part.length > 0).join(' — ')
 }
 

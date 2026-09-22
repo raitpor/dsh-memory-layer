@@ -307,6 +307,14 @@ export interface TechniqueRecord {
   tags: string[]
   /** 证据链。 */
   evidence: TechniqueEvidence[]
+  /**
+   * 同一触发条件下**另外的做法**的记录 id。
+   *
+   * 用途是「显式呈现分歧」而不是静默择一：两条技巧都适用时，模型应该看到还有别解，
+   * 而不是被悄悄喂给其中一条。判定是**保守的近似** —— 触发条件相同即视为可能冲突，
+   * 不做语义蕴含判断（那会引入误判）。
+   */
+  conflictsWith?: string[]
   /** 是否通过去标识化校验；未通过者不得进入全局域。 */
   deidentified: boolean
   /** 被召回次数。 */

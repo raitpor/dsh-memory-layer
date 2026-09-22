@@ -75,7 +75,20 @@
         failurePreventWindowTurns: 3
         # 归一化错误模板的字符上限
         fingerprintTemplateMaxChars: 200
-        # 暴露 memory_* 与 technique_* 工具
+        # 代码挖掘（technique_learn）：显式触发、成本受限
+        mineUseModel: true
+        mineMaxFiles: 200
+        mineMaxBytes: 524288
+        mineMaxModelCalls: 8
+        mineMinOccurrences: 2
+        mineTimeoutMs: 120000
+        mineInclude: []
+        mineExclude: []
+        # 导出 SKILL.md 的目标目录；留空即 $DSH_HOME/skills（通常 ~/.dsh/skills）
+        skillExportDir: null
+        # 写入 SKILL.md 前言 allowed-tools 的白名单；留空则不写该字段
+        skillAllowedTools: []
+        # 暴露 memory_* / technique_* / failure_* 工具
         registerTools: true
         # 会话结束提炼的超时；超时或缺少 llm 时自动回退到规则提炼
         distillTimeoutMs: 30000

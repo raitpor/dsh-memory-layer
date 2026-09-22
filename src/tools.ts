@@ -205,6 +205,19 @@ export interface TechniqueToolDeps {
    * @returns 删除结果说明。
    */
   forget(id: string, wipeAll: boolean): Promise<string>
+  /**
+   * 把一条已验证技巧导出成标准 `SKILL.md`。
+   * @param id - 技巧 id。
+   * @returns 导出结果说明（含落盘路径）。
+   */
+  exportSkill(id: string): Promise<string>
+  /**
+   * 从一个代码仓库挖掘可复用技巧。
+   * @param path - 仓库路径；缺省为当前会话工作目录。
+   * @param useModel - 是否允许调用模型归纳（默认允许；无模型时自动只走规则路径）。
+   * @returns 挖掘报告。
+   */
+  learn(path: string | undefined, useModel: boolean): Promise<string>
 }
 
 /**
@@ -318,6 +331,48 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
       },
       async execute(args) {
         return deps.apply(args.id, args.outcome === 'failure' ? 'failure' : 'success')
+      },
+    }),
+
+    defineTool({
+      name: 'technique_export',
+      description: [
+        'Materialise one verified technique as a standard SKILL.md under the local skills directory,',
+        'so it becomes available to every harness rather than only to this memory plugin.',
+        'Only verified techniques can be exported, and confidential knowledge is refused.',
+        'Do this when the user asks to turn a learned technique into a reusable skill.',
+      ].join(' '),
+      parameters: {
+        id: { type: 'string', required: true, description: 'Technique id returned by technique_search.' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: value }],
+      },
+      async execute(args) {
+        return deps.exportSkill(args.id)
+      },
+    }),
+
+    defineTool({
+      name: 'technique_learn',
+      description: [
+        'Mine reusable techniques from an existing code repository: how a proprietary API is called,',
+        'which business rules hold, which build configuration is required.',
+        'This is an explicit, budgeted operation — it scans many files, so run it when the user asks to learn',
+        'from a code base, not on every task. Produced entries are unverified drafts.',
+        'It stores summarised knowledge, never copies of the implementation.',
+      ].join(' '),
+      parameters: {
+        path: { type: 'string', description: 'Repository path to mine. Defaults to the current working directory.' },
+        useModel: { type: 'boolean', description: 'Allow model-assisted induction (default true; rule-only when no model route exists).' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: value }],
+      },
+      async execute(args) {
+        return deps.learn(args.path, args.useModel !== false)
       },
     }),
 

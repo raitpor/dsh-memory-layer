@@ -192,12 +192,15 @@ function normalize(input: unknown, stack: StackProfile | undefined): DistilledMe
     files: strings(record.files, FIELD_LIMITS.files, 240),
     tags: strings(record.tags, FIELD_LIMITS.tags, 48).map(tag => tag.toLowerCase()),
     facts: facts(record.facts),
-    techniques: techniques(record.techniques, stack),
+    techniques: normalizeTechniqueDrafts(record.techniques, stack),
   }
 }
 
 /**
  * 校验并裁剪模型给出的技巧草稿。
+ *
+ * 导出供代码挖掘（`mine.ts`）复用：两条路径产出的技巧必须过同一套校验，
+ * 否则「反思入库的技巧」与「挖掘入库的技巧」会在形状与限额上分叉。
  *
  * 校验刻意严格：**名称、触发条件、说明三者缺一即丢弃**。技巧是「可直接执行的操作」，
  * 残缺条目进入全局域后只会污染注入，不如不要。
@@ -206,7 +209,7 @@ function normalize(input: unknown, stack: StackProfile | undefined): DistilledMe
  * @param stack - 当前项目的技术栈，作为这些技巧的适用栈。
  * @returns 校验后的草稿数组。
  */
-function techniques(input: unknown, stack: StackProfile | undefined): TechniqueDraft[] {
+export function normalizeTechniqueDrafts(input: unknown, stack: StackProfile | undefined): TechniqueDraft[] {
   if (!Array.isArray(input)) return []
   const out: TechniqueDraft[] = []
   for (const entry of input) {

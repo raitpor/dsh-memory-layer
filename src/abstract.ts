@@ -12,6 +12,7 @@
  */
 
 import { redact } from './redact.js'
+import type { TechniqueDraft, TechniqueEvidence } from './types.js'
 
 /** 占位符种类：只暴露「这是个什么」，不暴露「它叫什么」。 */
 export type PlaceholderKind = 'Class' | 'pkg' | 'CONST' | 'id'
@@ -180,4 +181,156 @@ export function findIdentifierLeaks(text: string, identifiers: readonly string[]
     }
   }
   return out
+}
+
+// ---- 技巧草稿的抽象化与泄漏校验 ---------------------------------------------
+
+/** 抽象化一条技巧草稿的选项。 */
+export interface AbstractDraftOptions {
+  /** 项目私有标识（通常由 {@link identifiersFromPaths} 从工作区路径推导）。 */
+  identifiers?: readonly string[]
+  /** 是否启用自动识别；默认关闭（会误伤库符号）。 */
+  autoDetect?: boolean
+  /** 示例行数上限。 */
+  exampleMaxLines?: number
+  /** 示例字符数上限。 */
+  exampleMaxChars?: number
+  /**
+   * 证据链覆盖。
+   *
+   * 提供时**替换**草稿自带的证据（会话反思用会话来源，代码挖掘用代码来源）；
+   * 不提供则保留草稿原有证据。
+   */
+  evidence?: readonly TechniqueEvidence[]
+}
+
+/**
+ * 对一条技巧草稿做去标识化与限额收敛。
+ *
+ * 这是「入库的是知识，不是代码」原则的执行点：所有进入全局域的技巧都必须经过这里，
+ * 把项目私有标识换成种类化占位符，并把示例压到硬上限内。
+ *
+ * @param draft - 待处理的技巧草稿。
+ * @param options - 抽象化选项。
+ * @returns 可落盘的草稿。
+ */
+export function abstractTechniqueDraft(
+  draft: TechniqueDraft,
+  options: AbstractDraftOptions = {},
+): TechniqueDraft {
+  const identifiers = options.identifiers ?? []
+  const run = (text: string): string =>
+    abstractText(text, {
+      identifiers,
+      ...(options.autoDetect === true ? { autoDetect: true } : {}),
+    }).text
+
+  const maxLines = options.exampleMaxLines ?? 8
+  const maxChars = options.exampleMaxChars ?? 480
+  const example = draft.example === undefined
+    ? undefined
+    : { ...draft.example, code: clipExample(run(draft.example.code), maxLines, maxChars) }
+
+  return {
+    ...draft,
+    name: run(draft.name),
+    when: run(draft.when),
+    summary: run(draft.summary),
+    ...(draft.steps === undefined ? {} : { steps: draft.steps.map(run) }),
+    ...(draft.invariants === undefined ? {} : { invariants: draft.invariants.map(run) }),
+    ...(draft.api === undefined
+      ? {}
+      : {
+        api: draft.api.map(surface => ({
+          symbol: run(surface.symbol),
+          ...(surface.signature === undefined ? {} : { signature: run(surface.signature) }),
+          ...(surface.notes === undefined ? {} : { notes: run(surface.notes) }),
+        })),
+      }),
+    ...(example === undefined ? {} : { example }),
+    pitfalls: draft.pitfalls.map(run),
+    verify: draft.verify.map(run),
+    tags: draft.tags.map(run),
+    ...(draft.domain === undefined ? {} : { domain: run(draft.domain) }),
+    sensitivity: draft.sensitivity ?? 'internal',
+    ...(options.evidence === undefined ? {} : { evidence: [...options.evidence] }),
+  }
+}
+
+/** 示例的硬上限：行数与字符数双重收敛。 */
+function clipExample(code: string, maxLines: number, maxChars: number): string {
+  const lines = code.split(/\r?\n/u).slice(0, Math.max(1, maxLines)).join('\n').trim()
+  return lines.length <= maxChars ? lines : lines.slice(0, Math.max(0, maxChars - 1))
+}
+
+// ---- 泄漏校验（P3） ---------------------------------------------------------
+
+/** 泄漏校验结果。 */
+export interface LeakReport {
+  /** 与来源逐字重合的长片段（词序列）。 */
+  verbatimRuns: string[]
+  /** 仍然残留的项目私有标识。 */
+  identifierHits: string[]
+}
+
+/** 默认的最小连续词数：短于它的重合属于通用措辞，不视为抄录。 */
+export const DEFAULT_LEAK_RUN = 8
+
+/**
+ * 把文本切成**保序**的词序列。
+ *
+ * 与 `recall.ts` 的 BM25 `tokenize` 不同：那个会去停用词、切 bigram，丢失顺序，
+ * 无法用于「连续片段是否逐字照抄」的判断。
+ *
+ * @param text - 任意文本。
+ * @returns 小写词序列。
+ */
+export function wordSequence(text: string): string[] {
+  return text.toLowerCase().match(/[a-z0-9_]+|[\u4e00-\u9fff]/gu) ?? []
+}
+
+/**
+ * 泄漏校验：知识里不得出现来源代码的逐字长片段，也不得残留项目私有标识。
+ *
+ * 为什么需要它：模型被要求「重建而非抄录」，但提示词约束不是硬保证。
+ * 一旦逐字抄录，就会把项目实现（甚至客户端代码）带进全局域 ——
+ * 这既是隐私问题也是许可问题，所以必须是**可测试的硬闸门**。
+ *
+ * @param candidate - 待入库的文本（名称/说明/示例等拼在一起）。
+ * @param source - 来源代码文本。
+ * @param identifiers - 项目私有标识。
+ * @param minRun - 判定合规的连续词数阈值。
+ * @returns 泄漏报告；两项都为空表示通过。
+ */
+export function leakCheck(
+  candidate: string,
+  source: string,
+  identifiers: readonly string[] = [],
+  minRun: number = DEFAULT_LEAK_RUN,
+): LeakReport {
+  const sourceWords = wordSequence(source)
+  const candidateWords = wordSequence(candidate)
+  const verbatimRuns: string[] = []
+
+  if (candidateWords.length >= minRun && sourceWords.length >= minRun) {
+    const sourceGrams = new Set<string>()
+    for (let index = 0; index + minRun <= sourceWords.length; index += 1) {
+      sourceGrams.add(sourceWords.slice(index, index + minRun).join(' '))
+    }
+    for (let index = 0; index + minRun <= candidateWords.length; index += 1) {
+      const gram = candidateWords.slice(index, index + minRun).join(' ')
+      if (sourceGrams.has(gram) && !verbatimRuns.includes(gram)) verbatimRuns.push(gram)
+    }
+  }
+
+  return { verbatimRuns, identifierHits: findIdentifierLeaks(candidate, identifiers) }
+}
+
+/**
+ * 判断泄漏报告是否通过。
+ * @param report - 泄漏报告。
+ * @returns 无泄漏时为 `true`。
+ */
+export function isClean(report: LeakReport): boolean {
+  return report.verbatimRuns.length === 0 && report.identifierHits.length === 0
 }

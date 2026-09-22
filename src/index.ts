@@ -25,6 +25,7 @@
 
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -34,13 +35,20 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import { KEY_ENV, KEY_FILE_NAME, createCodec, resolveKey } from './crypto.js'
 import type { StoreCodec } from './crypto.js'
-import { MemoryStore, MAX_SUMMARY_CHARS, emptyMetrics, techniqueText } from './store.js'
+import { MemoryStore, MAX_SUMMARY_CHARS, MINE_CACHE_FILE, emptyMetrics, techniqueText } from './store.js'
 import { recall, recallTechniques, toDocs, toTechniqueDocs, tokenize } from './recall.js'
 import type { RecallDoc } from './recall.js'
 import { distill } from './distill.js'
 import type { LlmTextCaller, Transcript } from './distill.js'
 import { redact, sanitizeForPrompt, sanitizeForText } from './redact.js'
-import { abstractText, identifiersFromPaths } from './abstract.js'
+import { abstractTechniqueDraft, abstractText, identifiersFromPaths } from './abstract.js'
+import {
+  createRepoView,
+  emptyMineCache,
+  mineRepository,
+  withCacheEntries,
+} from './mine.js'
+import type { MineCache } from './mine.js'
 import { createFileView, detectStack, stackSummary } from './stack/index.js'
 import { applyOutcome, confidenceOf, injectable, techniqueIndexLine } from './technique.js'
 import {
@@ -58,6 +66,7 @@ import {
   shouldWarn,
 } from './failures.js'
 import type { EscalationThresholds, FailureObservation } from './failures.js'
+import { renderSkill, verifySkill } from './skill.js'
 import { createFailureTools, createMemoryTools, createTechniqueTools } from './tools.js'
 import type { FailureToolDeps, MemoryToolDeps, TechniqueSaveInput, TechniqueToolDeps } from './tools.js'
 import type {
@@ -180,6 +189,34 @@ export interface Config {
    * 拦截范围必须窄，这是硬约束。
    */
   failureGuardTools?: string[]
+  /**
+   * 是否允许 `technique_learn` 调用模型归纳。
+   *
+   * 关掉后只有规则路径（零 token、纯结构统计）—— 适合离线或不想为挖掘付费的环境。
+   */
+  mineUseModel?: boolean
+  /** 单次挖掘最多处理的文件数。 */
+  mineMaxFiles?: number
+  /** 单文件字节上限，超过即跳过。 */
+  mineMaxBytes?: number
+  /** 单次挖掘最多调用的模型次数。 */
+  mineMaxModelCalls?: number
+  /** 结构候选成为技巧所需的最小出现次数。 */
+  mineMinOccurrences?: number
+  /** 单次挖掘的总时长上限（毫秒）；超时保留已产出结果。 */
+  mineTimeoutMs?: number
+  /** 额外包含的 glob（给出后只有命中的文件才被分析）。 */
+  mineInclude?: string[]
+  /** 额外排除的 glob。 */
+  mineExclude?: string[]
+  /**
+   * 导出 `SKILL.md` 的目标目录；缺省为 `<DSH_HOME>/skills`（通常 `~/.dsh/skills`）。
+   *
+   * 每条技巧落在 `<目录>/<skill 名>/SKILL.md`。
+   */
+  skillExportDir?: string
+  /** 写入 `SKILL.md` 前言 `allowed-tools` 的白名单；留空则不写该字段。 */
+  skillAllowedTools?: string[]
 }
 
 /** 默认记忆库目录名，落在 dsh home 之下。 */
@@ -313,6 +350,16 @@ export const Config: z<Config> = z.object({
   failurePreventWindowTurns: z.natural().min(1).max(20).default(3),
   fingerprintTemplateMaxChars: z.natural().min(40).max(2000).default(200),
   failureGuardTools: z.array(z.string()).default([...DEFAULT_GUARD_TOOLS]),
+  mineUseModel: z.boolean().default(true),
+  mineMaxFiles: z.natural().min(1).max(5000).default(200),
+  mineMaxBytes: z.natural().min(1024).max(10_000_000).default(524_288),
+  mineMaxModelCalls: z.natural().min(0).max(100).default(8),
+  mineMinOccurrences: z.natural().min(2).max(50).default(2),
+  mineTimeoutMs: z.natural().min(1000).max(600_000).default(120_000),
+  mineInclude: z.array(z.string()).default([]),
+  mineExclude: z.array(z.string()).default([]),
+  skillExportDir: z.string(),
+  skillAllowedTools: z.array(z.string()).default([]),
 })
 
 /** system prompt 注册服务的最小契约（服务缺失时整块跳过，因此不硬依赖其类型包）。 */
@@ -388,6 +435,16 @@ interface Settings {
   failurePreventWindowTurns: number
   fingerprintTemplateMaxChars: number
   failureGuardTools: string[]
+  mineUseModel: boolean
+  mineMaxFiles: number
+  mineMaxBytes: number
+  mineMaxModelCalls: number
+  mineMinOccurrences: number
+  mineTimeoutMs: number
+  mineInclude: string[]
+  mineExclude: string[]
+  skillExportDir: string
+  skillAllowedTools: string[]
 }
 
 /**
@@ -403,6 +460,14 @@ export function apply(ctx: Context, config: Config): void {
   const live = new Map<string, LiveSession>()
   /** 最近一次活跃的会话，用于定位「当前项目目录」与召回查询词。 */
   let current: LiveSession | undefined
+  /**
+   * 最近一次见过的会话工作目录。
+   *
+   * 会话被销毁后 `current` 会清空，但**项目归属不会因此消失**：此后调用
+   * `technique_apply` / `technique_export` 这类项目域操作时，若回退到 `process.cwd()`，
+   * 就会读写到另一个目录下，产生「记录明明存在却找不到」的静默错乱。
+   */
+  let lastCwd: string | undefined
   /**
    * 召回索引的内存镜像，按会话工作目录分桶。
    *
@@ -448,8 +513,16 @@ export function apply(ctx: Context, config: Config): void {
   /** 某个会话工作目录所属的桶键。 */
   const bucketKey = (cwd: string | undefined): string => cwd ?? process.cwd()
 
-  /** 当前项目目录：优先最近活跃会话的 cwd，回退到进程 cwd。 */
-  const projectCwd = (): string => current?.cwd ?? process.cwd()
+  /**
+   * 解析「当前项目目录」：显式参数 > 活跃会话 > 最近见过的会话 > 进程 cwd。
+   *
+   * 三处入口（`refresh` / `corpusFor` / `projectCwd`）必须用**同一个**解析结果，
+   * 否则会出现「写进了 A 桶、却去 B 桶里读」的静默错乱。
+   */
+  const resolveCwd = (cwd?: string): string | undefined => cwd ?? current?.cwd ?? lastCwd
+
+  /** 当前项目目录。 */
+  const projectCwd = (): string => resolveCwd() ?? process.cwd()
 
   /**
    * 重新加载指定会话目录所属的召回桶（项目域 + 全局域，含技巧层）。
@@ -460,7 +533,7 @@ export function apply(ctx: Context, config: Config): void {
    * @param cwd - 目标项目目录；缺省用当前会话。
    */
   const refresh = async (cwd?: string): Promise<void> => {
-    const directory = cwd ?? current?.cwd
+    const directory = resolveCwd(cwd)
     const key = bucketKey(directory)
     const [
       episodic,
@@ -498,7 +571,7 @@ export function apply(ctx: Context, config: Config): void {
    * @param cwd - 会话工作目录。
    * @returns 已加载的文档；桶未加载时为空数组。
    */
-  const corpusFor = (cwd: string | undefined): RecallDoc[] => corpora.get(bucketKey(cwd)) ?? []
+  const corpusFor = (cwd?: string): RecallDoc[] => corpora.get(bucketKey(resolveCwd(cwd))) ?? []
 
   track(store.readMetrics().then(loaded => { metrics = loaded }))
   track(refresh())
@@ -516,6 +589,7 @@ export function apply(ctx: Context, config: Config): void {
         turns: [],
       }
       live.set(id, created)
+      if (cwd !== undefined) lastCwd = cwd
       logger.debug(`memory: session ${id} entered`)
       // 新会话可能属于另一个项目：立即为其目录建立独立桶，避免沿用上一个项目的索引。
       track(refresh(cwd))
@@ -746,41 +820,14 @@ export function apply(ctx: Context, config: Config): void {
    * @param state - 来源会话状态。
    * @returns 可落盘的草稿。
    */
-  const abstractDraft = (draft: TechniqueDraft, state: LiveSession | undefined): TechniqueDraft => {
-    const identifiers = identifiersFromPaths((state?.turns ?? []).flatMap(turn => turn.files))
-    const run = (text: string): string => abstractText(text, { identifiers }).text
-    const example = draft.example === undefined
-      ? undefined
-      : {
-        ...draft.example,
-        code: clipExample(run(draft.example.code), settings.exampleMaxLines, settings.exampleMaxChars),
-      }
-    return {
-      ...draft,
-      name: run(draft.name),
-      when: run(draft.when),
-      summary: run(draft.summary),
-      ...(draft.steps === undefined ? {} : { steps: draft.steps.map(run) }),
-      ...(draft.invariants === undefined ? {} : { invariants: draft.invariants.map(run) }),
-      ...(draft.api === undefined
-        ? {}
-        : {
-          api: draft.api.map(surface => ({
-            symbol: run(surface.symbol),
-            ...(surface.signature === undefined ? {} : { signature: run(surface.signature) }),
-            ...(surface.notes === undefined ? {} : { notes: run(surface.notes) }),
-          })),
-        }),
-      ...(example === undefined ? {} : { example }),
-      pitfalls: draft.pitfalls.map(run),
-      verify: draft.verify.map(run),
-      tags: draft.tags.map(run),
-      ...(draft.domain === undefined ? {} : { domain: run(draft.domain) }),
-      sensitivity: draft.sensitivity ?? 'internal',
+  const abstractDraft = (draft: TechniqueDraft, state: LiveSession | undefined): TechniqueDraft =>
+    abstractTechniqueDraft(draft, {
+      identifiers: identifiersFromPaths((state?.turns ?? []).flatMap(turn => turn.files)),
+      exampleMaxLines: settings.exampleMaxLines,
+      exampleMaxChars: settings.exampleMaxChars,
       // 证据由提炼管线补上会话来源，不采信模型自述。
       evidence: state === undefined ? [] : [{ kind: 'session', sessionId: state.sessionId }],
-    }
-  }
+    })
 
   /**
    * 判断一条草稿是否允许写入目标作用域。
@@ -1168,6 +1215,22 @@ export function apply(ctx: Context, config: Config): void {
     return next()
   })
 
+  /** 挖掘用的模型路由：配置优先，其次复用会话最近一次请求的路由。 */
+  const mineRoute = (): ModelRoute | undefined => {
+    if (settings.provider !== undefined && settings.model !== undefined) {
+      return { provider: settings.provider, model: settings.model }
+    }
+    return current?.route
+  }
+
+  /** 挖掘产出的来源标记：走过模型就算 `model`，否则 `rule`。 */
+  const outcomOrigin = (outcome: { stats: { modelCalls: number } }): TechniqueRecord['provenance'] =>
+    outcome.stats.modelCalls > 0 ? 'model' : 'rule'
+
+  /** 判断挖掘出的草稿是否允许写入目标作用域（confidential 默认不进全局域）。 */
+  const storableDraft = (draft: TechniqueDraft, scope: MemoryScope): boolean =>
+    scope === 'project' || settings.allowConfidentialGlobal || (draft.sensitivity ?? 'internal') !== 'confidential'
+
   /** 工具行为实现：与提示注入复用同一套存储与召回。 */
   const toolDeps = (): MemoryToolDeps => ({
     async search(query, limit, scope) {
@@ -1290,6 +1353,88 @@ export function apply(ctx: Context, config: Config): void {
       return ok
         ? `Recorded ${outcome} for "${record.name}" (status ${updated.status}, confidence ${confidenceOf(updated).toFixed(2)}).`
         : `Could not update technique "${id}".`
+    },
+    async exportSkill(id) {
+      await refresh(current?.cwd)
+      const record = techniqueById.get(id)
+      if (record === undefined) return `No technique with id "${id}".`
+      if (!injectable(record)) {
+        return `Refused: "${record.name}" is ${record.status}. Only verified techniques (validated or canonical) can be exported as a skill.`
+      }
+      if (record.sensitivity === 'confidential') {
+        return 'Refused: confidential knowledge must not be exported — a shared skill cannot be un-shared.'
+      }
+      if (!record.deidentified) {
+        return 'Refused: this technique has not passed the de-identification check.'
+      }
+
+      const rendered = renderSkill(record, settings.skillAllowedTools.length === 0
+        ? {}
+        : { allowedTools: settings.skillAllowedTools })
+      const check = verifySkill(rendered.markdown)
+      if (!check.ok) {
+        return `Refused: generated SKILL.md is invalid (${check.problems.join('; ')}).`
+      }
+
+      const directory = join(settings.skillExportDir, rendered.name)
+      const file = join(directory, 'SKILL.md')
+      await mkdir(directory, { recursive: true })
+      await writeFile(file, rendered.markdown, 'utf8')
+      return [
+        `Exported "${record.name}" as skill "${rendered.name}".`,
+        `Path: ${file}`,
+        'Load it with the skills mechanism of this harness (or `add_skill` when OpenViking is available).',
+      ].join('\n')
+    },
+    async learn(path, useModel) {
+      const root = path === undefined || path.trim().length === 0 ? projectCwd() : resolve(path.trim())
+      const route = mineRoute()
+      const model = route === undefined ? '' : route.model
+      const cache = await store.readJsonFile<MineCache>(MINE_CACHE_FILE, emptyMineCache())
+      const callable = useModel && settings.mineUseModel && route !== undefined ? modelCaller(route) : undefined
+      const outcome = await mineRepository({
+        view: createRepoView(root),
+        stack: current?.stack ?? { languages: [] },
+        cache,
+        options: {
+          maxFiles: settings.mineMaxFiles,
+          maxBytes: settings.mineMaxBytes,
+          minOccurrences: settings.mineMinOccurrences,
+          maxModelCalls: settings.mineMaxModelCalls,
+          exampleMaxLines: settings.exampleMaxLines,
+          exampleMaxChars: settings.exampleMaxChars,
+          timeoutMs: settings.mineTimeoutMs,
+          ...(settings.mineInclude.length === 0 ? {} : { include: settings.mineInclude }),
+          ...(settings.mineExclude.length === 0 ? {} : { exclude: settings.mineExclude }),
+        },
+        ...(callable === undefined ? {} : { call: callable }),
+        model,
+      })
+
+      await store.writeJsonFile(MINE_CACHE_FILE, withCacheEntries(cache, outcome.processed, model))
+      const scope = settings.scopeTechnique
+      const cwd = scope === 'project' ? projectCwd() : undefined
+      const storable = outcome.candidates.filter(candidate => storableDraft(candidate.draft, scope))
+      const stored = storable.length === 0
+        ? { created: 0, merged: 0 }
+        : await store.upsertTechniques(storable.map(candidate => candidate.draft), {
+          scope,
+          ...(cwd === undefined ? {} : { cwd }),
+          partition: settings.partition,
+          sessionId: current?.sessionId ?? 'mine',
+          provenance: outcomOrigin(outcome),
+        })
+      await refresh(cwd)
+
+      const { stats } = outcome
+      return [
+        `Mined ${root} in ${stats.durationMs}ms:`,
+        `- files: ${stats.scanned} scanned (${stats.skippedCached} cached, ${stats.skippedLarge} oversized), ${stats.visited} visited`,
+        `- clusters: ${stats.clusters}, model calls: ${stats.modelCalls}${stats.timedOut ? ' (timed out, partial result kept)' : ''}`,
+        `- candidates: ${outcome.candidates.length} passed, ${outcome.rejected.length} rejected by leak check`,
+        `- stored as drafts: ${stored.created} new, ${stored.merged} merged`,
+        ...outcome.rejected.slice(0, 5).map(item => `  rejected: ${item.name} — ${item.reason}`),
+      ].join('\n')
     },
     async forget(id, _wipeAll) {
       const targets: MemoryScope[] = settings.scopeTechnique === 'global' ? ['global'] : ['project', 'global']
@@ -1550,6 +1695,16 @@ function resolveSettings(config: Config): Settings {
     failurePreventWindowTurns: config.failurePreventWindowTurns ?? 3,
     fingerprintTemplateMaxChars: config.fingerprintTemplateMaxChars ?? 200,
     failureGuardTools: config.failureGuardTools ?? [...DEFAULT_GUARD_TOOLS],
+    mineUseModel: config.mineUseModel ?? true,
+    mineMaxFiles: config.mineMaxFiles ?? 200,
+    mineMaxBytes: config.mineMaxBytes ?? 524_288,
+    mineMaxModelCalls: config.mineMaxModelCalls ?? 8,
+    mineMinOccurrences: config.mineMinOccurrences ?? 2,
+    mineTimeoutMs: config.mineTimeoutMs ?? 120_000,
+    mineInclude: config.mineInclude ?? [],
+    mineExclude: config.mineExclude ?? [],
+    skillExportDir: resolveSkillDir(config.skillExportDir),
+    skillAllowedTools: config.skillAllowedTools ?? [],
   }
 }
 
@@ -1567,6 +1722,22 @@ export function resolveDir(configured: string | undefined): string {
     ? resolve(expandHome(home))
     : join(homedir(), '.dsh')
   return join(base, MEMORY_DIR_NAME)
+}
+
+/**
+ * 解析 skill 导出目录：显式配置 > `$DSH_HOME/skills` > `~/.dsh/skills`。
+ * @param configured - 配置里的目录，可为相对路径。
+ * @returns 绝对路径。
+ */
+export function resolveSkillDir(configured: string | undefined): string {
+  if (configured !== undefined && configured.trim().length > 0) {
+    return isAbsolute(configured) ? configured : resolve(configured)
+  }
+  const home = process.env[DSH_HOME_ENV]
+  const base = home !== undefined && home.trim().length > 0
+    ? resolve(expandHome(home))
+    : join(homedir(), '.dsh')
+  return join(base, 'skills')
 }
 
 /**
@@ -1770,6 +1941,9 @@ function formatTechniqueDetail(record: TechniqueRecord): string {
   if (record.pitfalls.length > 0) lines.push('Pitfalls:', ...record.pitfalls.map(item => `  - ${item}`))
   if (record.verify.length > 0) lines.push('Verify:', ...record.verify.map(item => `  - ${item}`))
   if (record.tags.length > 0) lines.push(`Tags: ${record.tags.join(', ')}`)
+  if (record.conflictsWith !== undefined && record.conflictsWith.length > 0) {
+    lines.push(`Same trigger, different approach: ${record.conflictsWith.join(', ')}`)
+  }
   if (record.evidence.length > 0) {
     lines.push(`Evidence: ${record.evidence.map(item => [item.kind, item.repo, item.role, item.hint].filter(Boolean).join('/')).join(', ')}`)
   }
@@ -1786,12 +1960,6 @@ function dedupeById<T extends { id: string }>(items: readonly T[]): T[] {
     out.push(item)
   }
   return out
-}
-
-/** 示例的硬上限：行数与字符数双重收敛。 */
-function clipExample(code: string, maxLines: number, maxChars: number): string {
-  const lines = code.split(/\r?\n/u).slice(0, Math.max(1, maxLines)).join('\n').trim()
-  return clipHead(lines, Math.max(1, maxChars))
 }
 
 /** 把会话要点压成一段用于新颖度比较的文本。 */

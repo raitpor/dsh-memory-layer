@@ -53,6 +53,9 @@ export const FAILURE_FILE = 'failures.jsonl'
 /** 反思指标文件名（落在记忆库根目录，跨作用域共享）。 */
 export const METRICS_FILE = 'metrics.json'
 
+/** 代码挖掘的增量缓存文件名（落在记忆库根目录）。 */
+export const MINE_CACHE_FILE = 'mine-cache.json'
+
 /** 全局域的默认分区名。 */
 export const DEFAULT_PARTITION = 'default'
 
@@ -207,6 +210,44 @@ export function emptyMetrics(): ReflectionMetrics {
     duplicateTechniques: 0,
     emptyStreak: 0,
     backoff: false,
+  }
+}
+
+/** 一条技巧最多标注的「同触发另解」条数。 */
+export const MAX_CONFLICTS = 8
+
+/**
+ * 重算「同一触发条件下的另解」标记。
+ *
+ * 判定刻意保守：**触发条件归一化后相同**即视为可能需要并置呈现。真正的语义蕴含
+ * （两条是否真的互斥）需要模型判断，而误判的代价是把互补的做法说成冲突。
+ * 因此字段名是「同触发的另解」，呈现时也如实这么写。
+ *
+ * 会先清空旧标记：某条被解决后，冲突提示必须随之消失，否则会留下幽灵分歧。
+ *
+ * @param records - 同一作用域内的全部技巧（就地修改）。
+ */
+export function assignConflicts(records: readonly TechniqueRecord[]): void {
+  for (const record of records) delete record.conflictsWith
+
+  const byTrigger = new Map<string, TechniqueRecord[]>()
+  for (const record of records) {
+    if (record.status === 'deprecated') continue
+    const trigger = semanticKey(record.when)
+    if (trigger.length < 4) continue
+    const bucket = byTrigger.get(trigger)
+    if (bucket === undefined) byTrigger.set(trigger, [record])
+    else bucket.push(record)
+  }
+
+  for (const bucket of byTrigger.values()) {
+    if (bucket.length < 2) continue
+    for (const record of bucket) {
+      record.conflictsWith = bucket
+        .filter(other => other.id !== record.id)
+        .map(other => other.id)
+        .slice(0, MAX_CONFLICTS)
+    }
   }
 }
 
@@ -595,6 +636,7 @@ export class MemoryStore {
     }
 
     const next = [...byKey.values()].sort((left, right) => left.ts - right.ts).slice(-MAX_TECHNIQUES_PER_SCOPE)
+    assignConflicts(next)
     await this.writeAtomic(
       join(this.scopeDir(scope, cwd, partition), TECHNIQUE_FILE),
       next.map(record => JSON.stringify(record)).join('\n') + (next.length > 0 ? '\n' : ''),
@@ -617,6 +659,8 @@ export class MemoryStore {
     const index = records.findIndex(item => item.id === record.id)
     if (index < 0) return false
     records[index] = record
+    // 状态变化会影响「同触发另解」的集合（例如刚被解决的那条要退出），因此重算。
+    assignConflicts(records)
     await this.writeAtomic(
       join(this.scopeDir(record.scope, cwd, record.partition), TECHNIQUE_FILE),
       records.map(item => JSON.stringify(item)).join('\n') + '\n',
@@ -813,6 +857,41 @@ export class MemoryStore {
       )
     }
     return removed
+  }
+
+  /**
+   * 读取记忆库根目录下的一个 JSON 文件。
+   *
+   * 供挖掘缓存这类「整块状态」使用：缺失或损坏时返回调用方给出的初值，
+   * 绝不让一个坏掉的辅助文件影响主流程。
+   *
+   * @param name - 文件名（不含路径）。
+   * @param fallback - 文件缺失或损坏时的初值。
+   * @returns 解析后的值。
+   */
+  async readJsonFile<T>(name: string, fallback: T): Promise<T> {
+    let raw: string
+    try {
+      raw = await readFile(join(this.root, name), 'utf8')
+    } catch (error) {
+      if (isNotFound(error)) return fallback
+      throw error
+    }
+    try {
+      const parsed: unknown = JSON.parse(this.decode(raw).join('\n'))
+      return parsed === null || parsed === undefined ? fallback : parsed as T
+    } catch {
+      return fallback
+    }
+  }
+
+  /**
+   * 原子写入记忆库根目录下的一个 JSON 文件。
+   * @param name - 文件名（不含路径）。
+   * @param value - 可序列化的值。
+   */
+  async writeJsonFile(name: string, value: unknown): Promise<void> {
+    await this.writeAtomic(join(this.root, name), `${JSON.stringify(value)}\n`)
   }
 
   /**

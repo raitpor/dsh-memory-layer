@@ -1,0 +1,84 @@
+# dsh-memory-layer 在 deepseek-harness (dsh) 中的接入片段。
+#
+# 位置二选一：
+#   $DSH_HOME/cordis.patch.yml                      ← home 层，对所有 profile 生效，且被 HMR 监听
+#   $DSH_HOME/profiles/<name>/cordis.patch.yml      ← 只对某个 profile 生效
+#
+# 说明：
+#   - 本文件同时是插件包的 `dsh.bundle.patch`，用 `dsh plugin add` 安装时会自动套用。
+#   - patch 行的 `config` 是整体替换而非深合并，改写时请保留全部字段。
+#   - 未列出的字段由插件的 schemastery schema 补默认值。
+#   - 手动挂载（未走 `dsh plugin add`）时，把 `name` 换成插件包的绝对路径或目录名。
+
+- insert:
+    - id: dsh-memory-layer
+      name: 'dsh-memory-layer'
+      config:
+        # 记忆库根目录；留空即默认 $DSH_HOME/memory-layer（通常 ~/.dsh/memory-layer）
+        dir: null
+        # 全局作用域开关；留空即按层取默认值（见 layerScopes）。
+        # 一旦显式设置，四层统一使用该作用域。
+        scope: null
+        # 按层覆盖作用域。缺省：episodic=project（原始会话摘要含路径与原话，留在项目域），
+        # semantic=global、technique=global（已抽象的知识应跨项目复用）。
+        layerScopes:
+          episodic: project
+          semantic: global
+          technique: global
+          failure: global
+        # 全局域分区（组织/租户）：同一分区内互通，跨分区隔离。
+        partition: default
+        # 每轮结束用规则提炼兜底落盘（零模型调用）
+        distillOnTurnEnd: true
+        # 记忆库加密（AES-256-GCM，仅用 Node 内置 node:crypto，无额外依赖）
+        encrypt: true
+        # 密钥文件路径；留空即 <dir>/.dsh-memory-layer.key（记忆库内自包含）。
+        # 也可用环境变量 DSH_MEMORY_LAYER_KEY 注入密钥（hex/base64，不落盘）。
+        keyFile: null
+        # 召回注入
+        injectPrompt: true
+        recallLimit: 5
+        recallChars: 4000
+        promptOrder: 250
+        # 技巧经验层
+        techniques: true
+        techniqueLimit: 3
+        techniqueChars: 3000
+        techniquePromptOrder: 260
+        # 示例代码硬上限（入库的是知识，不是代码）
+        exampleMaxLines: 8
+        exampleMaxChars: 480
+        # 是否允许 confidential 知识进入全局域；默认 false（业务机密不外扬）
+        allowConfidentialGlobal: false
+        # 会话内反思：每会话一次（非每轮）。两道闸门保证「没有新东西就不花钱」。
+        reflectOnSessionEnd: true
+        reflectMinTurns: 3
+        reflectNoveltyThreshold: 0.15
+        reflectBackoffAfterEmpty: 5
+        reflectMaxTranscriptChars: 24000
+        # 失败经验层：识别「反复犯的同一个错」并按次数升级处置
+        failures: true
+        # 第几次重复开始注入预警
+        failureWarnAfter: 2
+        # 第几次重复开始在派发前询问（P2 生效）
+        failureAskAfter: 3
+        # 第几次重复开始硬拦截；0 = 从不硬拦截（默认，避免阻断正常工作）
+        failureBlockAfter: 0
+        # 允许自动推导守卫的工具白名单：文件编辑/读取永不被自动拦截
+        failureGuardTools:
+          - bash
+        failureInjectLimit: 3
+        failureInjectChars: 1500
+        # 失败预警 section 排在 recall 与 techniques 之间
+        failurePromptOrder: 255
+        # 判定「防住了」的观察窗口（轮次）
+        failurePreventWindowTurns: 3
+        # 归一化错误模板的字符上限
+        fingerprintTemplateMaxChars: 200
+        # 暴露 memory_* 与 technique_* 工具
+        registerTools: true
+        # 会话结束提炼的超时；超时或缺少 llm 时自动回退到规则提炼
+        distillTimeoutMs: 30000
+        # 提炼调用使用的模型路由；留空则复用本会话最近一次请求的 provider/model
+        provider: null
+        model: null

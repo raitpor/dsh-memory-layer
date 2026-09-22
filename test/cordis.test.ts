@@ -94,3 +94,42 @@ test('缺少 sessions 服务时插件停在 PENDING 而不执行 apply', async (
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('插件自带 cordis.patch.yml 的 null 空值不会让宿主启动失败', async () => {
+  // 复刻 cordis.patch.yml 的 config 形状：`dir:` / `keyFile:` 这类空值在 YAML 里是
+  // null，schemastery 对没有 default 的字段原样透传 null。旧实现在 resolveDir 里
+  // 直接对 null 调 .trim()，抛出的 TypeError 会被 loader 包成
+  // 「plugin tree failed to load」，整个 dsh 起不来。
+  const root = await mkdtemp(join(tmpdir(), 'dsh-memory-cordis-'))
+  const previousHome = process.env.DSH_HOME
+  const captured: unknown[] = []
+  const ctx = new Context()
+  try {
+    // 目录留空时回退到 $DSH_HOME，这里指到临时目录，避免污染真实 ~/.dsh。
+    process.env.DSH_HOME = root
+    ctx.provide('sessions', {})
+    ctx.provide('systemPrompt', {
+      context: (entry: unknown) => {
+        captured.push(entry)
+        return () => undefined
+      },
+    })
+
+    mount(ctx, {
+      dir: null,
+      scope: null,
+      keyFile: null,
+      provider: null,
+      model: null,
+      skillExportDir: null,
+      layerScopes: { episodic: 'project', semantic: 'global', technique: 'global', failure: 'global' },
+    })
+    await settle()
+
+    assert.equal(captured.length, 3, 'null 应被视同未设置，插件仍需完成 prompt 接线')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await rm(root, { recursive: true, force: true })
+  }
+})

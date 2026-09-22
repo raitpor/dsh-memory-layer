@@ -13,6 +13,7 @@ import {
   PROMPT_SECTION_NAME,
   TECHNIQUE_SECTION_NAME,
   resolveDir,
+  resolveSkillDir,
   DSH_HOME_ENV,
 } from '../src/index.js'
 
@@ -104,4 +105,14 @@ test('DSH_HOME 覆盖默认目录', () => {
     if (previous === undefined) delete process.env[DSH_HOME_ENV]
     else process.env[DSH_HOME_ENV] = previous
   }
+})
+
+test('YAML 空值（null）在 schema 里原样透传，且解析函数视同未设置', () => {
+  // `dir:` 这类空值经 YAML 解析是 null，schemastery 对没有 default 的字段不会把它
+  // 变成 undefined —— 这是 rc.2 上把整个 dsh 带崩的根因，必须在解析层消化掉。
+  const parsed = Config({ dir: null, keyFile: null, skillExportDir: null } as never)
+  assert.equal(parsed.dir, null, 'schemastery 透传 null，插件侧必须自己兜住')
+
+  assert.equal(resolveDir(null), resolveDir(undefined), 'null 目录应回退到默认记忆库')
+  assert.equal(resolveSkillDir(null), resolveSkillDir(undefined), 'null 目录应回退到默认 skills 目录')
 })

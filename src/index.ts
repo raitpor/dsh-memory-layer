@@ -453,7 +453,7 @@ interface Settings {
  * @param config - 已校验的插件配置。
  */
 export function apply(ctx: Context, config: Config): void {
-  const settings = resolveSettings(config)
+  const settings = resolveSettings(normalizeConfig(config))
   const logger = ctx.logger(name)
   const store = new MemoryStore(settings.dir, resolveCodec(settings, logger))
   /** 瞬时层：运行中会话的要点，仅存内存。 */
@@ -1644,6 +1644,34 @@ function snapshotTranscript(state: LiveSession): Transcript {
 }
 
 /**
+ * 把配置里的 YAML 空值收敛为 `undefined`。
+ *
+ * YAML 里 `key:` 形式的空值经解析是 `null`，而 schemastery 对**没有 `default`** 的字段
+ * 会原样透传 `null`（只有带默认值的字段才把空值换成默认值）。本插件的可选语义是
+ * 「缺省 = `undefined`」，于是 `config.dir ?? 默认` 之后的 `.trim()` 会在 `null`
+ * 上抛 `TypeError`，宿主加载该插件时整个 dsh 都起不来。
+ *
+ * 这里在进入 {@link resolveSettings} 之前一次性抹平顶层与 `layerScopes` 的 `null`，
+ * 让后续代码只需处理 `undefined` 一种缺省形态。
+ *
+ * @param config - 宿主传入、可能含 `null` 的配置。
+ * @returns 去掉空值的配置副本。
+ */
+function normalizeConfig(config: Config): Config {
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(config ?? {})) {
+    if (value === null || value === undefined) continue
+    out[key] = key === 'layerScopes' && typeof value === 'object'
+      ? Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .filter(([, item]) => item !== null && item !== undefined),
+      )
+      : value
+  }
+  return out as Config
+}
+
+/**
  * 把可选配置收敛成确定值。
  * @param config - 已校验配置。
  * @returns 运行时设置。
@@ -1710,11 +1738,11 @@ function resolveSettings(config: Config): Settings {
 
 /**
  * 解析记忆库根目录：显式配置 > `$DSH_HOME` > `~/.dsh`，再拼上 {@link MEMORY_DIR_NAME}。
- * @param configured - 配置里的目录，可为相对路径。
+ * @param configured - 配置里的目录，可为相对路径；YAML 空值 `null` 视同未设置。
  * @returns 绝对路径。
  */
-export function resolveDir(configured: string | undefined): string {
-  if (configured !== undefined && configured.trim().length > 0) {
+export function resolveDir(configured: string | null | undefined): string {
+  if (typeof configured === 'string' && configured.trim().length > 0) {
     return isAbsolute(configured) ? configured : resolve(configured)
   }
   const home = process.env[DSH_HOME_ENV]
@@ -1729,8 +1757,8 @@ export function resolveDir(configured: string | undefined): string {
  * @param configured - 配置里的目录，可为相对路径。
  * @returns 绝对路径。
  */
-export function resolveSkillDir(configured: string | undefined): string {
-  if (configured !== undefined && configured.trim().length > 0) {
+export function resolveSkillDir(configured: string | null | undefined): string {
+  if (typeof configured === 'string' && configured.trim().length > 0) {
     return isAbsolute(configured) ? configured : resolve(configured)
   }
   const home = process.env[DSH_HOME_ENV]
@@ -1776,8 +1804,8 @@ function expandHome(path: string): string {
  * @param value - 原始配置值。
  * @returns 去掉首尾空白后仍非空的字符串，否则 `undefined`。
  */
-function nonEmpty(value: string | undefined): string | undefined {
-  return value !== undefined && value.trim().length > 0 ? value : undefined
+function nonEmpty(value: string | null | undefined): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
 }
 
 /**

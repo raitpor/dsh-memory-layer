@@ -3,7 +3,7 @@
  * 验证「捕获 → 提炼 → 落盘 → 召回 → 注入 / 工具」这条完整链路，
  * 并覆盖安全修复（跨项目隔离、注入框定、脱敏、路径过滤、破坏性操作确认）。
  *
- * 替身只实现插件真正用到的契约（`logger` / `on` / `effect` / `get`），
+ * 替身只实现插件真正用到的契约（`logger` / `on` / `effect` / `get` / `inject`），
  * 因此测试不依赖 dsh 的启动流程，也不需要模型或网络。
  *
  * @module dsh-memory-layer/test/plugin.test
@@ -88,6 +88,12 @@ function fakeContext(services: Record<string, unknown> = {}): FakeContext {
       return { dispose: async () => undefined }
     },
     get: (name: string) => services[name],
+    // Cordis 的 `inject` 是响应式的：依赖服务就绪后才跑回调，服务消失时随子 fiber 回收。
+    // 替身的服务在构造时就固定，因此「全部可见即立即执行，否则保持 pending」与真实语义等价。
+    inject: (deps: readonly string[], callback: (childCtx: unknown) => unknown) => {
+      if (deps.every(dep => services[dep] !== undefined)) callback(ctx)
+      return { dispose: async () => undefined }
+    },
   }
 
   return {
@@ -359,8 +365,14 @@ test('缺少 systemPrompt / tools 服务时降级而不抛错', async () => {
     await runSession(fake, fakeSession())
     const records = await new MemoryStore(root).readEpisodic('project', '/work/demo')
     assert.equal(records.length, 1, '核心能力不受影响')
-    assert.ok(fake.logs.some(line => line.includes('systemPrompt service is absent')))
-    assert.ok(fake.logs.some(line => line.includes('tools service is absent')))
+    assert.equal(fake.prompts.length, 0, 'systemPrompt 缺席时不接线')
+    assert.equal(fake.tools.length, 0, 'tools 缺席时不接线')
+    // 旧实现会在这里 warn「服务缺席」。服务晚于 sessions 上线是真实 dsh 的常态，
+    // 谎报缺席比沉默更糟；现在缺席由框架的 pending 诊断呈现（见 cordis.test.ts 的时序用例）。
+    assert.ok(
+      !fake.logs.some(line => line.includes('systemPrompt service is absent') || line.includes('tools service is absent')),
+      `不应再谎报服务缺席，实际日志：${fake.logs.join(' | ')}`,
+    )
   } finally {
     await dispose()
   }
@@ -1132,7 +1144,6 @@ test('P2-④b 完全缺少 tools 服务时仍记录失败且不抛错', async ()
     await failSession(fake, fakeSession('s2', '/work/demo'), GUARDABLE_TEXT, undefined, { command: 'npm test' })
     assert.equal((await new MemoryStore(root).readFailures('global')).length, 1)
     assert.equal(fake.guards.length, 0, '没有 tools 服务就不登记守卫')
-    assert.ok(fake.logs.some(line => line.includes('tools service is absent')))
   } finally {
     await dispose()
   }

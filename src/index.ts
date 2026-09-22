@@ -1572,55 +1572,68 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   // ---- 能力接线：system prompt 注入与工具注册（均为软依赖） -----------------
+  //
+  // 这两项能力必须用 `ctx.inject` **响应式**接线，不能在 apply 里一次性 `ctx.get`。
+  //
+  // `tools` 服务（`@deepseek-ai/dsh-tools` 的 `ToolRuntime`）自身声明
+  // `inject: ['systemPrompt']`，因此它上线**晚于**本插件硬依赖的 `sessions`：
+  // apply 时刻 `ctx.get('tools')` 拿到的是 undefined，而一次性探测不会重试，
+  // 于是 14 个工具在真实 dsh 里全部安静地注册不上（记忆库、提炼、注入都正常，
+  // 只有模型看得见的那一层消失）。单测因为预先 provide 好服务，永远复现不了这个时序。
+  //
+  // `ctx.inject` 挂一个子 fiber：服务就绪时执行、服务消失时随 fiber 回收。
+  // 服务始终缺席时的可观测性交给框架——DSH 会把子 fiber 列为
+  // `pending (waiting for service: tools)`，比过去那句会误导人的 warn 更准确。
+  // 具名函数而不是箭头函数，是为了让那条 pending 诊断能报出可读的插件名。
 
-  const systemPrompt = ctx.get('systemPrompt') as PromptContextRegistry | undefined
-  if (settings.injectPrompt && systemPrompt !== undefined) {
-    ctx.effect(() => systemPrompt.context({
-      name: PROMPT_SECTION_NAME,
-      order: settings.promptOrder,
-      text: () => renderInjection(current?.turns.at(-1)?.user ?? ''),
-    }), 'memory-layer:prompt-injection')
-    if (settings.techniques) {
-      ctx.effect(() => systemPrompt.context({
-        name: TECHNIQUE_SECTION_NAME,
-        order: settings.techniquePromptOrder,
-        text: () => renderTechniqueInjection(current?.turns.at(-1)?.user ?? ''),
-      }), 'memory-layer:technique-injection')
-    }
-    if (settings.failures) {
-      ctx.effect(() => systemPrompt.context({
-        name: FAILURE_SECTION_NAME,
-        order: settings.failurePromptOrder,
-        text: () => renderFailureInjection(),
-      }), 'memory-layer:failure-injection')
-    }
-  } else if (settings.injectPrompt) {
-    logger.warn('memory: systemPrompt service is absent; recall injection is disabled')
+  if (settings.injectPrompt) {
+    ctx.inject(['systemPrompt'], function memoryPromptInjection(promptCtx) {
+      const systemPrompt = promptCtx.get('systemPrompt') as PromptContextRegistry
+      promptCtx.effect(() => systemPrompt.context({
+        name: PROMPT_SECTION_NAME,
+        order: settings.promptOrder,
+        text: () => renderInjection(current?.turns.at(-1)?.user ?? ''),
+      }), 'memory-layer:prompt-injection')
+      if (settings.techniques) {
+        promptCtx.effect(() => systemPrompt.context({
+          name: TECHNIQUE_SECTION_NAME,
+          order: settings.techniquePromptOrder,
+          text: () => renderTechniqueInjection(current?.turns.at(-1)?.user ?? ''),
+        }), 'memory-layer:technique-injection')
+      }
+      if (settings.failures) {
+        promptCtx.effect(() => systemPrompt.context({
+          name: FAILURE_SECTION_NAME,
+          order: settings.failurePromptOrder,
+          text: () => renderFailureInjection(),
+        }), 'memory-layer:failure-injection')
+      }
+    })
   }
 
-  const tools = ctx.get('tools') as ToolRuntime | undefined
-  if (settings.registerTools && tools !== undefined) {
-    // 单调守卫只负责硬拦截：它同步、且无法被后续监听器翻回允许。
-    if (settings.failures && typeof tools.guard === 'function') {
-      ctx.effect(() => tools.guard(exec => {
-        if (settings.failureBlockAfter <= 0) return undefined
-        const record = intercept(exec.name, exec.arguments, 'block')
-        return record === undefined ? undefined : failureDenialReason(record)
-      }), 'memory-layer:failure-guard')
-    } else if (settings.failures && settings.failureBlockAfter > 0) {
-      logger.warn('memory: tools.guard is absent; hard blocking of repeated failures is disabled')
-    }
+  if (settings.registerTools) {
+    ctx.inject(['tools'], function memoryToolsRegistration(toolCtx) {
+      const tools = toolCtx.get('tools') as ToolRuntime
+      // 单调守卫只负责硬拦截：它同步、且无法被后续监听器翻回允许。
+      if (settings.failures && typeof tools.guard === 'function') {
+        toolCtx.effect(() => tools.guard(exec => {
+          if (settings.failureBlockAfter <= 0) return undefined
+          const record = intercept(exec.name, exec.arguments, 'block')
+          return record === undefined ? undefined : failureDenialReason(record)
+        }), 'memory-layer:failure-guard')
+      } else if (settings.failures && settings.failureBlockAfter > 0) {
+        logger.warn('memory: tools.guard is absent; hard blocking of repeated failures is disabled')
+      }
 
-    const definitions = [
-      ...createMemoryTools(toolDeps()),
-      ...(settings.techniques ? createTechniqueTools(techniqueDeps()) : []),
-      ...(settings.failures ? createFailureTools(failureDeps()) : []),
-    ]
-    for (const tool of definitions) {
-      ctx.effect(() => tools.register(tool), `memory-layer:tool:${tool.name}`)
-    }
-  } else if (settings.registerTools) {
-    logger.warn('memory: tools service is absent; memory tools are not registered')
+      const definitions = [
+        ...createMemoryTools(toolDeps()),
+        ...(settings.techniques ? createTechniqueTools(techniqueDeps()) : []),
+        ...(settings.failures ? createFailureTools(failureDeps()) : []),
+      ]
+      for (const tool of definitions) {
+        toolCtx.effect(() => tools.register(tool), `memory-layer:tool:${tool.name}`)
+      }
+    })
   }
 
   logger.debug(

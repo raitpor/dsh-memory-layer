@@ -74,6 +74,49 @@ test('真实 Context 能加载插件并完成 system prompt 接线', async () =>
   }
 })
 
+test('systemPrompt / tools 晚于 sessions 上线时，能力仍会被接线（真实 dsh 时序）', async () => {
+  // 回归用例：真实 dsh 里 `tools` 服务（ToolRuntime）自身 `inject: ['systemPrompt']`，
+  // 因此它上线晚于本插件硬依赖的 `sessions`。旧实现在 apply 里一次性
+  // `ctx.get('tools')`，此刻拿到 undefined 且永不重试 —— 14 个工具在正式环境
+  // 全部注册不上，而当时所有单测都预先 provide 好服务，复现不了这个时序。
+  const root = await mkdtemp(join(tmpdir(), 'dsh-memory-cordis-'))
+  const sections: unknown[] = []
+  const registered: string[] = []
+  const ctx = new Context()
+  try {
+    // 阶段一：只有 sessions 就绪，复刻 apply 时刻的真实状态。
+    ctx.provide('sessions', {})
+    mount(ctx, { dir: root })
+    await settle()
+
+    assert.equal(sections.length, 0, '此时 systemPrompt 确实尚未上线')
+    assert.equal(registered.length, 0, '此时 tools 确实尚未上线')
+
+    // 阶段二：服务后到，响应式接线必须补上。
+    ctx.provide('systemPrompt', {
+      context: (entry: unknown) => {
+        sections.push(entry)
+        return () => undefined
+      },
+    })
+    ctx.provide('tools', {
+      register: (definition: { name: string }) => {
+        registered.push(definition.name)
+        return () => undefined
+      },
+    })
+    await settle()
+
+    assert.equal(sections.length, 3, '晚到的 systemPrompt 仍应装上三个 section')
+    assert.equal(registered.length, 14, '晚到的 tools 仍应装上全部 14 个工具')
+    for (const expected of ['memory_search', 'memory_save', 'memory_forget', 'memory_stats']) {
+      assert.ok(registered.includes(expected), `${expected} 应已注册`)
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('缺少 sessions 服务时插件停在 PENDING 而不执行 apply', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-memory-cordis-'))
   const captured: unknown[] = []

@@ -33,6 +33,16 @@ export interface SemanticDraft {
   text: string
 }
 
+/** 一条**用户纠偏**的语义认定结果（由模型给出，见 `distill.ts` 的 `corrections`）。 */
+export interface CorrectionDraft {
+  /** 触发方式：什么场景/动作会把这件事引出来。 */
+  trigger: string
+  /** 错在哪：模型对被纠正行为的归一化描述（不是用户原话）。 */
+  wrong: string
+  /** 正确做法：可直接执行的下一步。 */
+  correctApproach: string
+}
+
 /** 一次提炼的完整产物，同时喂给情景层与语义层。 */
 export interface DistilledMemory {
   /** 一句话标题，用于列表展示。 */
@@ -51,6 +61,8 @@ export interface DistilledMemory {
   facts: SemanticDraft[]
   /** 待合并进技巧层的经验（会话内反思产出）。 */
   techniques: TechniqueDraft[]
+  /** 本次会话里**用户对 agent 的纠偏**（只在模型确认为纠偏时才有值）。 */
+  corrections: CorrectionDraft[]
 }
 
 /** 情景层记录：一次会话一条。 */
@@ -436,6 +448,18 @@ export interface FailureRecord {
   symptom: string
   /** 正确的做法；未知时为空串（此时预警只给出重复次数与现场）。 */
   remedy: string
+  /**
+   * 触发方式：什么场景/动作会把这件事引出来。
+   *
+   * 与 `symptom`（现象）和 `remedy`（对策）互补：现象说明「错成了什么样」，
+   * 触发方式说明「什么时候会撞上」。有了它，**已解决**的记录才能在相似场景出现时
+   * 被提前端出来当提醒，而不是只能等复现计数爬到阈值。
+   */
+  trigger?: string
+  /** 标记已解决的时间；未解决时为 `undefined`。 */
+  resolvedAt?: number
+  /** 解决时的累计次数，用于在提醒里说明「解决之后又被触发了几次」。 */
+  occurrencesAtResolve?: number
   /** 可执行守卫条件（P2 使用）。 */
   guard?: GuardSpec
   /** 当前处置强度。 */

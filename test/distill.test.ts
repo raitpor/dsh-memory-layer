@@ -7,6 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { distill, distillWithModel, distillWithRules, isInjectedContext } from '../src/distill.js'
+import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from '../src/injection.js'
 import type { Transcript } from '../src/distill.js'
 import type { LiveTurn } from '../src/types.js'
 
@@ -73,13 +74,19 @@ test('检索标签只取技术栈语言并小写', () => {
 })
 
 test('宿主注入块被识别，用户提问不会被误伤', () => {
-  assert.equal(
-    isInjectedContext('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nCurrent DSH file policy: …'),
-    true,
-  )
-  assert.equal(isInjectedContext('Recalled memory from earlier sessions (stored locally by dsh-memory-layer).\n…'), true)
-  assert.equal(isInjectedContext('Mistakes that already happened repeatedly in earlier sessions'), true)
-  assert.equal(isInjectedContext('  \n  Current runtime context. …'), true, '前导空白不影响判定')
+  // 标记**由块定义派生**（`injection.ts`），所以这里逐块验证：任何一段注入的块首
+  // 若不再被识别，整段就会被当成用户原话重新捕获，并随「召回 → 再捕获」循环放大。
+  for (const block of INJECTION_BLOCKS) {
+    assert.equal(
+      isInjectedContext(block.header.join('\n')),
+      true,
+      `${block.section} 的块首必须能被识别为注入块`,
+    )
+  }
+  for (const marker of HOST_CONTEXT_MARKERS) {
+    assert.equal(isInjectedContext(`${marker} This snapshot supersedes earlier snapshots.`), true)
+  }
+  assert.equal(isInjectedContext(`  \n  ${HOST_CONTEXT_MARKERS[0] as string} …`), true, '前导空白不影响判定')
   assert.equal(isInjectedContext('你刚在另一个会话做了什么'), false)
   assert.equal(isInjectedContext('刚才那段 Recalled memory 是什么意思？'), false, '只匹配开头，不误伤提问')
   assert.equal(isInjectedContext(''), false)

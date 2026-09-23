@@ -17,6 +17,7 @@ import { basename, dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { apply } from '../src/index.js'
+import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from '../src/injection.js'
 import type { Config } from '../src/index.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
 import { parseSkillFrontmatter, verifySkill } from '../src/skill.js'
@@ -257,6 +258,18 @@ async function runSession(
 }
 
 /**
+ * 等到失败层的写入链真正落空。
+ *
+ * `session/flush` 只 await **调用那一刻**已登记的任务，而失败写入会「写里再排队写」
+ * （先写记录，再把 remedy 挂到旧记录上），因此单次 flush 会提前返回。多轮 flush 才追得上。
+ *
+ * @param fake - context 替身。
+ */
+async function flushWrites(fake: FakeContext): Promise<void> {
+  for (let round = 0; round < 4; round += 1) await fake.flush()
+}
+
+/**
  * 渲染当前记忆召回注入文本。
  *
  * 必须按 section 名取，不能用 `at(-1)`：技巧层 section 排在 recall 之后，
@@ -376,7 +389,7 @@ test('会话 dispose 时兜底提炼', async () => {
 })
 
 test('宿主注入的上下文块不会顶掉真正的用户请求', async () => {
-  // 回归用例：dsh 把运行时快照、本插件的召回块、失败预警都作为独立的
+  // 回归用例：dsh 把运行时快照、本插件的召回/技巧/失败三段注入都作为独立的
   // `user/message` 事件发出。旧实现把它们当用户输入、又按「保留尾部」截断，
   // 真正的请求被挤出 captureUserChars 窗口，提炼出的请求于是变成上一轮的
   // 召回流水，并随「召回 → 再捕获」逐会话放大。
@@ -386,17 +399,8 @@ test('宿主注入的上下文块不会顶掉真正的用户请求', async () =>
     fake.emit('session/created', session)
     fake.emit('session/event', session, event('turn/start', { turn: 1 }))
     fake.emit('session/event', session, userMessage('帮我把提炼规则里的工具流水去掉。'))
-    // 结构化注入：正文刻意不含任何已知标记词，只有 `source.kind` 能识别它。
+    // 结构化识别：正文刻意不含任何已知标记词，只有 `source.kind` 能识别它。
     fake.emit('session/event', session, injectedMessage('宿主上下文：bash todo_write read write edit src/index.ts package.json'))
-    // 措辞兜底：模拟结构信息缺失、只能靠块首标记识别的宿主实现。
-    fake.emit('session/event', session, userMessage([
-      'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.',
-      '',
-      'Recalled memory from earlier sessions (stored locally by dsh-memory-layer).',
-      '--- BEGIN UNTRUSTED MEMORY ---',
-      '1. (past session) 涉及文件：bash todo_write read write edit src/index.ts package.json',
-      '--- END UNTRUSTED MEMORY ---',
-    ].join('\n')))
     fake.emit('session/event', session, assistantMessage(1, '已把过程压成去重后的工具类别。'))
     fake.emit('session/event', session, event('turn/end', { turn: 1, reason: 'completed' }))
     await fake.flush()
@@ -405,8 +409,31 @@ test('宿主注入的上下文块不会顶掉真正的用户请求', async () =>
     const summary = records.at(-1)?.summary ?? ''
     assert.ok(summary.includes('请求：帮我把提炼规则里的工具流水去掉。'), summary)
     assert.ok(!summary.includes('宿主上下文'), 'source.kind=plugin 的注入块不应被当成用户请求')
-    assert.ok(!summary.includes('Current runtime context'), '运行时快照不应进入摘要')
-    assert.ok(!summary.includes('todo_write'), '召回块不应被当成用户请求')
+    assert.ok(!summary.includes('todo_write'), '注入块正文不应被当成用户请求')
+
+    // 措辞兜底：模拟结构信息缺失、只能靠块首标记识别的宿主实现。
+    //
+    // 关键在**让注入块成为该会话唯一的用户消息** —— 规则提炼把「第一条用户文本」当成
+    // 摘要的请求行，所以一旦某块的块首没被识别，它就会现身在请求行里；若把注入块夹在
+    // 真实请求后面，它会落进到不了摘要的字段，断言就变成空过（技巧块此前正是漏网的）。
+    for (const marker of [...HOST_CONTEXT_MARKERS, ...INJECTION_BLOCKS.map(block => block.header[0] as string)]) {
+      const probeId = `probe-${marker.slice(0, 24)}`
+      const probe = fakeSession(probeId, '/work/demo')
+      fake.emit('session/created', probe)
+      fake.emit('session/event', probe, event('turn/start', { turn: 1 }))
+      fake.emit('session/event', probe, userMessage(`${marker}\n注入块专有内容 ${probeId}\n--- END ---`))
+      fake.emit('session/event', probe, assistantMessage(1, '（框架注入，不是用户请求）'))
+      fake.emit('session/event', probe, event('turn/end', { turn: 1, reason: 'completed' }))
+      await fake.flush()
+
+      const probeRecords = await new MemoryStore(root).readEpisodic('project', '/work/demo')
+      const probeSummary = probeRecords.find(record => record.sessionId === probeId)?.summary ?? ''
+      assert.ok(probeSummary.length > 0, `探针会话 ${probeId} 应落盘一条摘要`)
+      assert.ok(
+        !probeSummary.includes(probeId),
+        `块首「${marker}」没被识别，注入内容当上了请求行：${probeSummary}`,
+      )
+    }
   } finally {
     await dispose()
   }
@@ -605,6 +632,39 @@ test('规则提炼路径同样脱敏凭据（DEF-SEC-002）', async () => {
       !JSON.stringify(records).includes(secret),
       '情景摘要不应明文包含凭据',
     )
+  } finally {
+    await dispose()
+  }
+})
+
+test('memory_forget 按 id 默认跨作用域删除，无需调用方知道记录落在哪一层', async () => {
+  // 实测踩到的坑：`memory_save` 写进语义层的作用域（默认 global），而 `memory_forget`
+  // 默认只查 project —— 于是「搜得到、删不掉」，模型还会以为已经删掉了。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const session = fakeSession('s-forget', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+
+    const reply = String(await toolOf(fake, 'memory_save').execute({
+      text: '按 id 删除应当跨作用域',
+      kind: 'constraint',
+    } as never, undefined as never))
+    const id = /sm_[0-9a-fA-F-]+/u.exec(reply)?.[0]
+    assert.ok(id !== undefined, `保存应答里应有 id：${reply}`)
+    assert.match(reply, /\(global\)/u, '语义层默认落在全局域')
+
+    // 不传 scope：应当直接删掉，而不是报 No memory matched。
+    const removed = String(await toolOf(fake, 'memory_forget').execute(
+      { id } as never, undefined as never,
+    ))
+    assert.match(removed, /Removed 1 memory record/u, `按 id 删除应跨作用域生效：${removed}`)
+
+    const left = String(await toolOf(fake, 'memory_search').execute(
+      { query: '按 id 删除应当跨作用域', scope: 'all' } as never, undefined as never,
+    ))
+    assert.doesNotMatch(left, new RegExp(id, 'u'), '删除后不应再检索到')
   } finally {
     await dispose()
   }
@@ -1245,7 +1305,7 @@ test('P1-② 第二次重复触发预警注入，且文案含正确做法', asyn
     const rendered = sectionText(fake, 'memory-layer:failures')
     assert.match(rendered, /已重复 2 次/u)
     assert.match(rendered, /UNTRUSTED FAILURE MEMORY/u)
-    assert.match(rendered, /PAST FAILURES/u)
+    assert.match(rendered, /已重复 N 次/u, '头部要说明两种条目的语气差异')
   } finally {
     await dispose()
   }
@@ -1296,13 +1356,18 @@ test('failure_resolve 记录正确做法并停止干预', async () => {
     const id = /fa_[0-9a-fA-F-]+/u.exec(listed)?.[0] ?? ''
 
     await toolOf(fake, 'failure_resolve').execute(
-      { id, remedy: '先创建目标目录再写入' } as never,
+      { id, remedy: '先创建目标目录再写入', trigger: '往不存在的目录写文件时' } as never,
       undefined as never,
     )
-    assert.equal(sectionText(fake, 'memory-layer:failures'), '', '已解决的失败不再预警')
+    const afterResolve = sectionText(fake, 'memory-layer:failures')
+    // 升级阶梯必须停下：不再出现「已重复 N 次」的预警行。
+    assert.doesNotMatch(afterResolve, /已重复 \d+ 次/u, `已解决的失败不应再按次数预警：${afterResolve}`)
     const records = await new MemoryStore(root).readFailures('global')
     assert.equal(records[0]?.status, 'deprecated')
     assert.equal(records[0]?.remedy, '先创建目标目录再写入')
+    assert.equal(records[0]?.trigger, '往不存在的目录写文件时', '触发方式必须落盘')
+    assert.equal(records[0]?.occurrencesAtResolve, 2, '要记下解决时的次数，才能算出解决后又触发了几次')
+    assert.ok(records[0]?.resolvedAt !== undefined)
   } finally {
     await dispose()
   }
@@ -1347,8 +1412,349 @@ test('失败经验按技术栈过滤，且统计里可见', async () => {
   }
 })
 
-test('安全策略覆盖失败层：用户纠偏落盘前过脱敏 + 去标识化', async () => {
-  const { fake, root, dispose } = await setup({ failures: true, reflectOnSessionEnd: false })
+// ---- 纠偏：两段式筛选（本地初筛 → 模型认定） -----------------------------
+
+/** 造一条「用户纠偏 + 一次机械失败」的会话，并跑完整轮次。 */
+async function correctionSession(
+  fake: FakeContext,
+  id: string,
+  correction: string,
+  options: { machineFailure?: boolean } = {},
+): Promise<void> {
+  const session = fakeSession(id, '/work/demo')
+  fake.emit('session/created', session)
+  fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+  if (options.machineFailure !== false) {
+    const fail = toolFailure(`c-${id}`, 'bash', 'Error: command failed with exit code 1', undefined, { command: 'npm test' })
+    fake.emit('session/event', session, fail.call)
+    fake.emit('session/event', session, fail.result)
+  }
+  fake.emit('session/event', session, userMessage(correction))
+  fake.emit('session/event', session, event('turn/end', { turn: 1, reason: 'completed' }))
+  await flushWrites(fake)
+}
+
+test('两段式纠偏：本地初筛命中但模型判定「不是纠偏」→ 一条记录都不落', async () => {
+  // 真实事故：一句平常的英文 "i have review,you should review again.after that commit"
+  // 命中了本地词表里的 'again'，于是在**全局**失败层留下一条垃圾记录。
+  // 现在关键词只负责「值得问一次模型」，结论由模型给。
+  const counter = { calls: 0 }
+  const payload = {
+    title: 't', summary: 's', decisions: [], todos: [], files: [], tags: [], facts: [], techniques: [],
+    corrections: [],
+  }
+  const { fake, root, dispose } = await setup(
+    { provider: 'test', model: 'test', reflectMinTurns: 1, reflectNoveltyThreshold: 0 },
+    true,
+    { llm: fakeLlm(payload, counter) },
+  )
+  try {
+    await correctionSession(fake, 's1', 'i have review,you should review again.after that commit')
+    assert.equal(counter.calls, 1, '本地初筛命中应换来一次模型认定')
+    const records = await new MemoryStore(root).readFailures('global')
+    assert.equal(
+      records.filter(record => record.fingerprint.kind === 'semantic').length,
+      0,
+      `模型说了不是纠偏，就不该留下语义失败记录：${JSON.stringify(records.map(r => r.symptom))}`,
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('两段式纠偏：模型认定是纠偏 → 落库的语义来自模型而非用户原句', async () => {
+  const counter = { calls: 0 }
+  const payload = {
+    title: 't', summary: 's', decisions: [], todos: [], files: [], tags: [], facts: [], techniques: [],
+    corrections: [{
+      trigger: '在没有先读文件的情况下直接编辑时',
+      wrong: '没读文件就改，触发了 file has not been read',
+      correctApproach: '先 read 目标文件再 edit',
+    }],
+  }
+  const { fake, root, dispose } = await setup(
+    { provider: 'test', model: 'test', reflectMinTurns: 1, reflectNoveltyThreshold: 0 },
+    true,
+    { llm: fakeLlm(payload, counter) },
+  )
+  try {
+    await correctionSession(fake, 's1', '不对，你应该先读文件再改')
+    const records = (await new MemoryStore(root).readFailures('global'))
+      .filter(record => record.fingerprint.kind === 'semantic')
+    assert.equal(records.length, 1, '模型认定的纠偏应落成一条语义失败记录')
+    const [record] = records
+    assert.equal(record?.trigger, '在没有先读文件的情况下直接编辑时')
+    assert.equal(record?.remedy, '先 read 目标文件再 edit')
+    assert.match(record?.symptom ?? '', /没读文件就改/u, '现象应取模型的归一化表述')
+    assert.doesNotMatch(record?.symptom ?? '', /不对，你应该先读文件再改/u, '不应把用户原句当现象')
+    // 纠偏紧跟一次机械失败：正确做法还要挂到那条机械记录上。
+    const machine = (await new MemoryStore(root).readFailures('global'))
+      .find(item => item.fingerprint.kind === 'machine')
+    assert.equal(machine?.remedy, '先 read 目标文件再 edit', 'remedy 应挂到刚失败的机械记录上')
+  } finally {
+    await dispose()
+  }
+})
+
+test('两段式纠偏的降级：无模型时只在「刚踩过坑」的会话里认纠偏', async () => {
+  // 没有模型路由时退回本地认定，但门槛收紧：必须同会话内刚发生过一次机械失败。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    // ① 有失败现场 → 认，并挂上 remedy。
+    await correctionSession(fake, 's1', '不要再跑 npm test 了，请先执行 npm run build')
+    // ② 没有失败现场 → 不认（这正是 'again' 那类误报被拦下的地方）。
+    await correctionSession(fake, 's2', 'i have review,you should review again', { machineFailure: false })
+
+    const records = (await new MemoryStore(root).readFailures('global'))
+      .filter(record => record.fingerprint.kind === 'semantic')
+    assert.equal(records.length, 1, `只应有失败现场那一条被认下：${JSON.stringify(records.map(r => r.symptom))}`)
+    assert.match(records[0]?.symptom ?? '', /不要再跑 npm test/u)
+    // DEF-06：断言**内容**而不是「非 undefined」—— 后者对任何取值都成立，等于没测。
+    // 触发方式必须取自那条机械失败（工具 + 归一化错误模板），而不是纠偏原话。
+    assert.match(records[0]?.trigger ?? '', /使用 bash/u, `触发方式应取自机械记录：${records[0]?.trigger}`)
+    assert.match(records[0]?.trigger ?? '', /Error: command failed/u, '触发方式应含机械错误模板')
+    assert.notEqual(records[0]?.trigger, records[0]?.remedy, '触发方式不应等于纠偏原话')
+    const machine = (await new MemoryStore(root).readFailures('global'))
+      .find(item => item.fingerprint.kind === 'machine')
+    assert.match(machine?.remedy ?? '', /npm run build/u, '降级路径同样要把做法挂到机械记录上')
+  } finally {
+    await dispose()
+  }
+})
+
+test('纠偏窗口：隔了两轮以上的跨话题纠偏不认（DEF-04）', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    // 第 1 轮失败，第 3 轮才说一句「不要再用…」——中间隔了一整轮，不是紧跟失败。
+    const s = fakeSession('w1', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    const failed = toolFailure('c1', 'bash', 'ENOENT: no such file or directory, open report.json', undefined, { command: 'cat report.json' })
+    fake.emit('session/event', s, failed.call)
+    fake.emit('session/event', s, failed.result)
+    fake.emit('session/event', s, event('turn/end', { turn: 1, reason: 'completed' }))
+    await flushWrites(fake)
+
+    fake.emit('session/event', s, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', s, userMessage('顺便看看 PlantUML 泳道怎么写'))
+    fake.emit('session/event', s, event('turn/end', { turn: 2, reason: 'completed' }))
+    await flushWrites(fake)
+
+    fake.emit('session/event', s, event('turn/start', { turn: 3 }))
+    fake.emit('session/event', s, userMessage('不要再用 PlantUML 画时序图了'))
+    fake.emit('session/event', s, event('turn/end', { turn: 3, reason: 'completed' }))
+    await flushWrites(fake)
+
+    const records = await new MemoryStore(root).readFailures('global')
+    const semantic = records.filter(record => record.fingerprint.kind === 'semantic')
+    assert.equal(semantic.length, 0, `跨话题纠偏不应被认下：${JSON.stringify(semantic.map(r => r.symptom))}`)
+    const machine = records.find(record => record.fingerprint.kind === 'machine')
+    assert.equal(machine?.remedy, '', '无关的旧失败不应被挂上做法')
+  } finally {
+    await dispose()
+  }
+})
+
+test('模型调用失败时退回本地降级，纠偏不被丢弃（DEF-03）', async () => {
+  const failing = {
+    stream: async function* stream() {
+      throw new Error('model unavailable')
+    },
+  }
+  const { fake, root, dispose } = await setup(
+    { provider: 'test', model: 'test', reflectMinTurns: 1, reflectNoveltyThreshold: 0 },
+    true,
+    { llm: failing },
+  )
+  try {
+    const s = fakeSession('m1', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    const failed = toolFailure('c1', 'bash', 'Error: command failed with exit code 1', undefined, { command: 'npm test' })
+    fake.emit('session/event', s, failed.call)
+    fake.emit('session/event', s, failed.result)
+    fake.emit('session/event', s, userMessage('不要再跑 npm test 了，请先执行 npm run build'))
+    fake.emit('session/event', s, event('turn/end', { turn: 1, reason: 'completed' }))
+    await flushWrites(fake)
+
+    const records = await new MemoryStore(root).readFailures('global')
+    const semantic = records.filter(record => record.fingerprint.kind === 'semantic')
+    assert.equal(
+      semantic.length,
+      1,
+      '模型失败已回退规则路径，纠偏应走本地降级而不是被丢弃'
+        + `（日志应含 distilled by rules）：${JSON.stringify(records.map(r => r.symptom))}`,
+    )
+    const machine = records.find(record => record.fingerprint.kind === 'machine')
+    assert.match(machine?.remedy ?? '', /npm run build/u, '做法应挂到机械失败上')
+  } finally {
+    await dispose()
+  }
+})
+
+test('dispose 路径也能认纠偏（distillOnTurnEnd=false，DEF-02）', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const s = fakeSession('d1', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    const failed = toolFailure('c1', 'bash', 'Error: command failed with exit code 1', undefined, { command: 'npm test' })
+    fake.emit('session/event', s, failed.call)
+    fake.emit('session/event', s, failed.result)
+    fake.emit('session/event', s, userMessage('不要再跑 npm test 了，请先执行 npm run build'))
+    // 刻意**不**发 turn/end：收尾只能由 dispose 触发。
+    fake.emit('session/disposed', s)
+    await flushWrites(fake)
+
+    const records = await new MemoryStore(root).readFailures('global')
+    const semantic = records.filter(record => record.fingerprint.kind === 'semantic')
+    assert.equal(semantic.length, 1, `dispose 路径也应认下纠偏：${JSON.stringify(records.map(r => r.symptom))}`)
+    const machine = records.find(record => record.fingerprint.kind === 'machine')
+    assert.match(machine?.remedy ?? '', /npm run build/u, 'dispose 路径也要把做法挂到机械失败上')
+  } finally {
+    await dispose()
+  }
+})
+
+test('memory_forget 能删掉 memory_search 返回的技巧层 id（DEF-05）', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create', when: 'integrating the orders client', summary: 'Call authorize first.', kind: 'api-usage',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `保存应答应含 id：${saved}`)
+    // 工具描述承诺「按 memory_search 的 id 删除」，而 memory_search 覆盖技巧层。
+    const found = String(await toolOf(fake, 'memory_search').execute(
+      { query: 'authorize', scope: 'all' } as never, undefined as never,
+    ))
+    assert.match(found, new RegExp(id, 'u'), `memory_search 应返回该技巧：${found}`)
+
+    const removed = String(await toolOf(fake, 'memory_forget').execute({ id } as never, undefined as never))
+    assert.match(removed, /Removed 1 technique/u, `按 id 应能删除技巧：${removed}`)
+    assert.equal((await new MemoryStore(root).readTechniques('global')).length, 0, '技巧应真的被删掉')
+  } finally {
+    await dispose()
+  }
+})
+
+test('失败注入段两类条目连续编号（DEF-07）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    await failSession(fake, fakeSession('n1', '/work/demo'), 'ENOENT: cannot write report.json')
+    await failSession(fake, fakeSession('n2', '/work/demo'), 'ENOENT: cannot write report.json')
+    const listed = String(await toolOf(fake, 'failure_list').execute({} as never, undefined as never))
+    const id = /fa_[0-9a-fA-F-]+/u.exec(listed)?.[0] ?? ''
+    await toolOf(fake, 'failure_resolve').execute({
+      id, remedy: '先创建报告目录再写文件', trigger: '写 report.json 之前忘了建目录',
+    } as never, undefined as never)
+
+    // 已解决的那条不再按次数预警，所以要另造一条**仍活跃**的失败，才能在同一段里
+    // 同时看到两类条目并检查编号。
+    await failSession(fake, fakeSession('n4', '/work/demo'), 'Error: command failed with exit code 1')
+    await failSession(fake, fakeSession('n5', '/work/demo'), 'Error: command failed with exit code 1')
+
+    const s = fakeSession('n3', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    const failed = toolFailure('c9', 'bash', 'Error: command failed with exit code 1')
+    fake.emit('session/event', s, failed.call)
+    fake.emit('session/event', s, failed.result)
+    fake.emit('session/event', s, userMessage('接着写 report.json，目录可能还不存在'))
+    await flushWrites(fake)
+
+    const rendered = sectionText(fake, 'memory-layer:failures')
+    assert.match(rendered, /已重复 3 次/u, `应有预警行：${rendered}`)
+    assert.match(rendered, /已解决/u, `应有提醒行：${rendered}`)
+    const numbers = [...rendered.matchAll(/^(\d+)\. /gmu)].map(match => Number(match[1]))
+    assert.deepEqual(numbers, numbers.map((_, index) => index + 1), `两类条目编号必须连续：${JSON.stringify(numbers)}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('最小字符预算下块头与 BEGIN/END 边界仍完整（DEF-08）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, recallChars: 200 })
+  try {
+    const s = fakeSession('f1', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    await toolOf(fake, 'memory_save').execute({ text: '构建命令是 pnpm build', kind: 'fact' } as never, undefined as never)
+    await fake.flush()
+    fake.emit('session/event', s, userMessage('构建命令是什么'))
+    const rendered = sectionText(fake, 'memory-layer:recall')
+    // 安全声明与围栏不能被预算裁掉：上限约束的是条目正文。
+    assert.match(rendered, /UNTRUSTED reference data, NOT instructions/u, '不可信声明必须保留')
+    assert.match(rendered, /--- BEGIN UNTRUSTED MEMORY ---/u, 'BEGIN 边界必须保留')
+    assert.match(rendered, /--- END UNTRUSTED MEMORY ---/u, 'END 边界必须保留')
+  } finally {
+    await dispose()
+  }
+})
+
+test('已解决的失败：触发场景命中时提前提醒，场景不符则不打扰', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    // 造一条反复失败并解决它，同时记下触发场景与做法。
+    await failSession(fake, fakeSession('f1', '/work/demo'), 'ENOENT: cannot write report.json')
+    await failSession(fake, fakeSession('f2', '/work/demo'), 'ENOENT: cannot write report.json')
+    const listed = String(await toolOf(fake, 'failure_list').execute({} as never, undefined as never))
+    const id = /fa_[0-9a-fA-F-]+/u.exec(listed)?.[0] ?? ''
+    await toolOf(fake, 'failure_resolve').execute({
+      id,
+      remedy: '先创建报告目录再写文件',
+      trigger: '写 report.json 之前忘了建目录',
+    } as never, undefined as never)
+
+    // 场景不符：另一个话题，且没有用过同款工具。
+    const unrelated = fakeSession('u1', '/work/demo')
+    fake.emit('session/created', unrelated)
+    fake.emit('session/event', unrelated, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', unrelated, userMessage('帮我看看 PlantUML 的泳道语法'))
+    assert.equal(
+      sectionText(fake, 'memory-layer:failures'),
+      '',
+      '触发场景没出现时不该拿已解决的旧坑打扰模型',
+    )
+
+    // 场景相符：说到写 report.json 与目录。
+    const related = fakeSession('u2', '/work/demo')
+    fake.emit('session/created', related)
+    fake.emit('session/event', related, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', related, userMessage('接着写 report.json，目录可能还不存在'))
+    const injected = sectionText(fake, 'memory-layer:failures')
+    assert.match(injected, /已解决/u, `相似场景应提前提醒：${injected}`)
+    assert.match(injected, /触发场景：写 report\.json 之前忘了建目录/u)
+    assert.match(injected, /先创建报告目录再写文件/u, '提醒里必须带当时验证过的做法')
+    assert.doesNotMatch(injected, /已重复 \d+ 次/u, '已解决记录不该按「你又犯了」的语气预警')
+  } finally {
+    await dispose()
+  }
+})
+
+test('安全策略覆盖失败层：纠偏落盘前过脱敏 + 去标识化', async () => {
+  const counter = { calls: 0 }
+  // 走**模型认定**的主路径：本地初筛命中后由模型给出纠偏语义。
+  const payload = {
+    title: 't',
+    summary: 's',
+    decisions: [],
+    todos: [],
+    files: [],
+    tags: [],
+    facts: [],
+    techniques: [],
+    corrections: [{
+      trigger: '改 OrderPolicy 的折扣规则时',
+      wrong: '直接用了 AKIAIOSFODNN7EXAMPLE 并写死 /etc/ssl/private/legacy.pem',
+      correctApproach: '读 src/OrderPolicy.ts 里的配置，别写死密钥',
+    }],
+  }
+  const { fake, root, dispose } = await setup(
+    { failures: true, provider: 'test', model: 'test', reflectMinTurns: 1, reflectNoveltyThreshold: 0 },
+    true,
+    { llm: fakeLlm(payload, counter) },
+  )
   try {
     const session = fakeSession('s-redact', '/work/demo')
     fake.emit('session/created', session)
@@ -1362,14 +1768,15 @@ test('安全策略覆盖失败层：用户纠偏落盘前过脱敏 + 去标识�
       arguments: JSON.stringify({ file_path: '/work/demo/src/OrderPolicy.ts' }),
     }))
     fake.emit('session/event', session, userMessage(
-      '不对，别再用 AKIAIOSFODNN7EXAMPLE 了，应该看 src/OrderPolicy.ts，或读 /etc/ssl/private/legacy.pem。',
+      '不对，别再用 AKIAIOSFODNN7EXAMPLE 了，应该看 src/OrderPolicy.ts。',
     ))
     fake.emit('session/event', session, event('turn/end', { turn: 1, reason: 'completed' }))
-    await fake.flush()
+    await flushWrites(fake)
 
+    assert.equal(counter.calls, 1, '应真的走了模型认定')
     const raw = await readFile(join(root, 'global', 'failures.jsonl'), 'utf8')
-    assert.ok(raw.length > 0, '用户纠偏应写入失败层')
-    // symptom 与 remedy 都会被注入后续会话，且默认落在全局域 —— 三层策略缺一不可。
+    assert.ok(raw.length > 0, '模型认定的纠偏应写入失败层')
+    // symptom / remedy / trigger 都会被注入后续会话，且默认落在全局域 —— 三层策略缺一不可。
     assert.doesNotMatch(raw, /AKIAIOSFODNN7EXAMPLE/u, '凭据不得原样落盘')
     assert.doesNotMatch(raw, /OrderPolicy/u, '项目私有标识不得原样落盘')
     assert.doesNotMatch(raw, /\/etc\/ssl/u, '工作区外绝对路径不得原样落盘')
@@ -1503,6 +1910,7 @@ test('P2-② failureBlockAfter>0 时守卫拒绝，理由含正确做法', async
       await failSession(fake, fakeSession(id, '/work/demo'), GUARDABLE_TEXT, undefined, { command: 'npm test' })
     }
     // 用户纠偏必须紧跟**同一次会话内**的失败：那句「应该怎么做」会成为这条失败的 remedy。
+    // 纠偏认定在 `turn/end` 触发（本地降级路径要求同会话内有机械失败），因此这一轮要收尾。
     const fix = fakeSession('s4', '/work/demo')
     fake.emit('session/created', fix)
     fake.emit('session/event', fix, event('turn/start', { turn: 1 }))
@@ -1510,7 +1918,8 @@ test('P2-② failureBlockAfter>0 时守卫拒绝，理由含正确做法', async
     fake.emit('session/event', fix, repeat.call)
     fake.emit('session/event', fix, repeat.result)
     fake.emit('session/event', fix, userMessage('不要再跑 npm test 了，请先执行 npm run build'))
-    await fake.flush()
+    fake.emit('session/event', fix, event('turn/end', { turn: 1, reason: 'completed' }))
+    await flushWrites(fake)
 
     const blocked = fake.guards
       .map(guard => guard({ name: 'bash', arguments: { command: 'npm test' } }))

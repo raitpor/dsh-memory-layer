@@ -165,7 +165,7 @@ export function redactTechnique(draft: TechniqueDraft): TechniqueDraft {
 }
 
 /**
- * 对整个提炼产物脱敏：标题、摘要、决定、待办、文件、事实与技巧。
+ * 对整个提炼产物脱敏：标题、摘要、决定、待办、文件、事实、纠偏与技巧。
  * @param memory - 提炼结果。
  * @returns 脱敏后的新对象。
  */
@@ -179,6 +179,12 @@ export function redactMemory(memory: DistilledMemory): DistilledMemory {
     tags: redactAll(memory.tags),
     facts: memory.facts.map(fact => ({ kind: fact.kind, text: redact(fact.text) })),
     techniques: memory.techniques.map(redactTechnique),
+    // 纠偏的三段文本都会进入全局失败层并被注入，必须与其它层同一道脱敏。
+    corrections: memory.corrections.map(correction => ({
+      trigger: redact(correction.trigger),
+      wrong: redact(correction.wrong),
+      correctApproach: redact(correction.correctApproach),
+    })),
   }
 }
 

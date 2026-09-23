@@ -70,11 +70,17 @@ test('redactMemory 覆盖全部字段', () => {
       tags: [secret],
       evidence: [],
     }],
+    corrections: [{
+      trigger: `场景 ${secret}`,
+      wrong: `错误 ${secret}`,
+      correctApproach: `做法 ${secret}`,
+    }],
   }
   const output = redactMemory(memory)
   assert.ok(!JSON.stringify(output).includes(secret), '任一字段都不得残留明文凭据')
   assert.equal(isRedacted(output.summary), true)
   assert.ok(!JSON.stringify(output.techniques).includes(secret), '技巧字段同样必须脱敏')
+  assert.ok(!JSON.stringify(output.corrections).includes(secret), '纠偏字段同样必须脱敏')
 })
 
 test('sanitizeForPrompt 剥离控制字符与 ANSI 转义', () => {

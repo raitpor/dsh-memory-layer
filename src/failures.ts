@@ -355,6 +355,99 @@ export function failureWarningLine(record: FailureRecord, recentFiles: readonly 
 }
 
 /**
+ * 为一个**机械**失败推导粗粒度的触发方式。
+ *
+ * 机械观测只知道「哪个工具、报了什么」，说不出「在什么情形下会撞上」—— 那需要模型。
+ * 这里给出的是**可用但不精确**的兜底描述（工具 + 归一化错误模板），用途有两个：
+ * 让 `failure_resolve` 没写 trigger 时也有东西可用于场景匹配，以及让 `failure_list`
+ * 不至于在触发方式一栏留空。语义纠偏的 trigger 由模型直接给出，不走这里。
+ *
+ * @param input - 工具名、错误名与归一化模板。
+ * @returns 触发方式描述；三者皆空时返回 `undefined`。
+ */
+export function deriveTrigger(input: {
+  tool?: string
+  errorName?: string
+  template?: string
+}): string | undefined {
+  const subject = [input.tool, input.errorName].filter((part): part is string => part !== undefined && part.length > 0)
+  const symptom = (input.template ?? '').trim()
+  if (subject.length === 0 && symptom.length === 0) return undefined
+  const where = subject.length === 0 ? '调用工具时' : `使用 ${subject.join(' ')} 时`
+  return symptom.length === 0 ? where : `${where}遇到「${symptom}」这类情况`
+}
+
+/**
+ * 渲染一条**已解决**失败的提前提醒。
+ *
+ * 与 {@link failureWarningLine} 的区别在语气与用途：那条是「你又犯了」，这条是
+ * 「这个场景以前踩过、已经解决，动手前先把结论拿走」。因此它不报重复次数，而是给出
+ * 触发方式与解决方案；若解决之后又被触发过，则据实说明 —— 那正是「修复没守住」的
+ * 信号，比单纯的复现次数更有价值。
+ *
+ * @param record - 已解决的失败记录。
+ * @returns 单行文本。
+ */
+export function failureLessonLine(record: FailureRecord): string {
+  const relapsed = record.occurrencesAtResolve === undefined
+    ? 0
+    : Math.max(0, record.occurrences - record.occurrencesAtResolve)
+  const parts = [`[已解决${relapsed > 0 ? `·解决后又触发 ${relapsed} 次` : ''}]`]
+  const trigger = failureTrigger(record)
+  if (trigger !== undefined) parts.push(`触发场景：${trigger}`)
+  parts.push(`现象：${record.symptom}`)
+  parts.push(record.remedy.length > 0 ? `当时的做法：${record.remedy}` : '当时的记录没写做法，动手前再确认一遍')
+  parts.push(`id ${record.id}`)
+  return parts.join(' — ')
+}
+
+/**
+ * 取一条失败记录的触发方式：显式字段优先，缺失时退回 {@link deriveTrigger}。
+ * @param record - 失败记录。
+ * @returns 触发方式描述；无从推导时 `undefined`。
+ */
+export function failureTrigger(record: FailureRecord): string | undefined {
+  if (record.trigger !== undefined && record.trigger.trim().length > 0) return record.trigger
+  return deriveTrigger({
+    ...(record.fingerprint.tool === undefined ? {} : { tool: record.fingerprint.tool }),
+    ...(record.fingerprint.errorName === undefined ? {} : { errorName: record.fingerprint.errorName }),
+    ...(record.fingerprint.template === undefined ? {} : { template: record.fingerprint.template }),
+  })
+}
+
+/**
+ * 判断一条**已解决**的记录是否值得在当前场景提前提醒。
+ *
+ * 判据刻意做成两条确定性规则，而不是一个可调的相似度阈值 —— 失败层通常只有个位数
+ * 记录，BM25 的 idf 在这种小语料上没有区分度，阈值只会变成没人能解释的魔数：
+ *
+ * 1. **工具命中**：当前会话用过同一个工具。工具名是强信号，直接放行；
+ * 2. **词面重合 ≥2 个词**：`trigger` + 解决方案与当前上下文（最近用户输入、文件、
+ *    工具名）的重合词数。单个词太容易偶合 —— 「文件」「错误」这类词遍地都是。
+ *
+ * @param record - 已解决的失败记录。
+ * @param contextTokens - 当前上下文的词集合（调用方用 `tokenize` 生成）。
+ * @param sessionTools - 当前会话用过的工具名。
+ * @returns 值得提醒时为 `true`。
+ */
+export function lessonMatches(
+  record: FailureRecord,
+  contextTokens: ReadonlySet<string>,
+  sessionTools: ReadonlySet<string>,
+): boolean {
+  const tool = record.fingerprint.tool
+  if (tool !== undefined && sessionTools.has(tool)) return true
+  const tokens = new Set(tokenize(`${failureTrigger(record) ?? ''} ${record.remedy}`))
+  let shared = 0
+  for (const token of tokens) {
+    if (!contextTokens.has(token)) continue
+    shared += 1
+    if (shared >= 2) return true
+  }
+  return false
+}
+
+/**
  * 渲染一条失败记录的完整正文（供 `failure_list` 使用）。
  * @param record - 失败记录。
  * @returns 多行文本。
@@ -367,6 +460,14 @@ export function failureDetail(record: FailureRecord): string {
     `Status: ${record.status} | First seen: ${new Date(record.firstSeen).toISOString()} | Last seen: ${new Date(record.lastSeen).toISOString()}`,
     `Remedy: ${record.remedy.length > 0 ? record.remedy : '(尚未记录正确做法，可用 failure_resolve 补充)'}`,
   ]
+  const trigger = failureTrigger(record)
+  if (trigger !== undefined) lines.push(`Trigger: ${trigger}`)
+  if (record.resolvedAt !== undefined) {
+    const relapsed = record.occurrencesAtResolve === undefined
+      ? 0
+      : Math.max(0, record.occurrences - record.occurrencesAtResolve)
+    lines.push(`Resolved at: ${new Date(record.resolvedAt).toISOString()}${relapsed > 0 ? `（解决后又触发 ${relapsed} 次）` : ''}`)
+  }
   if (record.fingerprint.template !== undefined) lines.push(`Template: ${record.fingerprint.template}`)
   if (record.sessions.length > 0) lines.push(`Sessions: ${record.sessions.join(', ')}`)
   if (record.evidence.length > 0) {

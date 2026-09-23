@@ -788,6 +788,8 @@ export class MemoryStore {
       symptom: string
       stack?: FailureRecord['stack']
       remedy?: string
+      /** 触发方式；缺省时记录里就没有可匹配的场景描述。 */
+      trigger?: string
       guard?: FailureRecord['guard']
     }[],
     options: {
@@ -821,6 +823,11 @@ export class MemoryStore {
         if (observation.guard !== undefined && existing.guard === undefined) {
           existing.guard = observation.guard
         }
+        // 触发方式一旦写定就不再被后来的观测改写：它是人工/模型给的语义结论，
+        // 而每次观测只能提供粗粒度推导，覆盖只会让它退化成模板文本。
+        if (observation.trigger !== undefined && existing.trigger === undefined) {
+          existing.trigger = observation.trigger
+        }
         if (!existing.sessions.includes(sessionId)) {
           existing.sessions = [...existing.sessions, sessionId].slice(-MAX_FAILURE_SESSIONS)
         }
@@ -838,6 +845,7 @@ export class MemoryStore {
         fingerprint: observation.fingerprint,
         symptom: observation.symptom,
         remedy: observation.remedy ?? '',
+        ...(observation.trigger === undefined ? {} : { trigger: observation.trigger }),
         ...(observation.guard === undefined ? {} : { guard: observation.guard }),
         enforcement: enforcement(1),
         occurrences: 1,

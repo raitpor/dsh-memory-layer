@@ -105,10 +105,10 @@ export function createMemoryTools(deps: MemoryToolDeps): ToolDefinition[] {
 
     defineTool({
       name: 'memory_forget',
-      description: `Delete stored memory by the id returned from memory_search. ${LAYER_NOTE} Passing "*" wipes the entire scope and is irreversible, so it additionally requires confirm: true.`,
+      description: `Delete stored memory by the id returned from memory_search. ${LAYER_NOTE} A single-id delete searches every scope, because ids are unique across scopes; pass scope only to narrow it. Passing "*" wipes the given scope and is irreversible, so it additionally requires confirm: true and defaults to the project scope.`,
       parameters: {
-        id: { type: 'string', required: true, description: 'Memory id from memory_search, or "*" to clear the whole scope.' },
-        scope: { type: 'string', description: "Scope to delete from: 'project' (default), 'global' or 'all'." },
+        id: { type: 'string', required: true, description: 'Memory id from memory_search, or "*" to clear a whole scope.' },
+        scope: { type: 'string', description: "Scope to delete from: 'project', 'global' or 'all'. Defaults to 'all' for a single id and 'project' for '*'." },
         confirm: { type: 'boolean', description: 'Must be true to allow the irreversible "*" wipe. Ignored for single-id deletes.' },
       },
       output: {
@@ -116,9 +116,14 @@ export function createMemoryTools(deps: MemoryToolDeps): ToolDefinition[] {
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args) {
-        const scope = parseScope(args.scope, 'project')
         const wipeAll = args.id.trim() === '*'
         if (wipeAll && args.confirm !== true) return WIPE_ALL_REFUSAL
+        // 未显式给 scope 时按「最不容易出错」的默认：按 id 删除跨全部作用域 ——
+        // id 是全局唯一 uuid，而 `memory_search` 默认搜全部、`memory_save` 又写进
+        // 语义层的作用域（默认 global），只查一个作用域必然出现「搜得到、删不掉」。
+        // `*` 清空则相反，默认只清 project：破坏性操作取最保守的默认值。
+        const fallback: MemoryScope | 'all' = wipeAll ? 'project' : 'all'
+        const scope = args.scope === undefined ? fallback : parseScope(args.scope, fallback)
         return deps.forget(args.id, scope, wipeAll)
       },
     }),
@@ -448,7 +453,7 @@ export interface FailureToolDeps {
    * @param remedy - 正确做法；给出后后续预警会带上它。
    * @returns 处理结果说明。
    */
-  resolve(id: string, remedy: string | undefined): Promise<string>
+  resolve(id: string, remedy: string | undefined, trigger: string | undefined): Promise<string>
   /**
    * 放行一次：本次会话内不再就这条失败预警（P2 起同时放行拦截）。
    * @param id - 失败记录 id。
@@ -493,19 +498,23 @@ export function createFailureTools(deps: FailureToolDeps): ToolDefinition[] {
       name: 'failure_resolve',
       description: [
         'Mark a recurring failure as resolved and record the correct approach.',
-        'Call it once you have actually fixed the root cause: the remedy you give here is what future warnings will say,',
+        'Call it once you have actually fixed the root cause: the remedy you give here is what future sessions will read,',
         'so write the concrete action, not "be careful".',
+        'Also give the trigger scene: the situation that brings this mistake about. A resolved failure stays silent,',
+        'but when a future session runs into that scene it is surfaced again as a heads-up, which is the only thing',
+        'standing between a fixed bug and a silent regression.',
       ].join(' '),
       parameters: {
         id: { type: 'string', required: true, description: 'Failure id returned by failure_list.' },
         remedy: { type: 'string', description: 'The correct approach, as one standalone sentence. Strongly recommended.' },
+        trigger: { type: 'string', description: 'The situation or action that leads to this mistake ("when editing a file that was not read first"), so it can be matched against future sessions.' },
       },
       output: {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args) {
-        return deps.resolve(args.id, args.remedy)
+        return deps.resolve(args.id, args.remedy, args.trigger)
       },
     }),
 

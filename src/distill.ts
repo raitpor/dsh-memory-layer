@@ -13,10 +13,12 @@
  * @module dsh-memory-layer/distill
  */
 
+import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from './injection.js'
 import { redactMemory } from './redact.js'
 import { MAX_SUMMARY_CHARS } from './store.js'
 import type {
   ApiSurface,
+  CorrectionDraft,
   DistilledMemory,
   ExtractionSource,
   LiveTurn,
@@ -56,7 +58,7 @@ export interface DistillResult {
 export const DISTILL_SYSTEM_PROMPT = [
   'You distill one AI coding-assistant session into long-term memory.',
   'Return ONE JSON object and nothing else, using this exact shape:',
-  '{"title":string,"summary":string,"decisions":string[],"todos":string[],"files":string[],"tags":string[],"facts":[{"kind":"fact"|"preference"|"decision"|"constraint","text":string}],"techniques":[{"kind":"api-usage"|"business-rule"|"procedure"|"pitfall"|"env-recipe","name":string,"when":string,"summary":string,"steps":string[],"api":[{"symbol":string,"signature":string,"notes":string}],"example":{"language":string,"kind":"usage"|"signature"|"config","code":string},"pitfalls":string[],"verify":string[],"domain":string,"tags":string[]}]}',
+  '{"title":string,"summary":string,"decisions":string[],"todos":string[],"files":string[],"tags":string[],"facts":[{"kind":"fact"|"preference"|"decision"|"constraint","text":string}],"corrections":[{"trigger":string,"wrong":string,"correctApproach":string}],"techniques":[{"kind":"api-usage"|"business-rule"|"procedure"|"pitfall"|"env-recipe","name":string,"when":string,"summary":string,"steps":string[],"api":[{"symbol":string,"signature":string,"notes":string}],"example":{"language":string,"kind":"usage"|"signature"|"config","code":string},"pitfalls":string[],"verify":string[],"domain":string,"tags":string[]}]}',
   'Rules:',
   '- title: one short line naming what the session was about, in the language of the session.',
   '- summary: 1-3 sentences of durable context; skip greetings, tool noise and dead ends.',
@@ -66,6 +68,15 @@ export const DISTILL_SYSTEM_PROMPT = [
   '- facts: long-lived facts and user preferences worth remembering across sessions.',
   '  Write each fact as a standalone sentence that still makes sense without this session.',
   '  Prefer a stable, canonical phrasing so repeated observations collapse into one fact.',
+  '- corrections: ONLY when the user pushed back on what you did or said (a mistake, a wrong',
+  '  assumption, "no, do it this way"): the local keyword filter has already flagged such a',
+  '  turn, so decide from the actual exchange whether it really was a correction. An ordinary',
+  '  new requirement, a follow-up task, or a neutral "try again" is NOT a correction — when in',
+  '  doubt, return an empty array. Getting this wrong pollutes a global, cross-project store.',
+  '  * trigger: the situation or action that brings the mistake about, phrased as a condition',
+  '    ("when editing a file that was not read first"). Future sessions match on this text.',
+  '  * wrong: what actually went wrong, normalised — do NOT paste the user sentence verbatim.',
+  '  * correctApproach: the concrete step to take instead, phrased as an instruction.',
   '- techniques: reusable KNOWLEDGE, not code. Emit one entry only when the session',
   '  established something a future session could apply elsewhere.',
   '  * name: a one-line statement of the technique, not a task description.',
@@ -102,6 +113,10 @@ const FIELD_LIMITS = {
   techniqueExampleLines: 8,
   techniqueExampleChars: 480,
   techniques: 5,
+  correctionTrigger: 200,
+  correctionWrong: 240,
+  correctionApproach: 300,
+  corrections: 3,
 } as const
 
 /**
@@ -199,7 +214,33 @@ function normalize(input: unknown, stack: StackProfile | undefined): DistilledMe
     tags: strings(record.tags, FIELD_LIMITS.tags, 48).map(tag => tag.toLowerCase()),
     facts: facts(record.facts),
     techniques: normalizeTechniqueDrafts(record.techniques, stack),
+    corrections: corrections(record.corrections),
   }
+}
+
+/**
+ * 校验并裁剪模型给出的**纠偏**认定。
+ *
+ * 三字段缺一即丢弃：只有「什么场景触发 / 错在哪 / 该怎么做」齐全，这条记录才能在
+ * 将来既当预警又当提醒 —— 半条纠偏只会在全局库里留噪音。
+ *
+ * @param input - 模型输出里的 `corrections` 字段。
+ * @returns 校验后的纠偏列表。
+ */
+function corrections(input: unknown): CorrectionDraft[] {
+  if (!Array.isArray(input)) return []
+  const out: CorrectionDraft[] = []
+  for (const entry of input) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const record = entry as Record<string, unknown>
+    const trigger = clip(string(record.trigger), FIELD_LIMITS.correctionTrigger)
+    const wrong = clip(string(record.wrong), FIELD_LIMITS.correctionWrong)
+    const correctApproach = clip(string(record.correctApproach), FIELD_LIMITS.correctionApproach)
+    if (trigger.length === 0 || wrong.length === 0 || correctApproach.length === 0) continue
+    out.push({ trigger, wrong, correctApproach })
+    if (out.length >= FIELD_LIMITS.corrections) break
+  }
+  return out
 }
 
 /**
@@ -361,16 +402,17 @@ const TODO_MARKERS = ['下一步', '接下来', '待办', 'todo', '剩下', '后
 const FILE_RE = /(?:^|[\s“"'([])((?:[\w.@-]+\/)*[\w.@-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|yml|yaml|toml|py|go|rs|java|kt|sh|sql|css|html|vue))(?=[\s”"'),:;]|$)/gu
 
 /**
- * 宿主注入块的起始标记。
+ * 注入块的起始标记。
  *
- * dsh 会把运行时快照、本插件的召回块、失败预警都作为 `user/message` 事件发出 ——
- * 它们是框架输出，不是用户说的话，捕获端必须整条挡掉。
+ * **从块定义派生，不再手抄**：dsh 会把运行时快照、本插件的召回/技巧/失败三段注入都作为
+ * `user/message` 事件发出，它们是框架输出、不是用户说的话，捕获端必须整条挡掉。标记若与
+ * 块首各写一份，改块首时漏同步就会让整段注入被重新捕获（并随「召回 → 再捕获」自我放大）；
+ * 技巧块的块首此前正是漏在表外的那一个。见 `injection.ts`。
  */
-const INJECTED_CONTEXT_MARKERS = [
-  'Current runtime context.',
-  'Recalled memory from earlier sessions',
-  'Mistakes that already happened repeatedly',
-] as const
+const INJECTED_CONTEXT_MARKERS: readonly string[] = [
+  ...HOST_CONTEXT_MARKERS,
+  ...INJECTION_BLOCKS.map(block => block.header[0] as string),
+]
 
 /**
  * 判断一条 user/message 是否整条都是宿主注入的上下文块。
@@ -460,6 +502,9 @@ export function distillWithRules(transcript: Transcript): DistilledMemory {
     facts: facts.slice(0, FIELD_LIMITS.items),
     // 规则路径不产出技巧：技巧需要跨会话可复用的抽象，靠会话末的模型反思或代码挖掘产出。
     techniques: [],
+    // 同理，规则路径**不认定纠偏语义**：本地关键词只能证明「这句话长得像纠偏」，
+    // 证明不了它真是纠偏，所以只留给模型判（见 `index.ts` 的两段式筛选）。
+    corrections: [],
   })
 }
 

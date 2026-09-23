@@ -20,6 +20,7 @@ package "dsh-memory-layer" as ML {
   component "tools.ts\n14 个 memory_/technique_/failure_ 工具" as TOOLS_IMPL
   component "store.ts\n四层持久化 · 原子写" as STORE
   component "distill.ts\n提炼(模型 + 规则兜底)" as DIST
+  component "injection.ts\n注入块定义(块首即识别标记)" as INJ
   component "recall.ts\nBM25 召回 + 分层过滤" as REC
   component "technique.ts\n置信度 · 状态迁移" as TECH
   component "failures.ts\n错误指纹 · 升级处置" as FAIL
@@ -54,6 +55,8 @@ TOOLS_IMPL --> TECH
 TOOLS_IMPL --> MINE
 TOOLS_IMPL --> SKILL
 IDX --> DIST
+IDX --> INJ
+DIST --> INJ
 IDX --> REC
 IDX --> FAIL
 IDX --> STK

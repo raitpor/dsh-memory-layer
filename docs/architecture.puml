@@ -1,0 +1,224 @@
+@startuml dsh-memory-layer-modules
+title dsh-memory-layer 模块结构
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam ArrowColor #555555
+skinparam PackageBorderColor #999999
+
+left to right direction
+
+package "dsh 运行时服务" as RT {
+  component "sessions" as SESS
+  component "systemPrompt" as PROMPT
+  component "tools" as TOOLS
+  component "llm" as LLM
+}
+
+package "dsh-memory-layer" as ML {
+  component "index.ts\n插件入口 · 事件接线 · 能力接线" as IDX
+  component "tools.ts\n14 个 memory_/technique_/failure_ 工具" as TOOLS_IMPL
+  component "store.ts\n四层持久化 · 原子写" as STORE
+  component "distill.ts\n提炼(模型 + 规则兜底)" as DIST
+  component "recall.ts\nBM25 召回 + 分层过滤" as REC
+  component "technique.ts\n置信度 · 状态迁移" as TECH
+  component "failures.ts\n错误指纹 · 升级处置" as FAIL
+  component "mine.ts\n代码挖掘流水线" as MINE
+  component "abstract.ts\n去标识化" as ABS
+  component "redact.ts\n脱敏 + 注入净化" as RED
+  component "crypto.ts\nAES-256-GCM" as CRY
+  component "stack/\n技术栈画像" as STK
+  component "skill.ts\nSKILL.md 导出" as SKILL
+}
+
+package "注册到 systemPrompt 的 section" as SEC {
+  interface "memory-layer:recall" as IREC
+  interface "memory-layer:techniques" as ITECH
+  interface "memory-layer:failures" as IFAIL
+}
+
+database "记忆库\n$DSH_HOME/memory-layer" as DB
+
+SESS --> IDX
+PROMPT --> IDX
+TOOLS --> TOOLS_IMPL
+LLM --> DIST
+
+IDX -right-> TOOLS_IMPL
+IDX ..> IREC : 注册 section
+IDX ..> ITECH : 注册 section
+IDX ..> IFAIL : 注册 section
+
+TOOLS_IMPL --> STORE
+TOOLS_IMPL --> TECH
+TOOLS_IMPL --> MINE
+TOOLS_IMPL --> SKILL
+IDX --> DIST
+IDX --> REC
+IDX --> FAIL
+IDX --> STK
+
+DIST --> ABS
+ABS --> RED
+MINE --> ABS
+MINE --> RED
+TECH --> STK
+STORE --> CRY
+STORE --> DB
+
+REC -down-> STORE
+TECH -down-> STORE
+FAIL -down-> STORE
+
+@enduml
+
+@startuml dsh-memory-layer-session
+title 一次会话：捕获 → 召回 → 摊销反思 → 采用回报
+
+autonumber "<b>[0]"
+hide footbox
+skinparam shadowing false
+
+box "dsh 运行时" #EEEEFF
+  participant "session" as S
+  participant "systemPrompt" as P
+  participant "tools" as T
+end box
+
+box "dsh-memory-layer" #EEFFEE
+  participant "index.ts" as M
+  participant "store.ts" as D
+end box
+
+participant "llm" as L
+
+S -> M ++ : session/created
+M -> D : 读当前项目桶
+
+== 每轮：召回注入 ==
+P -> M : 取三个 section 的正文
+M -> D : recall / techniques / failures
+D --> M : 条目 + 分数
+M --> P -- : 净化后的注入块
+note over M, P : sanitizeForInjection\n打断 {{ 与控制字符
+
+== 每轮：捕获 ==
+S -> M ++ : user/message · tool/call · assistant/message
+M -> M : 丢弃宿主注入块\n(source.kind = plugin)
+M -> D -- : turn/end 规则摘要兜底
+
+== 摊销反思(窗口 = reflectMinTurns) ==
+M -> M : 新增轮次 ≥ 窗口?
+M -> L ++ : distill(整会话转录)
+L --> M -- : 摘要 + 事实 + 技巧
+M -> D : 情景摘要 + 语义事实 + 技巧草稿
+note right of M : 只有真正付出模型调用\n才推进水位
+
+== 采用回报 ==
+T -> M ++ : technique_apply(id, success)
+M -> D -- : 置信度与状态迁移
+
+S -> M ++ : session/disposed
+M -> D -- : 最终落盘 + metrics
+M --
+
+@enduml
+
+@startuml dsh-memory-layer-mine
+title technique_learn 挖掘流水线
+
+skinparam shadowing false
+
+|#EEEEFF|扫描|
+start
+:scanRepository\n扩展名过滤 + .gitignore + 大小上限;
+:cacheHit\n内容哈希 + 提示版本 + 模型;
+note right
+  三者全同才跳过 ——
+  换模型或改提示词会自动重挖
+end note
+
+|#EEFFEE|分析|
+:analyzeSource\nimports / 调用点 + 参数个数 / 守卫 / 注解;
+:clusterSymbols\n按规范化调用名聚类\noccurrences ≥ mineMinOccurrences;
+
+|#FFEEEE|归纳|
+fork
+  :规则路径(零 token)\nruleCandidate 只陈述结构事实;
+fork again
+  :模型路径\n过 worthModeling 闸门;
+  :modelCandidates\n受 maxModelCalls 与 timeoutMs 双约束;
+end fork
+
+|#FFFFEE|闸门|
+:abstractTechniqueDraft\n项目私有标识 → 占位符;
+if (leakCheck 通过?) then (是)
+  :upsertTechniques\n按归一化 key 合并\n一律落为 draft;
+else (否)
+  :拒绝入库并记录原因;
+  detach
+endif
+
+|#EEEEFF|落盘|
+:写 mine-cache\n未变文件下次直接跳过;
+stop
+
+@enduml
+
+@startuml dsh-memory-layer-technique-lifecycle
+title 技巧的生命周期
+
+skinparam shadowing false
+
+[*] --> draft : 挖掘 / 反思 / technique_save\n出生即草稿
+draft --> validated : technique_apply(success) ≥ 1
+validated --> canonical : success ≥ 3 且 failure = 0\n且有代码证据
+validated --> deprecated : failure ≥ 2 且 failure > success
+canonical --> deprecated : 同上
+validated --> [*] : technique_export\n(写出 SKILL.md)
+canonical --> [*] : technique_export
+deprecated --> [*]
+
+note right of draft
+  草稿不参与自动注入
+  置信度 = (successes+1)/(successes+failures+2)
+  依据是「被采用且成功」，不是「被召回」
+end note
+
+note bottom of deprecated
+  deprecated 是粘性终态，不自动回升
+end note
+
+@enduml
+
+@startuml dsh-memory-layer-failure-escalation
+title 失败经验的升级处置
+
+skinparam shadowing false
+
+state "L0 静默记录" as L0
+state "L1 注入预警" as L1
+state "L2 派发前询问" as L2
+state "L3 硬拦截" as L3
+state "deprecated" as D
+
+[*] --> L0 : 第 1 次观测
+L0 --> L1 : occurrences ≥ failureWarnAfter (2)
+L1 --> L2 : occurrences ≥ failureAskAfter (3)
+L2 --> L3 : occurrences ≥ failureBlockAfter\n(默认 0 = 关闭)
+L1 --> D : failure_resolve
+L2 --> D : failure_resolve
+L3 --> D : failure_resolve
+
+note right of L1
+  通道：system prompt 注入
+end note
+note right of L2
+  通道：tools/pre-execute → ask
+end note
+note right of L3
+  通道：ctx.tools.guard（同步、单调）
+  自身拒绝不计入，防自我强化
+end note
+
+@enduml

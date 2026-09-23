@@ -6,18 +6,24 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   EPISODIC_FILE,
+  LOCK_STALE_MS,
+  MAX_SEMANTIC_PER_SCOPE,
   MemoryStore,
   SEMANTIC_FILE,
+  StoreIntegrityError,
+  StoreLockedError,
+  WRITER_LOCK_FILE,
   semanticKey,
   slugify,
   scopeDirName,
 } from '../src/store.js'
-import type { EpisodicRecord } from '../src/types.js'
+import { createCodec } from '../src/crypto.js'
+import type { EpisodicRecord, TechniqueDraft } from '../src/types.js'
 
 /** 建一个临时记忆库，并在用例结束时清理。 */
 async function withStore(run: (store: MemoryStore, root: string) => Promise<void>): Promise<void> {
@@ -245,5 +251,152 @@ test('forgetFailure：按记录 id 删除与整域清空', async () => {
     assert.equal((await store.readFailures('global')).length, 1)
     assert.equal(await store.forgetFailure('global', undefined, 'default', '*'), 1, '`*` 清空整域')
     assert.equal((await store.readFailures('global')).length, 0)
+  })
+})
+
+// ---- B1：写入互斥（跨进程锁 + 进程内串行） ----------------------------------
+
+/** 造一条技巧草稿。 */
+function draft(index: number): TechniqueDraft {
+  return {
+    kind: 'procedure',
+    name: `concurrent ${index}`,
+    when: `case ${index}`,
+    summary: `Written for case ${index}.`,
+    pitfalls: [], verify: [], stack: { languages: [] }, tags: [], evidence: [],
+  }
+}
+
+test('同一记忆库上的并发读-改-写不再互相覆盖', async () => {
+  await withStore(async (_store, root) => {
+    const a = new MemoryStore(root)
+    const b = new MemoryStore(root)
+    // 两个实例同时各写 10 条：每条都是「读全量 → 改 → 整体重写」，未加锁时后写者抹掉前写者。
+    await Promise.all([
+      a.upsertTechniques(Array.from({ length: 10 }, (_, i) => draft(i)), { scope: 'global', sessionId: 'sA', provenance: 'model' }),
+      b.upsertTechniques(Array.from({ length: 10 }, (_, i) => draft(100 + i)), { scope: 'global', sessionId: 'sB', provenance: 'model' }),
+    ])
+    const records = await new MemoryStore(root).readTechniques('global')
+    assert.equal(records.length, 20, '两边的写入都要在')
+  })
+})
+
+test('别人持锁时拒绝写入（而不是覆盖它的记录）', async () => {
+  await withStore(async (store, root) => {
+    await store.upsertTechniques([draft(1)], { scope: 'global', sessionId: 's1', provenance: 'model' })
+    const file = join(root, 'global', 'techniques.jsonl')
+    const before = await readFile(file, 'utf8')
+
+    // 造一把「新鲜的」别人的锁：从锁的角度看，就是一个正在写的实例。
+    const lock = join(root, WRITER_LOCK_FILE)
+    await writeFile(lock, `${JSON.stringify({ owner: 'other-host#999', pid: 999, at: Date.now() })}\n`)
+    await assert.rejects(
+      () => store.upsertTechniques([draft(2)], { scope: 'global', sessionId: 's2', provenance: 'model' }),
+      (error: unknown) => error instanceof StoreLockedError,
+      '持续被占时应报 StoreLockedError',
+    )
+    assert.equal(await readFile(file, 'utf8'), before, '被拒绝时目标文件必须原样不动')
+    await rm(lock, { force: true })
+  })
+})
+
+test('过期的锁会被接管，而不是把库永久锁死', async () => {
+  await withStore(async (store, root) => {
+    await store.upsertTechniques([draft(1)], { scope: 'global', sessionId: 's1', provenance: 'model' })
+    const lock = join(root, WRITER_LOCK_FILE)
+    await writeFile(lock, `${JSON.stringify({ owner: 'dead-host#404', pid: 404, at: 0 })}\n`)
+    // 把 mtime 拨到过期之前：模拟持锁进程已经死掉。
+    const old = new Date(Date.now() - LOCK_STALE_MS * 10)
+    await utimes(lock, old, old)
+
+    await store.upsertTechniques([draft(2)], { scope: 'global', sessionId: 's2', provenance: 'model' })
+    const records = await new MemoryStore(root).readTechniques('global')
+    assert.equal(records.length, 2, '接管后写入应成功')
+    await assert.rejects(() => stat(lock), '写完必须释放锁')
+  })
+})
+
+// ---- B2：密钥不匹配时 fail-closed -------------------------------------------
+
+/** 造一个加密库，写入一条后用错误的密钥重新打开。 */
+async function withWrongKey(run: (broken: MemoryStore, file: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-memory-key-'))
+  try {
+    const good = new MemoryStore(root, createCodec(Buffer.alloc(32, 7)))
+    await good.upsertTechniques([draft(1)], { scope: 'global', sessionId: 's1', provenance: 'model' })
+    const broken = new MemoryStore(root, createCodec(Buffer.alloc(32, 9)))
+    await run(broken, join(root, 'global', 'techniques.jsonl'))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+test('整份文件解不开时拒绝写入，保住旧密文', async () => {
+  await withWrongKey(async (broken, file) => {
+    const raw = await readFile(file, 'utf8')
+    assert.equal((await broken.readTechniques('global')).length, 0, '读不出来时按空库处理（既有约定）')
+    assert.equal(broken.integrityBroken, true, '整份解不开必须被标记')
+    assert.equal(broken.undecodableLines, 1, '解不开的行数要能报出来')
+
+    await assert.rejects(
+      () => broken.upsertTechniques([draft(2)], { scope: 'global', sessionId: 's2', provenance: 'model' }),
+      (error: unknown) => error instanceof StoreIntegrityError,
+      '此时写入必须被拒绝',
+    )
+    assert.equal(await readFile(file, 'utf8'), raw, '拒绝写入后旧密文必须原样保留，恢复密钥还能救回来')
+  })
+})
+
+test('个别行解不开时容忍并计数，写入照常', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-memory-partial-'))
+  try {
+    const good = new MemoryStore(root, createCodec(Buffer.alloc(32, 7)))
+    await good.upsertTechniques([draft(1)], { scope: 'global', sessionId: 's1', provenance: 'model' })
+    const file = join(root, 'global', 'techniques.jsonl')
+    // 混入一行用别的密钥加密的内容：单行解不开，但整份文件不是全解不开。
+    const foreign = createCodec(Buffer.alloc(32, 9)).encode(JSON.stringify({ id: 'tq_foreign' }))
+    await writeFile(file, `${await readFile(file, 'utf8')}${foreign}\n`)
+
+    const reopened = new MemoryStore(root, createCodec(Buffer.alloc(32, 7)))
+    assert.equal((await reopened.readTechniques('global')).length, 1, '好行仍然读得出来')
+    assert.equal(reopened.integrityBroken, false, '个别行解不开不算整库损坏')
+    assert.equal(reopened.undecodableLines, 1, '跳过的行数要能报出来')
+    await reopened.upsertTechniques([draft(2)], { scope: 'global', sessionId: 's2', provenance: 'model' })
+    assert.equal((await reopened.readTechniques('global')).length, 2, '容忍坏行时写入必须照常')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('语义层也有容量上限，且优先保留命中多的', async () => {
+  await withStore(async (store) => {
+    // 去重键由正文派生，因此反复写同一句话就是「反复观察到同一条事实」。
+    for (let i = 0; i < 21; i += 1) {
+      await store.upsertSemantic([{ kind: 'fact', text: '重要的老事实' }],
+        { scope: 'global', sessionId: `s${i}`, tags: [] })
+    }
+    await store.upsertSemantic(
+      Array.from({ length: MAX_SEMANTIC_PER_SCOPE + 50 }, (_, i) => ({
+        kind: 'fact' as const, text: `填充事实条目第 ${i} 号`,
+      })),
+      { scope: 'global', sessionId: 'bulk', tags: [] },
+    )
+    const records = await store.readSemantic('global')
+    assert.equal(records.length, MAX_SEMANTIC_PER_SCOPE, `应保留 ${MAX_SEMANTIC_PER_SCOPE} 条`)
+    const important = records.find(record => record.text === '重要的老事实')
+    assert.ok(important !== undefined, '命中多的老事实不能被按时间淘汰掉')
+    assert.equal(important.hits, 21, '命中次数仍要累计')
+  })
+})
+
+test('锁文件内容损坏时，仍能报出「有别的实例在写」', async () => {
+  await withStore(async (store, root) => {
+    // 持锁进程在写锁文件的中途崩掉，会留下半截内容；此时不能因为解析失败就当作没锁。
+    await writeFile(join(root, WRITER_LOCK_FILE), '{"owner": "half')
+    await assert.rejects(
+      () => store.upsertTechniques([draft(1)], { scope: 'global', sessionId: 's1', provenance: 'model' }),
+      (error: unknown) => error instanceof StoreLockedError && /unknown/u.test((error as Error).message),
+      '内容损坏的锁仍要阻塞写入，并把持锁者报成 unknown',
+    )
   })
 })

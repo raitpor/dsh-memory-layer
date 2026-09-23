@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-layer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "轻量级跨会话本地记忆：把会话按瞬时/情景/语义三层沉淀的 deepseek-harness 原生 Cordis 插件",
   "type": "module",
   "license": "MIT",
@@ -17,6 +17,7 @@
     "lib/src",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {

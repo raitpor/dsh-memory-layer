@@ -19,10 +19,12 @@
  * @module dsh-memory-layer/store
  */
 
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
+import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
+import { isEncrypted } from './crypto.js'
 import type { StoreCodec } from './crypto.js'
 import { mergeStack } from './stack/index.js'
 import type {
@@ -92,6 +94,67 @@ export const MAX_TECHNIQUE_API = 12
 
 /** 一条语义记忆最多保留的来源会话数。 */
 export const MAX_SEMANTIC_SOURCES = 20
+
+/** 语义层每作用域的记录上限（与其他三层同口径）。 */
+export const MAX_SEMANTIC_PER_SCOPE = 500
+
+/** 写者锁文件名；放在记忆库根目录。 */
+export const WRITER_LOCK_FILE = '.writer.lock'
+
+/** 锁的过期判定：临界区只有几毫秒（都是小文件的读-改-写），10 秒足以判定持锁者已死。 */
+export const LOCK_STALE_MS = 10_000
+
+/** 争锁的重试间隔与总等待上限。 */
+const LOCK_RETRY_MS = 25
+const LOCK_WAIT_MS = 2_000
+
+/**
+ * 另一个实例正在写同一个记忆库。
+ *
+ * 这是**刻意的拒绝**而不是排队等待：所有层都是「读全量 → 改 → 整体重写」，
+ * 两个进程重叠读-改-写窗口时，后写者会把前写者刚写的记录整份抹掉。
+ * 宁可让这一次写入失败并告警，也不要静默丢数据。
+ */
+export class StoreLockedError extends Error {
+  /** 持锁者标识（`主机#pid`）或 `unknown`。 */
+  readonly owner: string
+
+  /**
+   * @param owner - 持锁者标识。
+   * @param waitedMs - 已等待毫秒数。
+   */
+  constructor(owner: string, waitedMs: number) {
+    super(
+      `memory-store: another dsh instance is writing this store (${owner}, waited ${waitedMs}ms) — `
+      + 'refusing to write rather than overwrite its records. Retry in a moment.',
+    )
+    this.name = 'StoreLockedError'
+    this.owner = owner
+  }
+}
+
+/**
+ * 记忆库里有整份文件解不开（密钥不匹配或密文损坏）。
+ *
+ * 此时**必须拒绝写入**：写入是「整体重写」，会把那些读不出来的记录永久覆盖掉 ——
+ * 那样即使之后找回密钥也救不回来了。
+ */
+export class StoreIntegrityError extends Error {
+  /** 出问题的文件绝对路径。 */
+  readonly file: string
+
+  /**
+   * @param file - 整份无法解码的文件。
+   */
+  constructor(file: string) {
+    super(
+      `memory-store: "${file}" exists but none of its lines could be decoded — wrong or missing key? `
+      + 'Restore the key and restart BEFORE writing: a write would overwrite the unreadable records for good.',
+    )
+    this.name = 'StoreIntegrityError'
+    this.file = file
+  }
+}
 
 /** 语义层合并时判定「同一条事实」的归一化：去空白、去标点、转小写。 */
 export function semanticKey(text: string): string {
@@ -342,6 +405,22 @@ function mergeTechnique(
   if (existing.example === undefined && draft.example !== undefined) existing.example = draft.example
 }
 
+/** 一次失败观测的输入形状（`upsertFailures` 的入参元素）。 */
+export interface FailureObservation {
+  /** 归一化错误模板。 */
+  fingerprint: FailureRecord['fingerprint']
+  /** 现象描述。 */
+  symptom: string
+  /** 观测到的技术栈。 */
+  stack?: FailureRecord['stack']
+  /** 正确做法；已解决时补上。 */
+  remedy?: string
+  /** 触发方式；缺省时记录里就没有可匹配的场景描述。 */
+  trigger?: string
+  /** 自动推导出的守卫。 */
+  guard?: FailureRecord['guard']
+}
+
 /** 本地记忆库：负责一个存储根下的读、写、合并，不做打分排序。 */
 export class MemoryStore {
   /** 存储根目录。 */
@@ -357,6 +436,266 @@ export class MemoryStore {
   constructor(root: string, codec?: StoreCodec) {
     this.root = root
     if (codec !== undefined) this.codec = codec
+  }
+
+  /** 进程内写入串行链：把所有写入排成一条队，避免同进程内的读-改-写互相覆盖。 */
+  private writeChain: Promise<void> = Promise.resolve()
+
+  /** 读到的无法解码的行数（密钥不匹配或密文损坏）。 */
+  private decodeFailures = 0
+
+  /** 第一份「整份都解不开」的文件；非空即说明密钥不对或密文损坏。 */
+  private integrityFile: string | undefined
+
+  /** 无法解码的行数；调用方 >0 时应告警（静默跳过等于静默丢数据）。 */
+  get undecodableLines(): number {
+    return this.decodeFailures
+  }
+
+  /** 是否存在整份解不开的文件。 */
+  get integrityBroken(): boolean {
+    return this.integrityFile !== undefined
+  }
+
+  /** 第一份整份解不开的文件路径。 */
+  get brokenFile(): string | undefined {
+    return this.integrityFile
+  }
+
+  /**
+   * 在写者锁内执行一次读-改-写。
+   *
+   * 锁必须是**方法级**而不是 `writeAtomic` 级：这些方法都是「读全量 → 改 → 整体重写」，
+   * 只锁最后那次写，读到的仍是别人改之前的快照，照样互相覆盖（B1）。
+   *
+   * @param fn - 临界区内的读-改-写。
+   * @returns 临界区返回值。
+   * @throws {StoreIntegrityError} 记忆库里有整份解不开的文件。
+   * @throws {StoreLockedError} 另一个实例持续持锁超过等待上限。
+   */
+  private async exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.writeChain
+    let release!: () => void
+    this.writeChain = new Promise<void>(resolve => { release = resolve })
+    await previous
+    try {
+      if (this.integrityFile !== undefined) throw new StoreIntegrityError(this.integrityFile)
+      const unlock = await this.acquireWriterLock()
+      try {
+        return await fn()
+      } finally {
+        await unlock()
+      }
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * 取跨进程写者锁：`O_EXCL` 建锁文件，过期则接管，持续被占则按上限报错。
+   *
+   * 只在本地文件系统上可靠（`wx` 的原子性）；网络文件系统需另配锁服务。
+   *
+   * @returns 释放函数。
+   * @throws {StoreLockedError} 超过 `LOCK_WAIT_MS` 仍未拿到锁。
+   */
+  private async acquireWriterLock(): Promise<() => Promise<void>> {
+    const file = join(this.root, WRITER_LOCK_FILE)
+    const owner = `${hostname()}#${process.pid}`
+    const started = Date.now()
+    await mkdir(this.root, { recursive: true, mode: DIRECTORY_MODE })
+    for (;;) {
+      try {
+        await writeFile(file, `${JSON.stringify({ owner, pid: process.pid, at: started })}\n`, {
+          encoding: 'utf8',
+          mode: FILE_MODE,
+          flag: 'wx',
+        })
+        return async () => {
+          // 只删自己建的那把锁：若已被判定过期并接管，这里删的就是别人的锁。
+          try {
+            const raw = await readFile(file, 'utf8')
+            if (raw.includes(`"${owner}"`)) await rm(file, { force: true })
+          } catch {
+            // 锁文件已被释放/接管，无需处理。
+          }
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+
+      let fresh = true
+      try {
+        const info = await stat(file)
+        fresh = Date.now() - info.mtimeMs <= LOCK_STALE_MS
+      } catch (error) {
+        if (isNotFound(error)) continue      // 恰好被释放，立刻重试
+        throw error
+      }
+      if (!fresh) {
+        await rm(file, { force: true }).catch(() => undefined)
+        continue
+      }
+      if (Date.now() - started >= LOCK_WAIT_MS) {
+        throw new StoreLockedError(await readLockOwner(file), Date.now() - started)
+      }
+      await sleep(LOCK_RETRY_MS)
+    }
+  }
+
+
+  // ---- 公开写入入口：一律在写者锁内执行（B1） --------------------------------
+
+  /**
+   * 写入一条情景记录（加锁）。
+   * @param record - 待写入记录。
+   * @returns 写盘后该作用域保留的记录条数。
+   */
+  async saveEpisodic(record: EpisodicRecord): Promise<number> {
+    return this.exclusive(() => this.saveEpisodicInner(record))
+  }
+
+  /**
+   * 合并语义事实（加锁）。
+   * @param drafts - 待合并的事实草稿。
+   * @param options - 归属作用域、项目目录、来源会话与标签。
+   * @returns 合并后的语义记录全集。
+   */
+  async upsertSemantic(
+    drafts: readonly SemanticDraft[],
+    options: {
+      scope: MemoryScope
+      cwd?: string
+      partition?: string
+      sessionId: string
+      tags: readonly string[]
+      now?: number
+    },
+  ): Promise<SemanticRecord[]> {
+    return this.exclusive(() => this.upsertSemanticInner(drafts, options))
+  }
+
+  /**
+   * 写入技巧草稿（加锁）。
+   * @param drafts - 技巧草稿。
+   * @param options - 归属、来源与时间。
+   * @returns 合并结果与新增/合并计数。
+   */
+  async upsertTechniques(
+    drafts: readonly TechniqueDraft[],
+    options: {
+      scope: MemoryScope
+      cwd?: string
+      partition?: string
+      sessionId: string
+      provenance: TechniqueRecord['provenance']
+      now?: number
+    },
+  ): Promise<{ records: TechniqueRecord[]; created: number; merged: number }> {
+    return this.exclusive(() => this.upsertTechniquesInner(drafts, options))
+  }
+
+  /**
+   * 按 id 原地替换一条技巧（加锁）。
+   * @param record - 更新后的记录。
+   * @param cwd - 项目工作目录（project 作用域需要）。
+   * @returns 是否命中并写入。
+   */
+  async updateTechnique(record: TechniqueRecord, cwd?: string): Promise<boolean> {
+    return this.exclusive(() => this.updateTechniqueInner(record, cwd))
+  }
+
+  /**
+   * 删除技巧记录（加锁）。
+   * @param scope - 记忆作用域。
+   * @param cwd - 项目工作目录。
+   * @param partition - 分区名。
+   * @param id - 目标 id，或 `*` 清空。
+   * @returns 被删除的条数。
+   */
+  async forgetTechnique(
+    scope: MemoryScope,
+    cwd: string | undefined,
+    partition: string | undefined,
+    id: string,
+  ): Promise<number> {
+    return this.exclusive(() => this.forgetTechniqueInner(scope, cwd, partition, id))
+  }
+
+  /**
+   * 记录失败观测（加锁）。
+   * @param observations - 待记录的观测。
+   * @param options - 归属、来源与时间。
+   * @returns 合并后的全集与该次观测命中的记录。
+   */
+  async upsertFailures(
+    observations: readonly FailureObservation[],
+    options: {
+      scope: MemoryScope
+      cwd?: string
+      partition?: string
+      sessionId: string
+      enforcement: (occurrences: number) => FailureRecord['enforcement']
+      now?: number
+    },
+  ): Promise<{ records: FailureRecord[]; touched: FailureRecord[] }> {
+    return this.exclusive(() => this.upsertFailuresInner(observations, options))
+  }
+
+  /**
+   * 按 id 原地替换一条失败记录（加锁）。
+   * @param record - 更新后的记录。
+   * @param cwd - 项目工作目录。
+   * @returns 是否命中并写入。
+   */
+  async updateFailure(record: FailureRecord, cwd?: string): Promise<boolean> {
+    return this.exclusive(() => this.updateFailureInner(record, cwd))
+  }
+
+  /**
+   * 删除失败记录（加锁）。
+   * @param scope - 记忆作用域。
+   * @param cwd - 项目工作目录。
+   * @param partition - 分区名。
+   * @param id - 目标 id，或 `*` 清空。
+   * @returns 被删除的条数。
+   */
+  async forgetFailure(
+    scope: MemoryScope,
+    cwd: string | undefined,
+    partition: string | undefined,
+    id: string,
+  ): Promise<number> {
+    return this.exclusive(() => this.forgetFailureInner(scope, cwd, partition, id))
+  }
+
+  /**
+   * 原子写入记忆库根目录下的 JSON 文件（加锁）。
+   * @param name - 文件名。
+   * @param value - 可序列化的值。
+   */
+  async writeJsonFile(name: string, value: unknown): Promise<void> {
+    return this.exclusive(() => this.writeJsonFileInner(name, value))
+  }
+
+  /**
+   * 写入反思指标（加锁）。
+   * @param metrics - 完整指标快照。
+   */
+  async saveMetrics(metrics: ReflectionMetrics): Promise<void> {
+    return this.exclusive(() => this.saveMetricsInner(metrics))
+  }
+
+  /**
+   * 删除一条记忆（情景或语义），按 id 匹配（加锁）。
+   * @param scope - 记忆作用域。
+   * @param cwd - 项目工作目录。
+   * @param id - 目标 id，或 `*` 清空该作用域。
+   * @param partition - 分区名。
+   * @returns 被删除的条数。
+   */
+  async forget(scope: MemoryScope, cwd: string | undefined, id: string, partition?: string): Promise<number> {
+    return this.exclusive(() => this.forgetInner(scope, cwd, id, partition))
   }
 
   /**
@@ -393,19 +732,31 @@ export class MemoryStore {
    * @param raw - 落盘原文。
    * @returns 有效行（已解密、已剔除空行）的数组。
    */
-  private decode(raw: string): string[] {
-    const codec = this.codec
+  private decode(raw: string, file: string, trackIntegrity = true): string[] {
     const out: string[] = []
+    let total = 0
+    let failed = 0
     for (const line of raw.split('\n')) {
       if (line.trim().length === 0) continue
+      total += 1
+      const codec = this.codec
       if (codec === undefined) {
-        out.push(line)
+        // 明文模式下遇到密文行 = 把加密库当成明文库打开，读不出内容但也**不能**重写它。
+        if (isEncrypted(line)) failed += 1
+        else out.push(line)
         continue
       }
       try {
         out.push(codec.decode(line))
       } catch {
-        // 跳过无法解密的行：宁可少一条记忆，也不要整个库读不出来。
+        failed += 1
+      }
+    }
+    if (failed > 0) {
+      this.decodeFailures += failed
+      // 只有「整份都解不开」才算密钥不匹配级别的损坏：个别坏行按既有约定容忍。
+      if (trackIntegrity && total > 0 && failed === total && this.integrityFile === undefined) {
+        this.integrityFile = file
       }
     }
     return out
@@ -429,7 +780,7 @@ export class MemoryStore {
       throw error
     }
     const records: EpisodicRecord[] = []
-    for (const line of this.decode(raw)) {
+    for (const line of this.decode(raw, file)) {
       try {
         records.push(JSON.parse(line) as EpisodicRecord)
       } catch {
@@ -478,7 +829,7 @@ export class MemoryStore {
       throw error
     }
     let count = 0
-    for (const line of this.decode(raw)) {
+    for (const line of this.decode(raw, file)) {
       try {
         JSON.parse(line)
         count += 1
@@ -507,7 +858,7 @@ export class MemoryStore {
     }
     try {
       // 单行 JSON 与旧的多行美化 JSON 都能还原：逐行解密后用换行拼回。
-      const parsed: unknown = JSON.parse(this.decode(raw).join('\n'))
+      const parsed: unknown = JSON.parse(this.decode(raw, file).join('\n'))
       return Array.isArray(parsed) ? parsed as SemanticRecord[] : []
     } catch {
       return []
@@ -520,7 +871,7 @@ export class MemoryStore {
    * @param record - 待写入的情景记录。
    * @returns 写盘后该作用域保留的记录条数。
    */
-  async saveEpisodic(record: EpisodicRecord): Promise<number> {
+  private async saveEpisodicInner(record: EpisodicRecord): Promise<number> {
     const existing = await this.readEpisodic(record.scope, record.cwd, record.partition)
     const withoutSameSession = existing.filter(item => item.sessionId !== record.sessionId)
     const next = [...withoutSameSession, record].slice(-MAX_EPISODIC_PER_SCOPE)
@@ -535,7 +886,7 @@ export class MemoryStore {
    * @param options - 归属作用域、项目目录、来源会话与标签。
    * @returns 合并后的语义记录全集。
    */
-  async upsertSemantic(
+  private async upsertSemanticInner(
     drafts: readonly SemanticDraft[],
     options: {
       scope: MemoryScope
@@ -582,7 +933,14 @@ export class MemoryStore {
       }
       existing.tags = [...new Set([...existing.tags, ...tags])]
     }
-    const next = [...byKey.values()].sort((left, right) => left.ts - right.ts)
+    // 语义层原本没有容量上限，而它是「单行 JSON + 整表重写」，无界增长会同时放大内存与写开销。
+    // 淘汰规则与其他三层不同：**先保命中多的、再看新旧** —— 语义事实的价值正比于被反复观察到的
+    // 次数，纯按时间丢会把长期有效的偏好丢掉。
+    const next = [...byKey.values()]
+      .sort((left, right) => left.ts - right.ts)
+      .sort((left, right) => right.hits - left.hits)
+      .slice(0, MAX_SEMANTIC_PER_SCOPE)
+      .sort((left, right) => left.ts - right.ts)
     await this.writeAtomic(
       join(this.scopeDir(scope, cwd, partition), SEMANTIC_FILE),
       `${JSON.stringify(next)}\n`,
@@ -608,7 +966,7 @@ export class MemoryStore {
       throw error
     }
     const records: TechniqueRecord[] = []
-    for (const line of this.decode(raw)) {
+    for (const line of this.decode(raw, file)) {
       try {
         records.push(JSON.parse(line) as TechniqueRecord)
       } catch {
@@ -627,7 +985,7 @@ export class MemoryStore {
    * @param options - 归属作用域、项目目录、分区、来源会话与产出途径。
    * @returns 合并后的全集与新建/合并计数。
    */
-  async upsertTechniques(
+  private async upsertTechniquesInner(
     drafts: readonly TechniqueDraft[],
     options: {
       scope: MemoryScope
@@ -712,7 +1070,7 @@ export class MemoryStore {
    * @param cwd - 项目工作目录（`record.scope` 为 `project` 时必填）。
    * @returns 命中并写回时为 `true`。
    */
-  async updateTechnique(record: TechniqueRecord, cwd?: string): Promise<boolean> {
+  private async updateTechniqueInner(record: TechniqueRecord, cwd?: string): Promise<boolean> {
     const records = await this.readTechniques(record.scope, cwd, record.partition)
     const index = records.findIndex(item => item.id === record.id)
     if (index < 0) return false
@@ -734,7 +1092,7 @@ export class MemoryStore {
    * @param id - 目标记录 id，或 `*` 表示清空该作用域全部技巧。
    * @returns 被删除的记录条数。
    */
-  async forgetTechnique(
+  private async forgetTechniqueInner(
     scope: MemoryScope,
     cwd: string | undefined,
     partition: string | undefined,
@@ -769,7 +1127,7 @@ export class MemoryStore {
       throw error
     }
     const records: FailureRecord[] = []
-    for (const line of this.decode(raw)) {
+    for (const line of this.decode(raw, file)) {
       try {
         records.push(JSON.parse(line) as FailureRecord)
       } catch {
@@ -789,16 +1147,8 @@ export class MemoryStore {
    * @param options - 归属作用域、分区、来源会话与时间。
    * @returns 合并后的全集与该次观测命中的记录。
    */
-  async upsertFailures(
-    observations: readonly {
-      fingerprint: FailureRecord['fingerprint']
-      symptom: string
-      stack?: FailureRecord['stack']
-      remedy?: string
-      /** 触发方式；缺省时记录里就没有可匹配的场景描述。 */
-      trigger?: string
-      guard?: FailureRecord['guard']
-    }[],
+  private async upsertFailuresInner(
+    observations: readonly FailureObservation[],
     options: {
       scope: MemoryScope
       cwd?: string
@@ -887,7 +1237,7 @@ export class MemoryStore {
    * @param cwd - 项目工作目录（`record.scope` 为 `project` 时必填）。
    * @returns 命中并写回时为 `true`。
    */
-  async updateFailure(record: FailureRecord, cwd?: string): Promise<boolean> {
+  private async updateFailureInner(record: FailureRecord, cwd?: string): Promise<boolean> {
     const records = await this.readFailures(record.scope, cwd, record.partition)
     const index = records.findIndex(item => item.id === record.id)
     if (index < 0) return false
@@ -907,7 +1257,7 @@ export class MemoryStore {
    * @param id - 目标记录 id，或 `*` 表示清空该作用域全部失败记录。
    * @returns 被删除的记录条数。
    */
-  async forgetFailure(
+  private async forgetFailureInner(
     scope: MemoryScope,
     cwd: string | undefined,
     partition: string | undefined,
@@ -936,15 +1286,17 @@ export class MemoryStore {
    * @returns 解析后的值。
    */
   async readJsonFile<T>(name: string, fallback: T): Promise<T> {
+    const file = join(this.root, name)
     let raw: string
     try {
-      raw = await readFile(join(this.root, name), 'utf8')
+      raw = await readFile(file, 'utf8')
     } catch (error) {
       if (isNotFound(error)) return fallback
       throw error
     }
     try {
-      const parsed: unknown = JSON.parse(this.decode(raw).join('\n'))
+      // 挖掘缓存不是记忆本体：它读不出来只该重挖，不该触发「整库不可写」。
+      const parsed: unknown = JSON.parse(this.decode(raw, file, false).join('\n'))
       return parsed === null || parsed === undefined ? fallback : parsed as T
     } catch {
       return fallback
@@ -956,7 +1308,7 @@ export class MemoryStore {
    * @param name - 文件名（不含路径）。
    * @param value - 可序列化的值。
    */
-  async writeJsonFile(name: string, value: unknown): Promise<void> {
+  private async writeJsonFileInner(name: string, value: unknown): Promise<void> {
     await this.writeAtomic(join(this.root, name), `${JSON.stringify(value)}\n`)
   }
 
@@ -974,7 +1326,7 @@ export class MemoryStore {
       throw error
     }
     try {
-      const parsed = JSON.parse(this.decode(raw).join('\n')) as Partial<ReflectionMetrics>
+      const parsed = JSON.parse(this.decode(raw, file).join('\n')) as Partial<ReflectionMetrics>
       return { ...emptyMetrics(), ...parsed }
     } catch {
       return emptyMetrics()
@@ -985,7 +1337,7 @@ export class MemoryStore {
    * 写入反思指标。
    * @param metrics - 完整指标快照。
    */
-  async saveMetrics(metrics: ReflectionMetrics): Promise<void> {
+  private async saveMetricsInner(metrics: ReflectionMetrics): Promise<void> {
     await this.writeAtomic(join(this.root, METRICS_FILE), `${JSON.stringify(metrics)}\n`)
   }
 
@@ -996,7 +1348,7 @@ export class MemoryStore {
    * @param id - 目标记录 id，或 `*` 表示清空该作用域全部记忆。
    * @returns 被删除的记录条数。
    */
-  async forget(scope: MemoryScope, cwd: string | undefined, id: string, partition?: string): Promise<number> {
+  private async forgetInner(scope: MemoryScope, cwd: string | undefined, id: string, partition?: string): Promise<number> {
     const dir = this.scopeDir(scope, cwd, partition)
     const episodic = await this.readEpisodic(scope, cwd, partition)
     const semantic = await this.readSemantic(scope, cwd, partition)
@@ -1028,6 +1380,25 @@ export class MemoryStore {
     await writeFile(temp, this.encode(content), { encoding: 'utf8', mode: FILE_MODE })
     await rename(temp, file)
   }
+}
+
+/**
+ * 读锁文件里的持锁者标识，读不到就返回 `unknown`。
+ * @param file - 锁文件路径。
+ * @returns 持锁者标识。
+ */
+async function readLockOwner(file: string): Promise<string> {
+  try {
+    const parsed = JSON.parse(await readFile(file, 'utf8')) as { owner?: unknown }
+    return typeof parsed.owner === 'string' ? parsed.owner : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+/** 等待若干毫秒。 */
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>(resolve => setTimeout(resolve, ms))
 }
 
 /** 判断一个未知错误是否为「文件不存在」。 */

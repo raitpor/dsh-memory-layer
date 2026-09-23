@@ -20,6 +20,7 @@ import { apply } from '../src/index.js'
 import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from '../src/injection.js'
 import type { Config } from '../src/index.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
+import { createCodec } from '../src/crypto.js'
 import { DETAILED_HITS, MAX_VERIFICATION_CHARS } from '../src/technique.js'
 import { parseSkillFrontmatter, verifySkill } from '../src/skill.js'
 
@@ -2593,3 +2594,56 @@ test('P4-③ confidential 技巧无法导出为 skill', async () => {
   }
 })
 
+
+// ---- B1/B2：写入互斥与密钥不匹配的可见性 ------------------------------------
+
+test('另一个实例持锁时，写入工具当场报错而不是静默成功', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    // 造一把新鲜的别人的锁：从锁的角度看就是一个正在写的实例。
+    await writeFile(join(root, '.writer.lock'), `${JSON.stringify({ owner: 'other-host#77', pid: 77, at: Date.now() })}\n`)
+    await assert.rejects(
+      async () => toolOf(fake, 'memory_save').execute(
+        { text: '这条写不进去', kind: 'fact' } as never, undefined as never,
+      ),
+      /another dsh instance is writing/u,
+      '必须把「另一个实例在写」明确报出来，而不是静默丢弃或覆盖',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('密钥不匹配时：memory_stats 报警，写入被拒，旧密文不动', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, encrypt: true })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    await toolOf(fake, 'memory_save').execute({ text: '需要保住的事实', kind: 'fact' } as never, undefined as never)
+    const file = join(root, 'global', 'semantic.json')
+
+    // 把落盘内容换成「另一把密钥」写的密文：等价于换了机器/恢复备份时没带上密钥，
+    // 而当前进程手里的仍是原来那把 —— 于是整份文件解不开（而不是单行损坏）。
+    const foreign = createCodec(Buffer.alloc(32, 0xAB))
+    await writeFile(file, `${foreign.encode(JSON.stringify([{ id: 'sm_foreign' }]))}\n`)
+    const before = await readFile(file, 'utf8')
+
+    // 换一个会话触发重新读盘，让插件发现「整份解不开」。
+    fake.emit('session/created', fakeSession('s2', '/work/demo'))
+    await fake.flush()
+    const stats = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+    assert.match(stats, /Store integrity: BROKEN/u, '统计里必须明确报出整库不可读')
+    assert.match(stats, /writes are refused/u, '并说明写入已被拒绝')
+
+    await assert.rejects(
+      async () => toolOf(fake, 'memory_save').execute({ text: '不该写进去', kind: 'fact' } as never, undefined as never),
+      /could be decoded/u,
+      '此时写入必须失败并给出可操作的理由',
+    )
+    assert.equal(await readFile(file, 'utf8'), before, '旧密文必须原样保留，恢复密钥后还能救回来')
+  } finally {
+    await dispose()
+  }
+})

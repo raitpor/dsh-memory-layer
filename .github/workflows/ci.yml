@@ -1,0 +1,23 @@
+# 最小 CI：类型检查 + 全部单测/集成测试。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 与本插件开发环境一致的版本线；engines 允许 >=20，但 dsh 依赖对齐 0.1.5-rc.x，
+          # 先在已知可用的版本上跑绿，再谈放宽。
+          node-version: '26'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

@@ -596,6 +596,10 @@ export function apply(ctx: Context, config: Config): void {
    *
    * @param cwd - 目标项目目录；缺省用当前会话。
    */
+  /** 「整库解不开」与「个别坏行」各自只吼一次，避免每轮刷屏。 */
+  let integrityWarned = false
+  let undecodableWarned = false
+
   const refresh = async (cwd?: string): Promise<void> => {
     const directory = resolveCwd(cwd)
     const key = bucketKey(directory)
@@ -628,6 +632,21 @@ export function apply(ctx: Context, config: Config): void {
       ...toDocs([...episodic, ...globalEpisodic], [...semantic, ...globalSemantic]),
       ...toTechniqueDocs(techniques),
     ])
+    // 整份文件解不开（密钥不匹配/密文损坏）时，读取会静默返回空库，而写入又已被拒绝。
+    // 两条都没声音的话，用户只会看到「记忆突然没了」，所以这里主动吼一声（每进程一次）。
+    if (store.integrityBroken && !integrityWarned) {
+      integrityWarned = true
+      logger.error(
+        `memory: store at ${settings.dir} is unreadable (${store.brokenFile ?? 'unknown file'}) — wrong or missing key? `
+        + 'Writes are refused until the key is restored; writing now would overwrite the unreadable records for good.',
+      )
+    } else if (store.undecodableLines > 0 && !undecodableWarned) {
+      undecodableWarned = true
+      logger.warn(
+        `memory: skipped ${store.undecodableLines} undecodable line(s) under ${settings.dir} — individual corrupt lines `
+        + 'are tolerated, but a whole-file failure blocks writes.',
+      )
+    }
   }
 
   /**
@@ -1680,7 +1699,13 @@ export function apply(ctx: Context, config: Config): void {
         `Recurring failures: ${[...failureById.values()].filter(record => record.status !== 'deprecated').length} active, `
           + `${[...failureById.values()].filter(record => record.status === 'deprecated').length} resolved, `
           + `${[...failureById.values()].reduce((sum, record) => sum + record.prevented, 0)} prevented`,
+        ...(store.integrityBroken
+          ? [`Store integrity: BROKEN — ${store.brokenFile ?? 'unknown file'} cannot be decoded; writes are refused until the key is restored`]
+          : store.undecodableLines > 0
+            ? [`Store integrity: ${store.undecodableLines} undecodable line(s) skipped`]
+            : []),
         `Active session turns (transient): ${current?.turns.length ?? 0}`,
+
         `Experience compounding: reflections=${metrics.reflections}, skipped=${metrics.skipped}, new=${metrics.newTechniques}, duplicates=${metrics.duplicateTechniques}, backoff=${metrics.backoff}`,
       ].join('\n')
     },

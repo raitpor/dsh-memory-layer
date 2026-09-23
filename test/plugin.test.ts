@@ -713,6 +713,11 @@ test('会话内反思默认开启：含新信息时产出 draft 技巧', async (
     const report = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
     assert.match(report, /Techniques: 0 verified, 1 draft/u)
     assert.match(report, /Experience compounding: reflections=1/u)
+    // 四层作用域都要报出来：漏掉 failure 会让「按层作用域」这句话只对了一半。
+    assert.match(
+      report,
+      /Layer scopes: episodic=project, semantic=global, technique=global, failure=global/u,
+    )
   } finally {
     await dispose()
   }
@@ -803,6 +808,44 @@ test('摊销式反思：每积累 reflectMinTurns 个新轮次就反思一次，
     fake.emit('session/disposed', session)
     await fake.flush()
     assert.equal(counter.calls, 2, '会话末不重复反思已经反思过的轮次')
+  } finally {
+    await dispose()
+  }
+})
+
+test('退避不是死锁：退避期间的普通信号不反思，用户纠偏能放行一次', async () => {
+  const counter = { calls: 0 }
+  // 模型每次都回「没有新技巧」，于是每次反思都记一次「无新产出」。
+  const emptyPayload = { title: 't', summary: 's', techniques: [] }
+  const { fake, dispose } = await setup(
+    {
+      provider: 'test',
+      model: 'test',
+      reflectMinTurns: 1,
+      reflectBackoffAfterEmpty: 1,
+      reflectNoveltyThreshold: 0,
+    },
+    true,
+    { llm: fakeLlm(emptyPayload, counter) },
+  )
+  try {
+    // 第一次反思毫无产出 → 立即进入退避。
+    await runSession(fake, fakeSession('s1', '/work/demo'), '改一下 src/a.ts。', ['src/a.ts'])
+    fake.emit('session/disposed', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    assert.equal(counter.calls, 1, '首次有学习信号应反思')
+
+    // 退避期间：新会话、照样有用工具，但成本闸门应当拦住。
+    await runSession(fake, fakeSession('s2', '/work/demo'), '再改一下 src/b.ts。', ['src/b.ts'])
+    fake.emit('session/disposed', fakeSession('s2', '/work/demo'))
+    await fake.flush()
+    assert.equal(counter.calls, 1, '退避期间普通信号不应再花钱')
+
+    // 用户纠偏是最高价值信号：它必须能穿透退避，否则退避永远等不到清零的那次反思。
+    await runSession(fake, fakeSession('s3', '/work/demo'), '不对，应该先注册 BlockItem。', ['src/c.ts'])
+    fake.emit('session/disposed', fakeSession('s3', '/work/demo'))
+    await fake.flush()
+    assert.equal(counter.calls, 2, '用户纠偏应绕过退避')
   } finally {
     await dispose()
   }
@@ -1209,6 +1252,28 @@ test('失败经验按技术栈过滤，且统计里可见', async () => {
   }
 })
 
+test('失败层写入先脱敏：用户纠偏里的凭据不得进全局库', async () => {
+  const { fake, root, dispose } = await setup({ failures: true, reflectOnSessionEnd: false })
+  try {
+    const session = fakeSession('s-redact', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage(
+      '不对，别再用 AKIAIOSFODNN7EXAMPLE 了，应该读 src/secret/AppKey.ts 里的配置。',
+    ))
+    fake.emit('session/event', session, event('turn/end', { turn: 1, reason: 'completed' }))
+    await fake.flush()
+
+    const raw = await readFile(join(root, 'global', 'failures.jsonl'), 'utf8')
+    assert.ok(raw.length > 0, '用户纠偏应写入失败层')
+    // symptom 与 remedy 都会被注入后续会话，且默认落在全局域 —— 凭据必须先脱敏。
+    assert.doesNotMatch(raw, /AKIAIOSFODNN7EXAMPLE/u, '凭据不得原样落盘')
+    assert.match(raw, /\[REDACTED:aws-key\]/u, '应替换为种类化占位符')
+  } finally {
+    await dispose()
+  }
+})
+
 // ---- 派发前拦截：P2 验收（设计 §16 P2 行） ----------------------------------
 
 /** 一条反复失败的 bash 命令（守卫应能从参数推导出窄条件）。 */
@@ -1555,3 +1620,4 @@ test('P4-③ confidential 技巧无法导出为 skill', async () => {
     await dispose()
   }
 })
+

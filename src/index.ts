@@ -962,16 +962,6 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
-   * 决定会话结束时是否**花钱**调用模型做反思。
-   *
-   * 这是「前期投入、后期节省」得以成立的关键闸门：没有新信息就不调用。
-   * 任一高价值信号（触及新文件、用到工具、用户纠偏）会绕过新颖度闸门。
-   *
-   * @param state - 会话状态。
-   * @param transcript - 会话要点快照。
-   * @returns 是否反思与原因。
-   */
-  /**
    * 自上次反思以来新增的轮次。摊销口径的唯一来源。
    * @param state - 会话状态。
    * @returns 尚未反思过的轮次。
@@ -979,6 +969,24 @@ export function apply(ctx: Context, config: Config): void {
   const turnsSinceReflection = (state: LiveSession): LiveTurn[] =>
     state.turns.slice(state.reflectedTurns ?? 0)
 
+  /**
+   * 决定这次是否**花钱**调用模型做反思。
+   *
+   * 这是「前期投入、后期节省」得以成立的关键闸门：没有新信息就不调用。
+   * 三道闸门依次是：新增轮次够不够 `reflectMinTurns`、有没有学习信号、
+   * 词面新颖度是否达到 `reflectNoveltyThreshold`。
+   *
+   * **用户纠偏是唯一的例外**：它绕过退避，也不再受新颖度闸门约束。两个原因：
+   *
+   * 1. 退避不能是死锁 —— `metrics.backoff` 只在「某次反思真的有新产出」时才清零，
+   *    若退避期间一律不反思，就永远等不到清零的那次反思（这曾是真实缺陷）。
+   * 2. 纠偏本身稀有，且是「用户明确说不是这样」的直接证据，卡在词面新颖度上
+   *    会把最有价值的信号挡在门外。
+   *
+   * @param state - 会话状态。
+   * @param transcript - 会话要点快照。
+   * @returns 是否反思与原因。
+   */
   const reflectDecision = (state: LiveSession, transcript: Transcript): { reflect: boolean; reason: string } => {
     if (!settings.reflectOnSessionEnd) return { reflect: false, reason: 'reflection disabled' }
     // 摊销口径：只看上次反思之后**新增**的轮次。首轮与旧口径等价（总轮次），此后
@@ -988,6 +996,9 @@ export function apply(ctx: Context, config: Config): void {
       return { reflect: false, reason: `only ${fresh.length} new turn(s)` }
     }
     if (!hasLearningSignal(fresh)) return { reflect: false, reason: 'no learning signal' }
+    if (hasCorrectionSignal(fresh)) {
+      return { reflect: true, reason: `${fresh.length} new turn(s), user correction` }
+    }
     if (metrics.backoff) return { reflect: false, reason: 'backoff after empty reflections' }
     // 比较必须「同口径」：既有技巧是**去标识化后**存储的，转录也要先过同一道占位符化，
     // 否则项目私有标识符每次都算「新词」，闸门永远关不上。
@@ -1057,7 +1068,8 @@ export function apply(ctx: Context, config: Config): void {
    * 三处安全设计：
    * 1. 只读**当前会话目录所属的桶**（跨项目隔离）。
    * 2. 头部声明记忆为不可信数据、不得作为指令（抵御持久化提示注入）。
-   * 3. 正文经 {@link sanitizeForPrompt} 剥离控制字符并中性化可与结构混淆的标记。
+   * 3. 正文经 {@link sanitizeForInjection} 剥离控制字符、中性化可与结构混淆的标记，
+   *    并中和会被模板插值器误认的 `{{`。
    *
    * @param query - 召回查询词（通常是当前会话最近的用户输入）。
    * @returns 注入文本；无可注入内容时为空串。
@@ -1083,7 +1095,8 @@ export function apply(ctx: Context, config: Config): void {
    * 只给索引行（名称 / 状态 / 适用栈 / 触发条件 / id），完整步骤与示例交给
    * `technique_get` 按需展开 —— 这是控制上下文成本的关键。
    *
-   * 过滤链：分区 → 敏感级别 → 技术栈 → 状态（草稿与废弃不注入）→ BM25 + 置信度。
+   * 过滤链：状态（草稿与废弃不注入）→ 分区 → 技术栈 → BM25 + 置信度。
+   * 敏感级别不在这里过滤 —— `confidential` 在**写入时**就进不了全局域。
    *
    * @param query - 召回查询词（通常是当前会话最近的用户输入）。
    * @returns 注入文本；无可注入内容时为空串。
@@ -1348,7 +1361,7 @@ export function apply(ctx: Context, config: Config): void {
       const verified = techniques.filter(injectable).length
       return [
         `Memory root: ${settings.dir}`,
-        `Layer scopes: episodic=${settings.scopeEpisodic}, semantic=${settings.scopeSemantic}, technique=${settings.scopeTechnique} (partition ${settings.partition})`,
+        `Layer scopes: episodic=${settings.scopeEpisodic}, semantic=${settings.scopeSemantic}, technique=${settings.scopeTechnique}, failure=${settings.scopeFailure} (partition ${settings.partition})`,
         `Episodic summaries: ${episodic} (this project) · ${episodicTotal} (all projects)`,
         `Semantic facts: ${semantic}`,
         `Techniques: ${verified} verified, ${techniques.length - verified} draft`,
@@ -1539,10 +1552,14 @@ export function apply(ctx: Context, config: Config): void {
         if (settings.failures && CORRECTION_MARKERS.some(marker => text.toLowerCase().includes(marker))) {
           const fingerprint = semanticFingerprint(text)
           if (fingerprint !== undefined) {
-            const remedy = clipHead(text.trim().replace(/\s+/gu, ' '), 300)
+            // 现象与 remedy 都会被注入后续会话，且默认落在**全局域**，因此必须先过脱敏 ——
+            // 指纹里的 template 自带脱敏，但 symptom / remedy 是另存的正文，漏掉这一步
+            // 就会把用户原话里的凭据直接写进全局库。
+            const clean = redact(text.trim().replace(/\s+/gu, ' '))
+            const remedy = clipHead(clean, 300)
             recordFailure(
               state,
-              { fingerprint, symptom: `用户纠偏：${clipHead(text.trim().replace(/\s+/gu, ' '), 200)}` },
+              { fingerprint, symptom: `用户纠偏：${clipHead(clean, 200)}` },
               remedy,
             )
             // 用户纠偏通常紧跟在一次失败之后：那句「应该怎么做」正是这条失败缺的 remedy。
@@ -2200,6 +2217,20 @@ const CORRECTION_MARKERS = [
 ]
 
 /**
+ * 判断一段轮次里是否出现**用户纠偏** —— 最高价值的学习信号。
+ *
+ * 它比「用了工具」「碰了新文件」稀有得多，所以只有它能绕过退避与新颖度闸门：
+ * 用户明确说「不是这样」时，代价再高也值得重新沉淀一次。
+ *
+ * @param turns - 待判定的轮次。
+ * @returns 出现纠偏时为 `true`。
+ */
+function hasCorrectionSignal(turns: readonly LiveTurn[]): boolean {
+  return turns.some(turn =>
+    CORRECTION_MARKERS.some(marker => turn.user.toLowerCase().includes(marker)))
+}
+
+/**
  * 判断一段轮次里是否存在「值得沉淀」的信号。
  *
  * 纯闲聊、纯问答的会话不该触发反思 —— 这是反思成本曲线能递减的第一道保障。
@@ -2209,10 +2240,8 @@ const CORRECTION_MARKERS = [
  * @returns 存在学习信号时为 `true`。
  */
 function hasLearningSignal(turns: readonly LiveTurn[]): boolean {
-  return turns.some(turn =>
-    turn.files.length > 0
-    || turn.tools.length > 0
-    || CORRECTION_MARKERS.some(marker => turn.user.toLowerCase().includes(marker)))
+  return turns.some(turn => turn.files.length > 0 || turn.tools.length > 0)
+    || hasCorrectionSignal(turns)
 }
 
 /** 从文本里抽取可能的调用名（供 `symbol` 精确加权）。 */

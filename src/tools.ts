@@ -48,8 +48,13 @@ export interface MemoryToolDeps {
   stats(): Promise<string>
 }
 
-/** 工具描述里统一说明的三层结构，保证模型理解召回范围。 */
-const LAYER_NOTE = 'Memory is stored in three layers: transient (current session), episodic (one summary per past session) and semantic (long-lived facts and preferences).'
+/**
+ * 工具描述里统一说明的分层结构，保证模型理解召回范围。
+ *
+ * 必须与 `LAYER_SCOPE_DEFAULTS` 的五层对齐：`memory_search` 实际会返回
+ * episodic / semantic / technique 三种记录，只写「三层」会让模型以为技巧不在召回范围内。
+ */
+const LAYER_NOTE = 'Cross-session memory is stored in five layers: transient (current session), episodic (one summary per past session), semantic (long-lived facts and preferences), technique (reusable knowledge mined from code and sessions) and failure (mistakes that keep recurring). memory_search covers the episodic, semantic and technique layers; technique_* and failure_* tools cover the rest.'
 
 /** `*` 通配在未确认时的拒绝说明。 */
 export const WIPE_ALL_REFUSAL = [

@@ -165,3 +165,15 @@ test('slugify 与 scopeDirName 产出文件系统安全的目录名', () => {
   assert.match(scopeDirName('project', '/work/demo'), /^projects\/demo-[0-9a-f]{8}$/u)
   assert.equal(scopeDirName('global', '/work/demo'), 'global')
 })
+
+test('countProjectEpisodic 汇总所有项目桶，且不把 global 算进去', async () => {
+  await withStore(async store => {
+    await store.saveEpisodic(episodic({ id: 'ep_a', cwd: '/work/a', sessionId: 'sa' }))
+    await store.saveEpisodic(episodic({ id: 'ep_b', cwd: '/work/b', sessionId: 'sb' }))
+    await store.saveEpisodic(episodic({ id: 'ep_c', cwd: '/work/b', sessionId: 'sc' }))
+    await store.saveEpisodic(episodic({ id: 'ep_g', scope: 'global', sessionId: 'sg' }))
+
+    assert.equal((await store.readEpisodic('project', '/work/a')).length, 1, '当前桶只有 1 条')
+    assert.equal(await store.countProjectEpisodic(), 3, '跨项目总数应为 3，global 不计')
+  })
+})

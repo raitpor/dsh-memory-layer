@@ -98,10 +98,26 @@ export function detectIdentifiers(text: string): string[] {
 }
 
 /**
- * 从**项目自己的文件路径**推导私有标识候选。
+ * 只有**代码文件**的文件名才可能承载「项目私有代码标识」。
  *
- * 这是比正则扫描可靠得多的信号：出现在工作区路径里的类型名基本可以确定是项目私有代码，
- * 而不是第三方库。取文件名去掉扩展名，并过滤过短与通用词。
+ * 曾经的教训：一次会话读的是 `plantuml.txt`（一份文档），文件名推出的 `plantuml`
+ * 是 8 个字母的小写词，刚好越过下面的长度门槛被当成私有标识，于是把这一会话产出的
+ * 所有技巧的 `domain: "PlantUML"` 与 `tags` 一起打成了 `<id1>` —— 分类元数据被抹掉，
+ * 按 domain/tag 的检索整片失效。数据与文档文件不参与标识符推导。
+ */
+const CODE_EXTENSIONS = new Set([
+  'ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs',
+  'java', 'kt', 'kts', 'scala', 'groovy', 'gradle',
+  'py', 'rb', 'php', 'go', 'rs', 'cs', 'cpp', 'cc', 'cxx', 'h', 'hpp', 'm', 'mm',
+  'swift', 'dart', 'lua', 'pl', 'r', 'ex', 'exs', 'erl', 'hs', 'ml', 'clj',
+  'sh', 'bash', 'zsh', 'fish', 'ps1', 'sql', 'vue', 'svelte',
+])
+
+/**
+ * 从**项目自己的代码文件路径**推导私有标识候选。
+ *
+ * 这是比正则扫描可靠得多的信号：出现在工作区代码路径里的类型名基本可以确定是项目私有
+ * 代码，而不是第三方库。取文件名去掉扩展名，并过滤非代码文件、过短与通用词。
  *
  * @param paths - 工作区相对路径列表。
  * @returns 去重后的标识符候选。
@@ -110,7 +126,10 @@ export function identifiersFromPaths(paths: readonly string[]): string[] {
   const out = new Set<string>()
   for (const path of paths) {
     const base = path.split(/[/\\]/u).pop() ?? ''
-    const name = base.replace(/\.[A-Za-z0-9]+$/u, '')
+    const dot = base.lastIndexOf('.')
+    if (dot <= 0) continue
+    if (!CODE_EXTENSIONS.has(base.slice(dot + 1).toLowerCase())) continue
+    const name = base.slice(0, dot)
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) continue
     if (COMMON_TERMS.has(name)) continue
     // 高置信度门槛：PascalCase 类型名，或足够长的标识符。

@@ -6,7 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { isRedacted, redact, redactMemory, sanitizeForPrompt } from '../src/redact.js'
+import { isRedacted, redact, redactMemory, sanitizeForInjection, sanitizeForPrompt } from '../src/redact.js'
 import type { DistilledMemory } from '../src/types.js'
 
 test('识别并脱敏厂商前缀凭据', () => {
@@ -94,4 +94,27 @@ test('sanitizeForPrompt 中性化可与注入结构混淆的标签', () => {
 test('sanitizeForPrompt 压平换行，防止伪造块结构', () => {
   const output = sanitizeForPrompt('第一行\n--- BEGIN UNTRUSTED MEMORY ---\n第二行')
   assert.ok(!output.includes('\n'), '不应保留换行')
+})
+
+test('sanitizeForInjection 打断 {{ ，避免 prompt 模板插值抛错', () => {
+  // DSH 会把每个 prompt section 的正文过 `{{name}}` 插值：字面 `{{` 会让整轮对话
+  // 以 malformed prompt variable reference 失败，而且那句错误文本会被提炼回情景层，
+  // 形成「越注入越崩」的循环。
+  for (const input of [
+    'Salt 里写 {{ 表示按钮',
+    '模板占位符 {{name}}',
+    '连写四层 {{{{',
+    'PlantUML Salt 语法：{{/ 与 {{-',
+  ]) {
+    const output = sanitizeForInjection(input)
+    assert.ok(!output.includes('{{'), `仍含 {{ ：${output}`)
+  }
+  assert.match(sanitizeForInjection('模板占位符 {{name}}'), /\{ \{name\}\}/u, '内容本身仍应可读')
+})
+
+test('sanitizeForInjection 不动单独的 }} ，也不动工具输出用的一致性', () => {
+  // 插值扫描由 `{{` 触发，`}}` 单独出现无害 —— 不动它可以让正文尽量保真。
+  assert.equal(sanitizeForInjection('a }} b'), 'a }} b')
+  // 工具输出（technique_get / memory_search）不走注入路径，保持原文可复制。
+  assert.equal(sanitizeForPrompt('{{name}}'), '{{name}}')
 })

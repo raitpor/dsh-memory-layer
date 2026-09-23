@@ -860,6 +860,67 @@ test('技巧注入块要求用 technique_apply 回报采用，不自造文本标
   }
 })
 
+test('召回与检索按层打标签：技巧不得被标成 episodic', async () => {
+  // 曾经注入与检索两处都写成 `layer === 'semantic' ? 'long-term' : 'episodic'`，
+  // 于是 technique / failure 记录一律被标成 episodic —— 模型会把「一条可复用的技巧」
+  // 误读成「某次会话的摘要」，来源判断直接错。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('集成 OrdersClient 并调用 authorize'))
+
+    const injected = sectionText(fake, 'memory-layer:recall')
+    assert.match(injected, /\(technique\)/u, `注入块应标 technique：${injected}`)
+
+    const found = String(await toolOf(fake, 'memory_search').execute(
+      { query: 'authorize', scope: 'all' } as never, undefined as never,
+    ))
+    assert.match(found, new RegExp(id, 'u'), `检索应命中该技巧：${found}`)
+    assert.match(found, /\(technique,/u, `检索结果应标 technique：${found}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('注入块必须中和 {{ ：否则 prompt 插值会整轮抛错', async () => {
+  // DSH 会把每个 prompt section 的正文过 `{{name}}` 插值，字面 `{{` 直接抛
+  // malformed prompt variable reference，整轮对话失败；而那句错误文本还会被提炼回
+  // 情景层，形成自我维持的污染循环。存储保持原文，注入侧负责中和。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('salt 线框图的按钮该怎么写'))
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'salt 按钮写法',
+      when: '在 salt 线框图里摆按钮时',
+      summary: '用 {{ 表示按钮，双花括号会被模板吃掉。',
+      kind: 'pitfall',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, saved)
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success' } as never, undefined as never)
+
+    const stored = (await new MemoryStore(root).readTechniques('global')).find(item => item.id === id)
+    assert.ok(
+      JSON.stringify(stored).includes('{{'),
+      '存储侧应保留原文（工具输出要能照着复制）',
+    )
+
+    const rendered = sectionText(fake, 'memory-layer:techniques')
+    assert.match(rendered, /salt 按钮写法/u, '技巧应被注入')
+    assert.ok(!rendered.includes('{{'), `注入块仍含 {{ ：${rendered}`)
+  } finally {
+    await dispose()
+  }
+})
+
 test('反思闸门：confidential 业务规则默认不进全局域', async () => {
   const counter = { calls: 0 }
   const payload = techniquePayload({

@@ -77,6 +77,20 @@ test('从项目文件路径推导私有标识：比正则扫描可靠', () => {
   assert.ok(!identifiers.includes('store'), '过短的通用文件名不该入选')
 })
 
+test('文件路径推导标识符：非代码文件不参与（文档名曾被误当私有标识）', () => {
+  // 曾经的现场：一次会话读的是 `plantuml.txt`，文件名推出的 `plantuml` 刚好 8 个
+  // 小写字母、越过了长度门槛，于是把该会话产出的所有技巧的 `domain: "PlantUML"`
+  // 与 `tags` 一并打成了 `<id1>` —— 分类元数据被抹掉，按 domain/tag 的检索整片失效。
+  const identifiers = identifiersFromPaths([
+    '/work/dsh-library/.work/plantuml.txt',
+    'docs/changelog.md',
+    'data/orders.json',
+    'deploy/Dockerfile',
+    'src/OrderService.java',
+  ])
+  assert.deepEqual(identifiers, ['OrderService'], '只有代码文件的名字能推出标识符')
+})
+
 test('外部绝对路径被抹掉', () => {
   const { text, placeholders } = abstractText('配置在 /home/victim/.ssh/id_rsa 下。')
   assert.ok(!text.includes('/home/victim/.ssh/id_rsa'))

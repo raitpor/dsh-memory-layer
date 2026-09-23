@@ -19,7 +19,8 @@
  * @module dsh-memory-layer/store
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
+import type { Dirent } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import type { StoreCodec } from './crypto.js'
@@ -430,6 +431,56 @@ export class MemoryStore {
       }
     }
     return records
+  }
+
+  /**
+   * 统计**所有项目桶**的情景记录条数（不含 global 域）。
+   *
+   * `episodic` 是 project 作用域，{@link readEpisodic} 只覆盖当前工作目录；`memory_stats`
+   * 只报这一个桶时，别的项目整个不在统计里，读起来像「库里没东西」。
+   *
+   * @returns 各项目桶的条数之和。
+   */
+  async countProjectEpisodic(): Promise<number> {
+    const root = join(this.root, 'projects')
+    let entries: Dirent[] = []
+    try {
+      entries = await readdir(root, { withFileTypes: true })
+    } catch (error) {
+      if (isNotFound(error)) return 0
+      throw error
+    }
+    let total = 0
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      total += await this.countJsonLines(join(root, entry.name, EPISODIC_FILE))
+    }
+    return total
+  }
+
+  /**
+   * 数一个 JSONL 文件里的有效行数。
+   * @param file - 目标文件绝对路径。
+   * @returns 有效行数；文件不存在为 0。
+   */
+  private async countJsonLines(file: string): Promise<number> {
+    let raw: string
+    try {
+      raw = await readFile(file, 'utf8')
+    } catch (error) {
+      if (isNotFound(error)) return 0
+      throw error
+    }
+    let count = 0
+    for (const line of this.decode(raw)) {
+      try {
+        JSON.parse(line)
+        count += 1
+      } catch {
+        // 与 readEpisodic 同口径：损坏行跳过，而不是让整个库读不出来。
+      }
+    }
+    return count
   }
 
   /**

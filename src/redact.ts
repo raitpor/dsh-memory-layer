@@ -177,3 +177,26 @@ export function sanitizeForText(text: string): string {
 export function sanitizeForPrompt(text: string): string {
   return sanitizeForText(text).replace(/\s+/gu, ' ').trim()
 }
+
+/**
+ * 注入 system prompt 前的净化 **+ 模板中和** —— 凡是要塞进 prompt section 的文本都走这里。
+ *
+ * DSH 会把每个 prompt section / context 的正文过一遍 `{{name}}` 变量插值
+ * （`@deepseek-ai/dsh-system-prompt` 的 `interpolate()`）。记忆正文里只要出现字面的
+ * `{{`，插值器就抛 `malformed prompt variable reference`（`{{name}}` 形式则抛
+ * `unknown prompt variable`），**整个回合直接失败**。
+ *
+ * 更糟的是它会自我维持：那句错误文本本身会被会话捕获、提炼回情景层，于是摘要里也带上
+ * `{{`，之后每一轮召回注入都再抛一次 —— 实测在 PlantUML Salt 的 `{{` 语法上触发过。
+ *
+ * 只中和 `{{`：插值扫描由 `{{` 触发，`}}` 单独出现无害，不动它可以让正文尽量保真。
+ * 实现上必须按**整段连续花括号**处理（`\{{2,}` → 逐字空格隔开），不能写成
+ * `replace(/\{\{/, '{ {')` —— 那样在 `{{{{` 上两次替换的交界处会重新拼出一个 `{{`。
+ * 工具输出（`technique_get` / `memory_search`）不走这条路径，保持原文可复制。
+ *
+ * @param text - 记忆正文。
+ * @returns 可安全注入的文本。
+ */
+export function sanitizeForInjection(text: string): string {
+  return sanitizeForPrompt(text).replace(/\{{2,}/gu, run => run.split('').join(' '))
+}

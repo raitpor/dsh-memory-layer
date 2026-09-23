@@ -40,7 +40,7 @@ import { recall, recallTechniques, toDocs, toTechniqueDocs, tokenize } from './r
 import type { RecallDoc } from './recall.js'
 import { distill, isInjectedContext } from './distill.js'
 import type { LlmTextCaller, Transcript } from './distill.js'
-import { redact, sanitizeForPrompt, sanitizeForText } from './redact.js'
+import { redact, sanitizeForInjection, sanitizeForPrompt, sanitizeForText } from './redact.js'
 import { abstractTechniqueDraft, abstractText, identifiersFromPaths } from './abstract.js'
 import {
   createRepoView,
@@ -257,6 +257,21 @@ export const INJECTION_HEADER: readonly string[] = [
 
 /** 注入块尾部，给不可信数据一个明确的结束边界。 */
 export const INJECTION_FOOTER = '--- END UNTRUSTED MEMORY ---'
+
+/**
+ * 召回条目的层级标签。
+ *
+ * 必须**四层全覆盖**。早先注入与检索两处都写成
+ * `layer === 'semantic' ? 'long-term' : 'episodic'` 的二元映射，于是 technique 与
+ * failure 记录一律被标成 episodic —— 模型会把「一条可复用的技巧」误读成「某次会话的
+ * 摘要」，对来源的判断直接错，也就不会去想「这条技巧能不能用在我这儿」。
+ */
+const LAYER_LABELS: Record<'episodic' | 'semantic' | 'technique' | 'failure', string> = {
+  episodic: 'past session',
+  semantic: 'long-term fact',
+  technique: 'technique',
+  failure: 'recurring failure',
+}
 
 /** 技巧层注入 section 名。 */
 export const TECHNIQUE_SECTION_NAME = 'memory-layer:techniques'
@@ -1053,8 +1068,8 @@ export function apply(ctx: Context, config: Config): void {
     const hits = recall(query, docs, { limit: settings.recallLimit })
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
-      const kind = hit.layer === 'semantic' ? 'long-term fact' : 'past session'
-      return `${index + 1}. (${kind}) ${sanitizeForPrompt(hit.text)}`
+      const kind = LAYER_LABELS[hit.layer]
+      return `${index + 1}. (${kind}) ${sanitizeForInjection(hit.text)}`
     })
     return clipHead(
       [...INJECTION_HEADER, ...lines, INJECTION_FOOTER].join('\n'),
@@ -1087,7 +1102,7 @@ export function apply(ctx: Context, config: Config): void {
     const lines = hits.map((hit, index) => {
       const record = techniqueById.get(hit.id)
       const body = record === undefined ? hit.text : techniqueIndexLine(record)
-      return `${index + 1}. ${sanitizeForPrompt(body)}`
+      return `${index + 1}. ${sanitizeForInjection(body)}`
     })
     return clipHead(
       [
@@ -1164,7 +1179,7 @@ export function apply(ctx: Context, config: Config): void {
       }
       // 只在本会话确实见过这个指纹时才给出现场文件：全局域记录不带项目路径。
       const files = session?.lastSeenTurn.has(record.fingerprint.key) === true ? recentFiles : []
-      return `${index + 1}. ${sanitizeForPrompt(failureWarningLine(record, files))}`
+      return `${index + 1}. ${sanitizeForInjection(failureWarningLine(record, files))}`
     })
     return clipHead(
       [...FAILURE_INJECTION_HEADER, ...lines, FAILURE_INJECTION_FOOTER].join('\n'),
@@ -1322,6 +1337,9 @@ export function apply(ctx: Context, config: Config): void {
       await refresh(cwd)
       const docs = corpusFor(cwd)
       const episodic = docs.filter(doc => doc.layer === 'episodic').length
+      // episodic 是 project 作用域，`corpusFor` 只覆盖当前工作目录。另给一个跨项目总数，
+      // 否则别的项目那十几条整个不在报告里，读起来像库是空的。
+      const episodicTotal = await store.countProjectEpisodic()
       const semantic = docs.filter(doc => doc.layer === 'semantic').length
       const techniques = docs
         .filter(doc => doc.layer === 'technique')
@@ -1331,7 +1349,7 @@ export function apply(ctx: Context, config: Config): void {
       return [
         `Memory root: ${settings.dir}`,
         `Layer scopes: episodic=${settings.scopeEpisodic}, semantic=${settings.scopeSemantic}, technique=${settings.scopeTechnique} (partition ${settings.partition})`,
-        `Episodic summaries: ${episodic}`,
+        `Episodic summaries: ${episodic} (this project) · ${episodicTotal} (all projects)`,
         `Semantic facts: ${semantic}`,
         `Techniques: ${verified} verified, ${techniques.length - verified} draft`,
         `Recurring failures: ${[...failureById.values()].filter(record => record.status !== 'deprecated').length} active, `
@@ -1996,7 +2014,7 @@ function keepInsideWorkspace(files: readonly string[], cwd: string | undefined):
  * @returns 多行文本。
  */
 function formatHit(row: RecalledMemory): string {
-  const kind = row.layer === 'semantic' ? 'long-term' : 'episodic'
+  const kind = LAYER_LABELS[row.layer]
   return `${row.id} (${kind}, score ${row.score.toFixed(2)}, ${new Date(row.ts).toISOString()})\n  ${sanitizeForPrompt(row.text)}`
 }
 

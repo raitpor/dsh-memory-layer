@@ -139,6 +139,13 @@ export interface LiveSession {
   stack?: StackProfile
   /** 会话结束时的提炼 promise，用于诊断与测试等待。 */
   settling?: Promise<void>
+  /**
+   * 已经反思过的轮次数。
+   *
+   * 摊销口径下，反思只看**它之后新增**的轮次：长驻会话因此不再等到进程关闭才有机会
+   * 沉淀经验，同时 `reflectMinTurns` 自然变成「两次反思之间的最小新增轮次」。
+   */
+  reflectedTurns?: number
 }
 
 /** 召回结果：一条被打分的记忆及其命中来源。 */

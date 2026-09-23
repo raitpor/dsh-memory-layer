@@ -16,11 +16,8 @@
       config:
         # 记忆库根目录；留空即默认 $DSH_HOME/memory-layer（通常 ~/.dsh/memory-layer）
         dir: null
-        # 全局作用域开关；留空即按层取默认值（见 layerScopes）。
-        # 一旦显式设置，四层统一使用该作用域。
-        scope: null
-        # 按层覆盖作用域。缺省：episodic=project（原始会话摘要含路径与原话，留在项目域），
-        # semantic=global、technique=global（已抽象的知识应跨项目复用）。
+        # 按层覆盖作用域（作用域的唯一入口）。缺省：episodic=project（原始会话摘要含路径
+        # 与原话，留在项目域），semantic=global、technique=global（已抽象的知识应跨项目复用）。
         layerScopes:
           episodic: project
           semantic: global
@@ -50,8 +47,10 @@
         exampleMaxChars: 480
         # 是否允许 confidential 知识进入全局域；默认 false（业务机密不外扬）
         allowConfidentialGlobal: false
-        # 会话内反思：每会话一次（非每轮）。两道闸门保证「没有新东西就不花钱」。
+        # 会话内反思：摊销触发 —— 每积累 reflectMinTurns 个「新」轮次就有一次机会，
+        # 会话末再兜最后一次。到不到期由闸门决定，因此长驻会话不关闭进程也能沉淀经验。
         reflectOnSessionEnd: true
+        # 两次反思之间所需的最少新增轮次（不再表示「会话总轮次」）
         reflectMinTurns: 3
         reflectNoveltyThreshold: 0.15
         reflectBackoffAfterEmpty: 5

@@ -96,8 +96,6 @@ export const inject = ['sessions']
 export interface Config {
   /** 记忆库根目录；缺省为 `<DSH_HOME>/memory-layer`（即 `~/.dsh/memory-layer`）。 */
   dir?: string
-  /** 默认作用域：`project` 按项目目录隔离，`global` 跨项目共享。 */
-  scope?: MemoryScope
   /** 单次召回返回条数上限。 */
   recallLimit?: number
   /** 召回注入的字符上限，超出即截断。 */
@@ -127,7 +125,7 @@ export interface Config {
   /** 密钥文件路径；缺省为记忆库目录内的 `<dir>/.dsh-memory-layer.key`。 */
   keyFile?: string
   /**
-   * 按层覆盖作用域。
+   * 按层覆盖作用域 —— **作用域的唯一入口**。
    *
    * 缺省时使用 {@link LAYER_SCOPE_DEFAULTS}：`episodic` 留在项目域（它是**原始**会话摘要，
    * 含工作区路径与用户原话），`semantic` 与 `technique` 默认全局 —— 知识本就该跨项目复用。
@@ -280,6 +278,24 @@ export const TECHNIQUE_INJECTION_HEADER: readonly string[] = [
 /** 技巧注入块尾部。 */
 export const TECHNIQUE_INJECTION_FOOTER = '--- END UNTRUSTED TECHNIQUES ---'
 
+/**
+ * 采用回报要求：附在技巧注入块**头部之后**。
+ *
+ * 两处刻意的选择：
+ *
+ * 1. 放在头部之后而不是尾部 —— 整块会被 `clipHead` 按字符上限截断，放尾部时块一长
+ *    就被截掉，模型看不到要求。
+ * 2. 回报走 `technique_apply` 工具，而不是自定义的文本标记。工具是结构化的、会校验
+ *    id、能同时表达成功与失败，而且**当场记账**；文本标记只能等会话末再解析，而
+ *    `session/disposed` 在长驻会话里根本不会触发 —— 那等于又埋一个「永不生效」。
+ */
+export const TECHNIQUE_ADOPTION_NOTICE: readonly string[] = [
+  'If you actually APPLIED one of these techniques, report it with the `technique_apply` tool:',
+  'its id, plus outcome "success" (use "failure" if the technique turned out to be wrong).',
+  'Do not report techniques you merely read, quoted or considered — anything you do not report',
+  'counts as NOT adopted.',
+]
+
 /** 失败预警注入 section 名。 */
 export const FAILURE_SECTION_NAME = 'memory-layer:failures'
 
@@ -302,9 +318,6 @@ export const FAILURE_INJECTION_FOOTER = '--- END UNTRUSTED FAILURE MEMORY ---'
 /** 配置 schema：所有字段都有默认值，因此 `apply` 里拿到的配置始终完整。 */
 export const Config: z<Config> = z.object({
   dir: z.string(),
-  // 注意：`scope` 刻意**没有默认值**。缺省时应按层取 LAYER_SCOPE_DEFAULTS；
-  // 一旦给了默认值，`config.scope ?? 按层默认` 就永远拿不到按层默认。
-  scope: z.union([z.const('project'), z.const('global')]),
   recallLimit: z.natural().min(1).max(20).default(5),
   recallChars: z.natural().min(200).max(20_000).default(4000),
   injectPrompt: z.boolean().default(true),
@@ -943,34 +956,53 @@ export function apply(ctx: Context, config: Config): void {
    * @param transcript - 会话要点快照。
    * @returns 是否反思与原因。
    */
+  /**
+   * 自上次反思以来新增的轮次。摊销口径的唯一来源。
+   * @param state - 会话状态。
+   * @returns 尚未反思过的轮次。
+   */
+  const turnsSinceReflection = (state: LiveSession): LiveTurn[] =>
+    state.turns.slice(state.reflectedTurns ?? 0)
+
   const reflectDecision = (state: LiveSession, transcript: Transcript): { reflect: boolean; reason: string } => {
     if (!settings.reflectOnSessionEnd) return { reflect: false, reason: 'reflection disabled' }
-    if (state.turns.length < settings.reflectMinTurns) return { reflect: false, reason: 'too few turns' }
-    if (!hasLearningSignal(state)) return { reflect: false, reason: 'no learning signal' }
+    // 摊销口径：只看上次反思之后**新增**的轮次。首轮与旧口径等价（总轮次），此后
+    // 每积累 reflectMinTurns 个新轮次就有一次机会 —— 长驻会话不必等到进程关闭才沉淀。
+    const fresh = turnsSinceReflection(state)
+    if (fresh.length < settings.reflectMinTurns) {
+      return { reflect: false, reason: `only ${fresh.length} new turn(s)` }
+    }
+    if (!hasLearningSignal(fresh)) return { reflect: false, reason: 'no learning signal' }
     if (metrics.backoff) return { reflect: false, reason: 'backoff after empty reflections' }
     // 比较必须「同口径」：既有技巧是**去标识化后**存储的，转录也要先过同一道占位符化，
     // 否则项目私有标识符每次都算「新词」，闸门永远关不上。
-    const identifiers = identifiersFromPaths(state.turns.flatMap(turn => turn.files))
-    const query = abstractText(transcriptText(transcript), { identifiers }).text
+    const identifiers = identifiersFromPaths(fresh.flatMap(turn => turn.files))
+    const query = abstractText(transcriptText({ ...transcript, turns: fresh }), { identifiers }).text
     const novelty = noveltyRatio(
       query,
       [...techniqueById.values()].map(record => techniqueText(record)),
     )
     if (novelty < settings.reflectNoveltyThreshold) return { reflect: false, reason: `novelty ${novelty.toFixed(2)}` }
-    return { reflect: true, reason: `novelty ${novelty.toFixed(2)}` }
+    return { reflect: true, reason: `${fresh.length} new turn(s), novelty ${novelty.toFixed(2)}` }
   }
 
   /**
-   * 会话结束时的收尾：按闸门决定是否反思，并把结果计入「经验复利」指标。
+   * 按闸门决定是否反思，并把结果计入「经验复利」指标。
+   *
+   * 两个调用点共用同一条路径：**每轮末的摊销触发**（`turn/end`，长驻会话的主力）
+   * 与**会话末收尾**（`session/disposed`，兜最后一段）。两者口径一致 —— 是否反思
+   * 只看「自上次反思以来新增了多少轮」，因此进程不关闭也不会让沉淀无限期推迟。
+   *
    * @param state - 会话状态。
    */
-  const settleSession = async (state: LiveSession): Promise<void> => {
+  const settleSession = async (state: LiveSession, options: { ruleFallback?: boolean } = {}): Promise<void> => {
     const transcript = snapshotTranscript(state)
     const decision = reflectDecision(state, transcript)
     const route = decision.reflect ? routeFor(state) : undefined
     if (route === undefined) {
       // 没有可用模型路由：只走规则路径（仍然落盘情景摘要，但不产出技巧）。
-      await persist(state, transcript, undefined)
+      // 每轮末那个调用点已经写过一次规则摘要，用 `ruleFallback: false` 免去重复落盘。
+      if (options.ruleFallback !== false) await persist(state, transcript, undefined)
       if (decision.reflect) {
         metrics.skipped += 1
         logger.debug(`memory: reflection skipped for ${state.sessionId} (no model route available)`)
@@ -981,6 +1013,9 @@ export function apply(ctx: Context, config: Config): void {
     }
     // 反思是一次有界调用：转录按配置截断后再送审。
     const capped = capTranscript(transcript, settings.reflectMaxTranscriptChars)
+    // 只有真正付出模型调用才推进水位。被闸门拦下或没有路由时不推进，
+    // 这些轮次留待下次继续参与判定，不会被永久跳过。
+    state.reflectedTurns = state.turns.length
     const outcome = await persist(state, capped, route)
     metrics.reflections += 1
     if (outcome.created > 0) {
@@ -996,6 +1031,9 @@ export function apply(ctx: Context, config: Config): void {
     logger.debug(
       `memory: reflected on ${state.sessionId} (${decision.reason}): +${outcome.created} new, ${outcome.merged} merged`,
     )
+    // 计数器当场落盘。只在 `session/disposed` 写的话，长驻会话 —— 正是摊销反思要服务的
+    // 那类 —— 重启后会把「前期投入」的账目丢掉，`memory_stats` 的复利指标永远是 0。
+    await store.saveMetrics(metrics)
   }
 
   /**
@@ -1052,7 +1090,13 @@ export function apply(ctx: Context, config: Config): void {
       return `${index + 1}. ${sanitizeForPrompt(body)}`
     })
     return clipHead(
-      [...TECHNIQUE_INJECTION_HEADER, ...lines, TECHNIQUE_INJECTION_FOOTER].join('\n'),
+      [
+        ...TECHNIQUE_INJECTION_HEADER,
+        // 没注册工具时别提工具名：指向一个不存在的工具只会让模型白试一轮。
+        ...(settings.registerTools ? TECHNIQUE_ADOPTION_NOTICE : []),
+        ...lines,
+        TECHNIQUE_INJECTION_FOOTER,
+      ].join('\n'),
       settings.techniqueChars,
     )
   }
@@ -1547,8 +1591,13 @@ export function apply(ctx: Context, config: Config): void {
         // 先结算「防住了」：预警发出后经过观察窗口仍未复现，才计入 prevented。
         if (settings.failures) settlePrevention(state, event.data.turn)
         // 每轮末先做一次规则提炼落盘：进程被强杀时也不会丢掉这次会话。
-        if (!settings.distillOnTurnEnd || state.turns.length === 0) break
-        track(persist(state, snapshotTranscript(state), undefined).then(() => undefined))
+        if (settings.distillOnTurnEnd && state.turns.length > 0) {
+          track(persist(state, snapshotTranscript(state), undefined).then(() => undefined))
+        }
+        // 摊销式反思：`session/disposed` 只在 agent 销毁时发出，而 agent 跨 prompt 复用，
+        // 所以「会话内反思」在 web 这类不关会话的 profile 下原本等于死代码。
+        // 这里只负责「到期就来问一次」；是否真的反思仍由同一套闸门决定。
+        track(settleSession(state, { ruleFallback: false }))
         break
       }
       default:
@@ -1695,9 +1744,12 @@ function normalizeConfig(config: Config): Config {
  * @returns 运行时设置。
  */
 function resolveSettings(config: Config): Settings {
+  // 作用域只有一个入口：`layerScopes` 逐层覆盖，缺省落到 LAYER_SCOPE_DEFAULTS。
+  // （旧的全局 `scope` 已删除 —— 它能表达的 layerScopes 都能表达，留着只会让
+  //   「到底哪个生效」变成需要查优先级的问题。）
   const layerScope = (
     layer: 'episodic' | 'semantic' | 'technique' | 'failure',
-  ): MemoryScope => config.layerScopes?.[layer] ?? config.scope ?? LAYER_SCOPE_DEFAULTS[layer]
+  ): MemoryScope => config.layerScopes?.[layer] ?? LAYER_SCOPE_DEFAULTS[layer]
   return {
     dir: resolveDir(config.dir),
     scopeEpisodic: layerScope('episodic'),
@@ -2130,15 +2182,16 @@ const CORRECTION_MARKERS = [
 ]
 
 /**
- * 判断会话里是否存在「值得沉淀」的信号。
+ * 判断一段轮次里是否存在「值得沉淀」的信号。
  *
  * 纯闲聊、纯问答的会话不该触发反思 —— 这是反思成本曲线能递减的第一道保障。
+ * 摊销口径下传入的是**自上次反思以来新增**的轮次，因此旧的信号不会反复开门。
  *
- * @param state - 会话状态。
+ * @param turns - 待判定的轮次。
  * @returns 存在学习信号时为 `true`。
  */
-function hasLearningSignal(state: LiveSession): boolean {
-  return state.turns.some(turn =>
+function hasLearningSignal(turns: readonly LiveTurn[]): boolean {
+  return turns.some(turn =>
     turn.files.length > 0
     || turn.tools.length > 0
     || CORRECTION_MARKERS.some(marker => turn.user.toLowerCase().includes(marker)))

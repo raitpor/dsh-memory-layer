@@ -31,7 +31,7 @@
 | **失败** failure | **反复犯的同一个错**：指纹、重复次数、正确做法、处置强度 | `global` | `<scope>/failures.jsonl` |
 
 > `episodic` 刻意留在项目域：它是**原始**会话摘要，含工作区路径与用户原话，跨项目外泄风险最高；
-> 其余层存的是已抽象的知识，默认全局复用。用 `scope`（统一覆盖）或 `layerScopes`（逐层覆盖）调整。
+> 其余层存的是已抽象的知识，默认全局复用。用 `layerScopes` 逐层调整。
 
 ## 技巧经验层
 
@@ -51,22 +51,44 @@
 
 ### 会话内反思（默认开启）
 
-每会话一次（**不是每轮**），两道闸门保证「没有新东西就不花钱」：
+**摊销触发**：每积累 `reflectMinTurns` 个**新**轮次就有一次机会，会话末再兜最后一次。
+「新」指自上次反思以来新增的轮次 —— 首轮与旧口径等价，此后是滚动窗口。
 
-1. **触发闸门**（零 token，先判后调）：轮次 < `reflectMinTurns`、无工具/文件/纠偏信号、
-   或与既有技巧的**新颖度**低于 `reflectNoveltyThreshold` 时直接跳过；
+> 这一点是必须的：`session/disposed` 只在 **agent 被销毁**时发出，而 web 这类 profile
+> 里 agent 跨 prompt 复用（进程不关就不会 dispose）。若只在会话末反思，长驻会话永远
+> 沉淀不出经验 —— 实测 `reflections=0` 就是这么来的。
+
+两道闸门保证「没有新东西就不花钱」：
+
+1. **触发闸门**（零 token，先判后调）：自上次反思以来的**新增轮次** < `reflectMinTurns`、
+   这些轮次里无工具/文件/纠偏信号、或与既有技巧的**新颖度**低于 `reflectNoveltyThreshold`
+   时直接跳过；
 2. **产出闸门**：候选与既有记录按归一化 key 合并，纯重复只累加 `hits`，不新建记录。
 
-连续 `reflectBackoffAfterEmpty` 次反思无新产出后自动退避，仅在高价值信号出现时恢复。
-`memory_stats` 会输出 `Experience compounding: reflections=… skipped=… new=… duplicates=…`，
-让「前期投入、后期节省」可验证。设 `reflectNoveltyThreshold: 0` 可关闭闸门、每次都反思。
+只有真正付出模型调用才推进水位；被闸门拦下或当时没有模型路由的轮次会留到下次继续参与判定，
+不会被永久跳过。连续 `reflectBackoffAfterEmpty` 次反思无新产出后自动退避，仅在高价值信号
+出现时恢复。`memory_stats` 会输出
+`Experience compounding: reflections=… skipped=… new=… duplicates=…`，让「前期投入、后期节省」
+可验证。设 `reflectNoveltyThreshold: 0` 可关闭新颖度闸门。
 
 提炼有两条路径，产出同一形状：
 
-1. **模型提炼**（会话结束时）—— 调 `ctx.llm` 让模型输出结构化 JSON，写入情景层，并把它提炼出的
+1. **模型提炼**（反思触发时）—— 调 `ctx.llm` 让模型输出结构化 JSON，写入情景层，并把它提炼出的
    长期事实合并进语义层。
 2. **规则提炼**（每轮末 + 任何模型不可用时）—— 纯本地抽取偏好/决定/待办/文件路径，零 token 成本。
    它的价值是**兜底**：进程被强杀、模型超时、没有配模型，都不会让记忆静默丢失。
+
+### 采用回报：只有显式回报才计数
+
+被召回（注入）的技巧是否「被采用」，只认**模型显式调用 `technique_apply`**（`id` + `outcome`）。
+注入块头部会写明这一点。**没有回报的一律按「未采用」处理** —— 既不计成功也不计失败。
+
+> 为什么不在注入块里另造一个文本标记（例如让模型写 `ADOPTED-TECHNIQUE: <id>`）：
+> 那等于给同一件事造第二条通道。工具是结构化的、会校验 id、能同时表达成功与失败，
+> 而且**当场记账**；文本标记只能等会话末解析，而 `session/disposed` 在长驻会话里
+> 根本不会触发 —— 那会再埋一个「永不生效」。去文本推断同样不行：注入的索引本身就带着
+> `tq_…` id，模型复述一遍索引就会被误判成「采用了」，而误判推高的置信度决定这条经验
+> 将来会不会被自动注入。宁可漏记，也不把「读了一遍」算成「用过」。
 
 ## 失败经验层
 
@@ -187,11 +209,17 @@ dsh plugin --profile web add dsh-memory-layer
 手动挂载片段（也见本包的 `cordis.patch.yml`）：
 
 ```yaml
+# 注意：patch 行的 `config` 是**整体替换**而非深合并 —— 只写部分字段会让其余字段回落
+# schema 默认值。把本包 `cordis.patch.yml` 的 config 整块拷来，再改你要改的字段。
 - insert:
     - id: dsh-memory-layer
       name: 'dsh-memory-layer'   # 或插件目录的绝对路径
       config:
-        scope: project
+        layerScopes:
+          episodic: project
+          semantic: global
+          technique: global
+          failure: global
 ```
 
 > 安装后需要重启 dsh：运行中的实例不会热加载新的 bundle 层。
@@ -201,7 +229,6 @@ dsh plugin --profile web add dsh-memory-layer
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `dir` | `$DSH_HOME/memory-layer`（通常 `~/.dsh/memory-layer`） | 记忆库根目录 |
-| `scope` | `project` | `project` 按会话工作目录隔离；`global` 跨项目共享 |
 | `injectPrompt` | `true` | 是否把召回结果注入 system prompt |
 | `promptOrder` | `250` | 注入 section 的排序值 |
 | `recallLimit` | `5` | 单次召回条数上限（1–20） |
@@ -214,16 +241,15 @@ dsh plugin --profile web add dsh-memory-layer
 | `maxTurnsPerSession` | `60` | 单会话保留的轮次要点上限 |
 | `encrypt` | `true` | 是否加密记忆库（AES-256-GCM，仅用 Node 内置 `node:crypto`，无额外依赖） |
 | `keyFile` | `<dir>/.dsh-memory-layer.key` | 密钥文件路径；也可用环境变量 `DSH_MEMORY_LAYER_KEY` 注入（hex/base64，密钥不落盘） |
-| `scope` | 空 | 显式设置时四层统一使用该作用域；留空则按 `layerScopes` 取按层默认值 |
-| `layerScopes` | `episodic=project`，`semantic/technique=global` | 按层覆盖作用域 |
+| `layerScopes` | `episodic=project`，`semantic/technique/failure=global` | 按层设置作用域（**作用域的唯一入口**）：`project` 按会话工作目录隔离，`global` 跨项目共享 |
 | `partition` | `default` | 全局域分区（组织/租户） |
 | `techniques` | `true` | 是否启用技巧层 |
 | `techniqueLimit` / `techniqueChars` | `3` / `3000` | 技巧索引注入的条数与字符上限 |
 | `techniquePromptOrder` | `260` | 技巧注入 section 排序（排在 recall 之后） |
 | `exampleMaxLines` / `exampleMaxChars` | `8` / `480` | 示例的硬上限 |
 | `allowConfidentialGlobal` | `false` | 是否允许 `confidential` 知识进入全局域 |
-| `reflectOnSessionEnd` | `true` | 会话内反思（每会话一次，非每轮） |
-| `reflectMinTurns` | `3` | 少于该轮次不反思 |
+| `reflectOnSessionEnd` | `true` | 会话内反思总开关 |
+| `reflectMinTurns` | `3` | 两次反思之间所需的最少**新增**轮次（摊销窗口） |
 | `reflectNoveltyThreshold` | `0.15` | 新颖度低于此值不反思；`0` = 关闭闸门 |
 | `reflectBackoffAfterEmpty` | `5` | 连续无新产出后进入退避 |
 | `reflectMaxTranscriptChars` | `24000` | 送审转录音符上限 |
@@ -258,7 +284,7 @@ dsh plugin --profile web add dsh-memory-layer
 | `technique_learn` | 从一个代码仓库挖掘技巧（显式、受限；产出为草稿） |
 | `technique_export` | 把一条**已验证**技巧物化成 `SKILL.md`（confidential 拒绝导出） |
 | `technique_save` | 手工写入一条技巧草稿（与自动提炼走同一条脱敏 + 去标识化管线） |
-| `technique_apply` | 回报采用结果，驱动置信度与状态迁移 |
+| `technique_apply` | 回报采用结果，驱动置信度与状态迁移（**采用回报的唯一通道**） |
 | `technique_forget` | 按 id 删除；`*` 清空需显式 `confirm: true` |
 | `failure_list` | 列出反复犯的错（按重复次数排序） |
 | `failure_resolve` | 标记已解决并记录**正确做法**（后续预警会带上它） |
@@ -358,6 +384,12 @@ npm test            # 构建 + node --test（186 个用例：存储 / 召回 / �
 ## 设计取舍与已知限制
 
 - **技巧的示例是重建产物**：可能与原实现有细微差异，用途是「说明怎么调」，不是可直接编译的代码。
+- **采用回报依赖模型配合**：只有模型显式调用 `technique_apply` 才计入成功，因此「用了
+  但没回报」会被漏记。这是刻意选择的方向 —— 反向（靠文本推断）会把复述索引误判成采用，
+  而误判推高的置信度决定这条经验将来会不会被自动注入。注入块头部会明确要求回报。
+- **摊销反思的成本是「上限有界、分布前重后轻」**：它比「每会话一次」更早花出模型调用，
+  但新颖度闸门与退避会随经验积累自动收敛，`memory_stats` 的 `Experience compounding`
+  可用来核对这一点。
 - **技术栈画像可能推断失败**：推断不到时不做过滤（放行），因此语言闸门在画像缺失时不生效。
 - **去标识化是「最小版」**：P0 只做凭据脱敏 + 显式标识符 + 从项目文件路径推导的私有标识；
   完整的模型归纳与泄漏校验属于后续阶段。

@@ -19,8 +19,6 @@ import {
 
 test('空配置被补全为可用的默认值', () => {
   const parsed = Config({})
-  // `scope` 刻意没有默认值：缺省时按层取 LAYER_SCOPE_DEFAULTS（见下一条用例）。
-  assert.equal(parsed.scope, undefined)
   assert.equal(parsed.injectPrompt, true)
   assert.equal(parsed.registerTools, true)
   assert.equal(parsed.distillOnTurnEnd, true)
@@ -62,13 +60,13 @@ test('layerScopes 可逐层覆盖，且非法值被拒绝', () => {
 
 test('合法的显式配置被原样保留', () => {
   const parsed = Config({
-    scope: 'global',
+    layerScopes: { semantic: 'project' },
     recallLimit: 12,
     injectPrompt: false,
     provider: 'deepseek',
     model: 'deepseek-chat',
   })
-  assert.equal(parsed.scope, 'global')
+  assert.equal(parsed.layerScopes?.semantic, 'project')
   assert.equal(parsed.recallLimit, 12)
   assert.equal(parsed.injectPrompt, false)
   assert.equal(parsed.provider, 'deepseek')
@@ -76,7 +74,7 @@ test('合法的显式配置被原样保留', () => {
 })
 
 test('非法枚举值被拒绝', () => {
-  assert.throws(() => Config({ scope: 'nonsense' } as never))
+  assert.throws(() => Config({ layerScopes: { failure: 'nonsense' } } as never))
 })
 
 test('越界数值被拒绝', () => {

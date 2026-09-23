@@ -442,7 +442,7 @@ test('injectPrompt / registerTools 关闭时不接线', async () => {
 })
 
 test('global 作用域把记忆写到全局域', async () => {
-  const { fake, root, dispose } = await setup({ scope: 'global' })
+  const { fake, root, dispose } = await setup({ layerScopes: { episodic: 'global' } })
   try {
     await runSession(fake, fakeSession())
     const store = new MemoryStore(root)
@@ -496,8 +496,22 @@ test('project 作用域下不同项目的召回互相隔离（DEF-SEC-003）', a
   }
 })
 
+test('已移除的全局 scope 不再生效（layerScopes 是唯一入口）', async () => {
+  // schemastery 会原样透传未知键，所以旧配置里残留的 `scope` 不会报错；但它必须不再
+  // 影响解析 —— 「配置项删了却还在悄悄生效」比直接报错更难排查。
+  const { fake, root, dispose } = await setup({ scope: 'global' } as never)
+  try {
+    await runSession(fake, fakeSession())
+    const store = new MemoryStore(root)
+    assert.equal((await store.readEpisodic('project', '/work/demo')).length, 1, 'episodic 仍按层默认留在项目域')
+    assert.equal((await store.readEpisodic('global')).length, 0, '残留的 scope 不得把 episodic 推去全局域')
+  } finally {
+    await dispose()
+  }
+})
+
 test('global 作用域跨项目共享（与 project 隔离相对照）', async () => {
-  const { fake, dispose } = await setup({ scope: 'global' })
+  const { fake, dispose } = await setup({ layerScopes: { episodic: 'global' } })
   try {
     await runSession(fake, fakeSession('sA', '/work/project-a'), '全局记住：团队使用 pnpm。', [])
     fake.emit('session/created', fakeSession('sB', '/work/project-b'))
@@ -754,6 +768,93 @@ test('反思闸门：轮次不足时不反思', async () => {
     fake.emit('session/disposed', fakeSession('s1', '/work/demo'))
     await fake.flush()
     assert.equal(counter.calls, 0, '少于 reflectMinTurns 轮不应调用模型')
+  } finally {
+    await dispose()
+  }
+})
+
+test('摊销式反思：每积累 reflectMinTurns 个新轮次就反思一次，不等会话关闭', async () => {
+  const counter = { calls: 0 }
+  const { fake, dispose } = await setup(
+    // reflectNoveltyThreshold: 0 关掉新颖度闸门，让本用例只考察摊销窗口。
+    { provider: 'test', model: 'test', reflectMinTurns: 2, reflectNoveltyThreshold: 0 },
+    true,
+    { llm: fakeLlm(techniquePayload({ kind: 'procedure', name: 'n', when: 'w', summary: 's' }), counter) },
+  )
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    for (let n = 1; n <= 4; n += 1) {
+      fake.emit('session/event', session, event('turn/start', { turn: n }))
+      fake.emit('session/event', session, userMessage(`第 ${n} 轮：改一下 src/f${n}.ts`))
+      fake.emit('session/event', session, event('tool/call', {
+        turn: n,
+        step: 1,
+        callId: `c${n}`,
+        name: 'edit_file',
+        arguments: JSON.stringify({ file_path: `src/f${n}.ts` }),
+      }))
+      fake.emit('session/event', session, assistantMessage(n, `已完成第 ${n} 轮。`))
+      fake.emit('session/event', session, event('turn/end', { turn: n, reason: 'completed' }))
+      await fake.flush()
+    }
+    assert.equal(counter.calls, 2, '第 2、4 轮各触发一次（窗口 = 2 个新轮次）')
+
+    fake.emit('session/disposed', session)
+    await fake.flush()
+    assert.equal(counter.calls, 2, '会话末不重复反思已经反思过的轮次')
+  } finally {
+    await dispose()
+  }
+})
+
+/**
+ * 造一条 validated 技巧并返回其 id。
+ *
+ * 只有 `validated` / `canonical` 才会被自动注入，而升级必须先有一次 `technique_apply`
+ * 回报 —— 所以要先把它"喂"到可注入状态，才能考察注入块本身。
+ *
+ * @param fake - context 替身。
+ * @returns 技巧 id。
+ */
+async function seedValidatedTechnique(fake: FakeContext): Promise<string> {
+  const seed = fakeSession('seed', '/work/demo')
+  fake.emit('session/created', seed)
+  await fake.flush()
+  fake.emit('session/event', seed, event('turn/start', { turn: 1 }))
+  fake.emit('session/event', seed, userMessage('记住 authorize 的用法'))
+  const saved = String(await toolOf(fake, 'technique_save').execute({
+    name: 'authorize before create',
+    when: 'integrating the orders client',
+    summary: 'Call authorize before create.',
+    kind: 'api-usage',
+  } as never, undefined as never))
+  const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+  if (id === undefined) throw new Error(`技巧保存应答里没有 id：${saved}`)
+  await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success' } as never, undefined as never)
+  return id
+}
+
+/**
+ * 跑一个「技巧被召回注入」的会话。
+ * @param fake - context 替身。
+ * @param id - 期望被注入的技巧 id。
+ * @param assistant - 助手输出（用于考察采用标记的识别）。
+ */
+test('技巧注入块要求用 technique_apply 回报采用，不自造文本标记', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('集成 OrdersClient 并调用 authorize'))
+    const rendered = sectionText(fake, 'memory-layer:techniques')
+    assert.match(rendered, /technique_apply/u, '应指向已有的结构化工具')
+    assert.match(rendered, /counts as NOT adopted/u, '应说明不回报即视为未采用')
+    assert.doesNotMatch(rendered, /ADOPTED-TECHNIQUE/u, '不应再有自造的文本标记')
+    assert.match(rendered, new RegExp(id, 'u'), '索引行要带 id，模型才有东西可回报')
   } finally {
     await dispose()
   }

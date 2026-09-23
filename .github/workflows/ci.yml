@@ -1,4 +1,4 @@
-# 最小 CI：类型检查 + 全部单测/集成测试。
+# CI：类型检查 → 测试 → 打包离线包 → **真的离线装一遍**。
 name: ci
 
 on:
@@ -7,8 +7,17 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# 同一分支的旧运行没有意义，直接取消，省 runner 也省等待。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: typecheck + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,3 +30,37 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  offline-package:
+    name: offline bundle
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          cache: npm
+      # 打包校验脚本会调用 pnpm（模拟用户在 profile 里的安装动作），用与 dsh 相同的 11.x 线。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - run: npm ci
+      - name: 打离线包（prepack 会先构建 lib/）
+        run: npm run pack:offline
+      - name: 空 store + 断网装一遍
+        run: npm run verify:offline
+      - name: 记录校验和
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-memory-layer-offline
+          path: |
+            dist/*-offline.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

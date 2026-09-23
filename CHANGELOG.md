@@ -34,6 +34,19 @@
   单行 JSON 整表重写）。
 - **CI**：`.github/workflows/ci.yml` 跑 `typecheck` + `npm test`。
 
+### 交付
+
+- **离线安装包**：`npm run pack:offline` 产出 `dsh-memory-layer-<version>-offline.tar.gz`，
+  内含 npm 包、解包副本（供 `cordis.patch.yml` 手工挂载）、`manifest.json`（逐文件 sha256）、
+  `checksums.txt`、`install.sh`、`verify.sh` 与 `INSTALL.md`。
+  本插件零运行时依赖 + profile 关闭 peer 自动安装，因此可断网安装。
+- **`npm run verify:offline`**：在空 pnpm store + 不可路由 registry 下**真装一遍**，
+  校验落地产物与 `node --check`。CI 的门槛就是它，不是「测试过了」。
+- **CI/CD**：`ci.yml`（typecheck → test → 打离线包 → 离线装一遍 → 上传产物，带 `concurrency`
+  与最小 `permissions`）与 `release.yml`（打 tag 即发布：校验 tag 与 `package.json` 版本一致、
+  CHANGELOG 有对应小节、测试、打包、离线安装验证、生成校验和并创建 Release）。
+- `npm pack` 前置 `prepack` 构建：不再可能打出一个没有 `lib/` 或 `lib/` 过期的包。
+
 ### 修复
 
 - `technique_apply` 的 `evidence` 是新增写入路径，此前**没过 `sanitizeForStore()`**：凭据与工作区外
@@ -41,7 +54,7 @@
 - 空洞结论判定是**永远走不到的死代码**（整串匹配置于长度闸门之后，词表里没有一条备选达到 12 字符），
   且带数字的空洞结论可以绕过。改为「去掉数字与标点后是否只剩结论词拼接」并前置。
 - 验收证据此前无长度上限，会被 `technique_get` 反复注入上下文，现收敛到 400 字符。
-- README：修正「情景层是 JSONL：追加友好」（实际是整体重写）、「密钥丢失……读取时被跳过」
+- README：新增「离线安装」小节；修正「情景层是 JSONL：追加友好」（实际是整体重写）、「密钥丢失……读取时被跳过」
   （实际是**拒绝写入**，且恢复密钥必须在任何写入之前）、补上「升级三步」与小节 `memory_stats` 的
   健康度输出。
 

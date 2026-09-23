@@ -27,7 +27,10 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test lib/test/",
-    "clean": "rm -rf lib"
+    "clean": "rm -rf lib",
+    "prepack": "npm run build",
+    "pack:offline": "node scripts/pack-offline.mjs",
+    "verify:offline": "node scripts/verify-offline-install.mjs"
   },
   "keywords": [
     "dsh",

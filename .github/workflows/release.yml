@@ -1,0 +1,96 @@
+# CD：打 tag 即发布。
+#
+# 发布流程刻意把「tag 与 package.json 版本不一致」当成硬失败：版本号是离线包文件名与
+# 用户核对安装结果的依据，两者不一致会让用户装出与预期不同的版本。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 创建 Release 与上传资产
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build + release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          cache: npm
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - run: npm ci
+
+      - name: 校验 tag 与 package.json 版本一致
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "package.json=$PKG  tag=$TAG"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::tag 与 package.json 版本不一致：请把版本改成 $TAG 并重新打 tag"
+            exit 1
+          fi
+          if ! grep -q "## $PKG" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 里没有 ${PKG} 这一节"
+            exit 1
+          fi
+
+      - name: 测试
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: 打离线包
+        run: npm run pack:offline
+
+      - name: 空 store + 断网装一遍（发布的最后一道门）
+        run: npm run verify:offline
+
+      - name: 生成发布用校验和
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 提取本版本变更说明
+        run: |
+          # 取 CHANGELOG 里 "## <version>" 到下一个 "## " 之间的内容作为 Release 正文。
+          # 抽不到时也要落一个文件：`body_path` 指向不存在的文件会让发布步骤以难懂的
+          # 方式失败，而版本一致性在上一步已经校验过了。
+          node -e "
+            const fs = require('node:fs')
+            const version = require('./package.json').version
+            const text = fs.readFileSync('CHANGELOG.md', 'utf8')
+            const start = text.indexOf('## ' + version)
+            let body = 'dsh-memory-layer ' + version
+            if (start >= 0) {
+              const rest = text.slice(start + 3)
+              const end = rest.search(/\n## /)
+              body = (end < 0 ? rest : rest.slice(0, end)).trim()
+            }
+            fs.writeFileSync('release-notes.md', body + '\n')
+          "
+          head -20 release-notes.md
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: dsh-memory-layer ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/*-offline.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') }}

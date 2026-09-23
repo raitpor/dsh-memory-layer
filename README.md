@@ -288,6 +288,31 @@ dsh plugin --profile web add dsh-memory-layer
 
 > 安装后需要重启 dsh：运行中的实例不会热加载新的 bundle 层。
 
+### 离线安装（无外网环境）
+
+发布物里有**离线包**：一个自足的 tar.gz，内含 npm 包、解包副本、校验和与安装脚本。
+本插件的**运行时依赖为零**（`package.json` 只有
+`peerDependencies`，全部由宿主 dsh 提供），而 dsh 的 profile 在 `pnpm-workspace.yaml`
+里设了 `autoInstallPeers: false`，所以 pnpm 不会去 registry 抓任何东西。
+
+```sh
+tar xzf dsh-memory-layer-<version>-offline.tar.gz
+cd dsh-memory-layer-<version>-offline
+./install.sh web        # 换成你的 profile 名
+# 然后重启 dsh
+```
+
+`INSTALL.md` 里有四条路径：一条命令安装、手工 `dsh plugin add --offline`、
+离线升级（含必须先删旧副本的原因）、以及完全不走包管理器的 `cordis.patch.yml` 手工挂载。
+`verify.sh` 做不联网自检（校验和、文件齐全、版本一致、`node --check`）。
+
+自己打这个包：
+
+```sh
+npm run pack:offline     # → dist/dsh-memory-layer-<version>-offline.tar.gz（+ .sha256）
+npm run verify:offline   # 用空 store + 不可路由的 registry 真装一遍（CI 的同一道门）
+```
+
 ### 升级：不要只 `git pull`
 
 `lib/` 不入库，且 `file:` 依赖在 profile 里是**硬链接**：改写已有文件会同步，但**新增 / 删除 / 改名**

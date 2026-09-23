@@ -10,9 +10,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  deriveTrigger,
   enforcementFor,
   failureApplies,
+  failureDetail,
+  failureLessonLine,
+  failureTrigger,
   failureWarningLine,
+  guardLiteralFromArguments,
+  lessonMatches,
   guardMatches,
   isSelfDenial,
   machineFingerprint,
@@ -164,4 +170,82 @@ test('预警文案：有 remedy 给 remedy，没有就明确要求先定位根�
   const without = failureWarningLine(record({ remedy: '' }))
   assert.match(without, /先定位根因/u)
   assert.ok(!without.includes('正确做法'))
+})
+
+
+// ---- 白盒补充：分支矩阵（覆盖率显示这些分支此前从未被走到） ----------------------
+
+test('deriveTrigger 的四种输入组合与全空兜底', () => {
+  assert.equal(deriveTrigger({ tool: 'bash' }), '使用 bash 时')
+  assert.match(deriveTrigger({ tool: 'bash', template: 'boom' }) ?? '', /使用 bash 时遇到「boom」/u)
+  assert.equal(deriveTrigger({ errorName: 'ENOENT' }), '使用 ENOENT 时')
+  assert.equal(deriveTrigger({ template: 'boom' }), '调用工具时遇到「boom」这类情况')
+  assert.equal(deriveTrigger({}), undefined, '三者皆空时应返回 undefined')
+  assert.equal(deriveTrigger({ tool: '', errorName: '', template: '   ' }), undefined, '空白不算内容')
+})
+
+test('failureTrigger：显式触发方式优先，**空白字符串**应回落到推导', () => {
+  const explicit = record({ trigger: '改文件前没读' })
+  assert.equal(failureTrigger(explicit), '改文件前没读')
+  // 覆盖率显示这条分支此前没被走到：trigger 存在但只有空白。
+  const blank = record({ trigger: '   ' })
+  assert.match(failureTrigger(blank) ?? '', /使用 bash 时/u, '空白 trigger 应回落到指纹推导')
+
+  const missing = record()
+  assert.match(failureTrigger(missing) ?? '', /使用 bash 时遇到「boom」/u, '缺省时应由指纹推导')
+  // 指纹里什么都没有时无从推导。
+  assert.equal(failureTrigger(record({ fingerprint: { kind: 'semantic', key: 'k' } })), undefined)
+})
+
+test('failureLessonLine：未复发与已复发两种文案', () => {
+  const fresh = failureLessonLine(record({ status: 'deprecated', remedy: '先建目录', trigger: '写报告前', occurrencesAtResolve: 3, occurrences: 3 }))
+  assert.match(fresh, /\[已解决\]/u)
+  assert.doesNotMatch(fresh, /解决后又触发/u, '未复发不应提复发次数')
+  assert.match(fresh, /触发场景：写报告前/u)
+
+  const relapsed = failureLessonLine(record({ status: 'deprecated', remedy: '先建目录', trigger: '写报告前', occurrencesAtResolve: 3, occurrences: 5 }))
+  assert.match(relapsed, /已解决·解决后又触发 2 次/u, '解决后复发应据实写出')
+
+  const noRemedy = failureLessonLine(record({ status: 'deprecated', remedy: '', trigger: '写报告前' }))
+  assert.match(noRemedy, /没写做法/u, '没有做法时应明说')
+})
+
+test('failureDetail：已解决记录带上解决时间、复发次数与触发方式', () => {
+  const detail = failureDetail(record({
+    status: 'deprecated',
+    remedy: '先建目录',
+    trigger: '写报告前',
+    resolvedAt: 1_700_000_000_000,
+    occurrencesAtResolve: 2,
+    occurrences: 4,
+  }))
+  assert.match(detail, /Trigger: 写报告前/u)
+  assert.match(detail, /Resolved at: .*（解决后又触发 2 次）/u)
+  const fresh = failureDetail(record({ status: 'deprecated', resolvedAt: 1_700_000_000_000, occurrencesAtResolve: 2, occurrences: 2 }))
+  assert.match(fresh, /Resolved at: /u)
+  assert.doesNotMatch(fresh, /解决后又触发/u)
+})
+
+test('lessonMatches：工具命中、两词重合、单词重合与无重合四档', () => {
+  const target = record({ trigger: '写 report.json 之前忘了建目录', remedy: '先创建报告目录再写文件' })
+  // ① 工具命中直接放行。
+  assert.equal(lessonMatches(target, new Set(), new Set(['bash'])), true)
+  // ② 词面重合 ≥2 → 放行。
+  assert.equal(lessonMatches(target, new Set(['report', 'json']), new Set()), true)
+  // ③ 只重合一个词 → 不放行（单词偶合太容易）。
+  assert.equal(lessonMatches(target, new Set(['report']), new Set()), false)
+  // ④ 完全不同的话题 → 不放行。
+  assert.equal(lessonMatches(target, new Set(['plantuml', 'swimlane']), new Set(['read_file'])), false)
+})
+
+test('guardLiteralFromArguments：非标准参数名也取字面量，危险/过短/过长一律放弃', () => {
+  // 覆盖率显示：从 Object.values 兜底取值的分支此前没被走到。
+  assert.equal(guardLiteralFromArguments({ weird_key: 'npm test' }), 'npm test')
+  assert.equal(guardLiteralFromArguments({ command: 'npm test', weird: 'x' }), 'npm test', '标准键优先')
+  assert.equal(guardLiteralFromArguments({ command: '/etc/passwd' }), undefined, '含路径分隔符放弃')
+  assert.equal(guardLiteralFromArguments({ command: 'AKIAIOSFODNN7EXAMPLE' }), undefined, '含凭据放弃')
+  assert.equal(guardLiteralFromArguments({ command: 'ls' }), undefined, '过短放弃')
+  assert.equal(guardLiteralFromArguments({ command: 'x'.repeat(200) }), undefined, '过长放弃')
+  assert.equal(guardLiteralFromArguments({}), undefined, '没有字符串参数放弃')
+  assert.equal(guardLiteralFromArguments(null), undefined)
 })

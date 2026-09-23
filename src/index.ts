@@ -50,7 +50,19 @@ import {
 } from './mine.js'
 import type { MineCache } from './mine.js'
 import { createFileView, detectStack, stackSummary } from './stack/index.js'
-import { applyOutcome, confidenceOf, injectable, techniqueIndexLine } from './technique.js'
+import {
+  DETAILED_HITS,
+  applyOutcome,
+  checkVerificationEvidence,
+  clampVerificationEvidence,
+  confidenceOf,
+  gistOf,
+  injectable,
+  resolveTechniqueId,
+  techniqueIndexLine,
+  techniqueSearchLine,
+  techniqueTailLine,
+} from './technique.js'
 import {
   DEFAULT_GUARD_TOOLS,
   deriveGuard,
@@ -1256,7 +1268,16 @@ export function apply(ctx: Context, config: Config): void {
    * @returns 注入文本；无可注入内容时为空串。
    */
   const renderInjection = (query: string): string => {
-    const docs = corpusFor(current?.cwd)
+    // DEF-12：召回语料里含 `toTechniqueDocs(...)`，而 `recall()` **不看状态** —— 草稿技巧
+    // 会带着 `(technique)` 标签从这条通道进入上下文，与「草稿不参与自动注入」的承诺冲突，
+    // 更糟的是让未经验证的知识获得了注入权威。专用技巧段走 `recallTechniques()` 有硬过滤，
+    // 这里补上同一口径。工具侧（`memory_search` / `technique_search(includeDrafts)`）不受影响：
+    // 那是模型显式发起的检索，看得到草稿是特性。
+    const docs = corpusFor(current?.cwd).filter(doc => {
+      if (doc.layer !== 'technique') return true
+      const record = techniqueById.get(doc.id)
+      return record !== undefined && injectable(record)
+    })
     if (docs.length === 0) return ''
     const hits = recall(query, docs, { limit: settings.recallLimit })
     if (hits.length === 0) return ''
@@ -1305,6 +1326,7 @@ export function apply(ctx: Context, config: Config): void {
     const base: TechniqueDraft = {
       kind: input.kind,
       name: input.name.trim(),
+      ...(input.gist === undefined ? {} : { gist: input.gist.trim() }),
       when: input.when.trim(),
       summary: input.summary.trim(),
       ...(input.steps === undefined ? {} : { steps: [...input.steps] }),
@@ -1347,7 +1369,9 @@ export function apply(ctx: Context, config: Config): void {
     limit: number,
   ): string => {
     const head = [...block.header, ...extraHeader]
-    const fixed = `${head.join('\n')}\n${block.footer}`.length
+    // 固定开销 = 头部 + 尾部，再 +1 是正文与尾部之间的那个换行 —— 漏掉它会让总长比
+    // 配置上限多 1 个字符（DEF-13，白盒用例实测 520 → 521）。
+    const fixed = `${head.join('\n')}\n${block.footer}`.length + 1
     const budget = Math.max(0, limit - fixed)
     const body = lines.join('\n')
     // budget 必须显式判 0：`clipHead(body, 0)` 会走 `slice(0, -1)` 把**几乎整段**正文留下，
@@ -1373,7 +1397,11 @@ export function apply(ctx: Context, config: Config): void {
     if (!settings.failures) return ''
     const state = current
     if (state === undefined) return ''
-    const session = failuresBySession.get(state.sessionId)
+    // DEF-14：这里必须用 `failureState()`（缺则建）而不是 `failuresBySession.get()`。
+    // 用 `.get` 时，一个「本会话从未观测到失败、却撞见了历史失败」的会话拿到 undefined，
+    // 于是**预警发出去了但没登记** → 该会话永远不可能计入 `prevented`，
+    // 而这正是最常见的情形（预警本来就是给没犯过这个错的本会话看的）。
+    const session = failureState(state.sessionId)
     const turn = currentTurnOf(state)
 
     const candidates = [...failureById.values()].filter(record =>
@@ -1660,7 +1688,7 @@ export function apply(ctx: Context, config: Config): void {
 
   /** 技巧工具行为实现。 */
   const techniqueDeps = (): TechniqueToolDeps => ({
-    async search(query, limit, includeDrafts) {
+    async search(query, limit, includeDrafts, verbose) {
       const cwd = current?.cwd
       await refresh(cwd)
       const hits = recallTechniques(query, corpusFor(cwd), {
@@ -1673,16 +1701,42 @@ export function apply(ctx: Context, config: Config): void {
       if (hits.length === 0) {
         return `No technique matched "${query}" for the current stack.`
       }
-      return [
+      // 候选分两档付钱：前几条给可执行要点，其余只给「还存在」的指针。
+      // 依据是实测 —— 逐条都展开时模型无从判断该看哪条，结果全部展开（12 次 technique_get）。
+      const render = (hit: (typeof hits)[number], index: number, detailed: boolean): string => {
+        const record = techniqueById.get(hit.id)
+        if (record === undefined) return `${index + 1}. ${sanitizeForPrompt(hit.text)}`
+        if (verbose) return `${index + 1}. ${sanitizeForPrompt(techniqueIndexLine(record))} — score ${hit.score.toFixed(2)}`
+        return sanitizeForPrompt(detailed
+          ? techniqueSearchLine(record, index + 1)
+          : techniqueTailLine(record, index + 1))
+      }
+      const detailed = hits.slice(0, DETAILED_HITS)
+      const tail = hits.slice(DETAILED_HITS)
+      const lines = [
         `${hits.length} technique(s) for "${query}"${includeDrafts ? ' (including drafts)' : ''}:`,
-        ...hits.map(hit => formatTechniqueHit(hit, techniqueById.get(hit.id))),
-      ].join('\n')
+        ...detailed.map((hit, index) => render(hit, index, true)),
+      ]
+      if (tail.length > 0) {
+        lines.push(
+          'also matching (expand by id with technique_get):',
+          ...tail.map((hit, index) => render(hit, DETAILED_HITS + index, false)),
+        )
+      }
+      return lines.join('\n')
     },
-    async get(id) {
+    async get(ids) {
       await refresh(current?.cwd)
-      const record = techniqueById.get(id)
-      if (record === undefined) return `No technique with id "${id}".`
-      return formatTechniqueDetail(record)
+      const records = [...techniqueById.values()]
+      const blocks: string[] = []
+      for (const needle of ids) {
+        const resolved = resolveTechniqueId(needle, records)
+        blocks.push(resolved.ok
+          ? formatTechniqueDetail(resolved.record)
+          : `No technique resolved for "${needle}": ${resolved.reason}.`)
+      }
+      // 一次展开多条时用分隔线划清边界：正文之间没有围栏会让下一条的字段看起来属于上一条。
+      return blocks.join('\n\n---\n\n')
     },
     async save(input) {
       const scope = settings.scopeTechnique
@@ -1702,16 +1756,50 @@ export function apply(ctx: Context, config: Config): void {
       const saved = stored.records.find(record => record.name === draft.name && record.when === draft.when)
       return `Saved technique (scope ${scope})${saved === undefined ? '' : ` [id ${saved.id}, status ${saved.status}]`}: "${draft.name}"`
     },
-    async apply(id, outcome) {
+    async apply(id, outcome, evidence) {
       await refresh(current?.cwd)
-      const record = techniqueById.get(id)
-      if (record === undefined) return `No technique with id "${id}".`
-      const updated = applyOutcome(record, outcome)
+      const resolved = resolveTechniqueId(id, [...techniqueById.values()])
+      if (!resolved.ok) return `No technique resolved for "${id}": ${resolved.reason}.`
+      const record = resolved.record
+
+      const check = checkVerificationEvidence(evidence)
+      if (!check.ok) {
+        // 拒绝时把「怎么才算合格」和这条技巧**自己的判据**一起回给模型：
+        // 只说 "invalid" 会让它重试同样的空话，而判据正是它该照着的模板。
+        const criteria = record.verify.length === 0
+          ? ['(this technique records no explicit verification criteria — state what you checked and what you observed)']
+          : record.verify.map(item => `  - ${item}`)
+        return [
+          `Refused: no verification recorded for "${record.name}" — ${check.reason}.`,
+          'Evidence must be falsifiable: say what you checked and the concrete result you observed.',
+          'Good: "re-ran `npm test`: 240/240 pass (was 238)". Bad: "works" / "已采用".',
+          'Verify criteria recorded for this technique:',
+          ...criteria,
+        ].join('\n')
+      }
+
+      // 证据是**新增的落盘写入路径**，必须与其余四层同口径：先过安全管线（凭据脱敏 →
+      // 私有标识占位 → 区外绝对路径占位），再收敛长度。两者都在校验之后：
+      // 校验看全文，避免把写在末尾的具体锚点截掉后反被判为不合格（DEF-15/16）。
+      const stored = clampVerificationEvidence(
+        sanitizeForStore(check.value, current, current?.cwd),
+      )
+
+      const updated = applyOutcome(record, {
+        outcome,
+        evidence: stored,
+        at: Date.now(),
+        ...(current?.sessionId === undefined ? {} : { sessionId: current.sessionId }),
+        ...(current?.cwd === undefined ? {} : { cwd: current.cwd }),
+      })
       const ok = await store.updateTechnique(updated, record.scope === 'project' ? projectCwd() : undefined)
       await refresh(current?.cwd)
-      return ok
-        ? `Recorded ${outcome} for "${record.name}" (status ${updated.status}, confidence ${confidenceOf(updated).toFixed(2)}).`
-        : `Could not update technique "${id}".`
+      if (!ok) return `Could not update technique "${id}".`
+      const kept = updated.verifications?.length ?? 0
+      return [
+        `Recorded ${outcome} for "${record.name}" (status ${updated.status}, confidence ${confidenceOf(updated).toFixed(2)}).`,
+        `Evidence #${kept}: ${stored}`,
+      ].join('\n')
     },
     async exportSkill(id) {
       await refresh(current?.cwd)
@@ -2318,19 +2406,6 @@ function formatHit(row: RecalledMemory): string {
 }
 
 /**
- * 渲染一条技巧召回结果（索引行 + 得分），细节留给 `technique_get`。
- * @param row - 召回结果。
- * @param record - 对应的完整记录；缺失时退回可检索文本。
- * @returns 单行文本。
- */
-function formatTechniqueHit(row: RecalledMemory, record: TechniqueRecord | undefined): string {
-  if (record === undefined) {
-    return `${row.id} (technique, score ${row.score.toFixed(2)}) ${sanitizeForPrompt(row.text)}`
-  }
-  return `${sanitizeForPrompt(techniqueIndexLine(record))} — score ${row.score.toFixed(2)}`
-}
-
-/**
  * 渲染一条技巧的完整正文。
  *
  * 用 {@link sanitizeForText} 而非 `sanitizeForPrompt`：后者会压平换行，
@@ -2344,6 +2419,7 @@ function formatTechniqueDetail(record: TechniqueRecord): string {
     `${record.name} [${record.id}]`,
     `Kind: ${record.kind} | Status: ${record.status} | Confidence: ${confidenceOf(record).toFixed(2)}`,
     `When: ${record.when}`,
+    `Gist: ${gistOf(record)}`,
     `Summary: ${record.summary}`,
   ]
   const stack = stackSummary(record.stack)
@@ -2379,6 +2455,9 @@ function formatTechniqueDetail(record: TechniqueRecord): string {
   }
   if (record.evidence.length > 0) {
     lines.push(`Evidence: ${record.evidence.map(item => [item.kind, item.repo, item.role, item.hint].filter(Boolean).join('/')).join(', ')}`)
+  }
+  for (const verification of record.verifications ?? []) {
+    lines.push(`Verification (${verification.outcome}, ${new Date(verification.at).toISOString()}): ${verification.evidence}`)
   }
   return sanitizeForText(lines.join('\n'))
 }

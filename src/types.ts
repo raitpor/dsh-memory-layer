@@ -246,12 +246,43 @@ export interface TechniqueEvidence {
   sessionId?: string
 }
 
+/**
+ * 一次「采用并验收」的记录。
+ *
+ * 存在的理由是**证据**：只报 `outcome` 无法区分「真的按判据验过」与「用过就算成功」，
+ * 于是成功信号会饱和（实测：一次任务里 11 条技巧全报 success、0 条 failure），
+ * 置信度被系统性抬高。要求附带一句可证伪的证据，成功才是一条有信息量的观测。
+ */
+export interface TechniqueVerification {
+  /** 本次采用结果。 */
+  outcome: 'success' | 'failure'
+  /**
+   * 可证伪的验收证据：**按什么判据检查、看到什么结果**。
+   *
+   * 刻意不做语义判定（那是模型的活），只设下限：要具体到能被别人复核。
+   */
+  evidence: string
+  /** 检查发生的时间（Unix 毫秒）。 */
+  at: number
+  /** 来源会话 id。 */
+  sessionId?: string
+  /** 检查发生时的工作目录。 */
+  cwd?: string
+}
+
 /** 技巧草稿：提炼或挖掘产出、尚未与既有记录合并。 */
 export interface TechniqueDraft {
   /** 知识形态。 */
   kind: TechniqueKind
   /** 一句话技巧名。 */
   name: string
+  /**
+   * 一句话可执行要点（≤90 字）。
+   *
+   * 检索结果里带的是它而不是完整正文或长触发条件 —— 让模型**不必再展开**就能决定用不用，
+   * 这是压缩检索成本的主要手段。缺省时从 `summary` 首句派生。
+   */
+  gist?: string
   /** 触发条件：症状 / 意图 / 任务类型。 */
   when: string
   /** 主体：2–4 句总结性说明。 */
@@ -302,6 +333,8 @@ export interface TechniqueRecord {
   sensitivity: Sensitivity
   /** 一句话技巧名。 */
   name: string
+  /** 一句话可执行要点；缺省时由 `summary` 首句派生（见 `gistOf`）。 */
+  gist?: string
   /** 触发条件。 */
   when: string
   /** 主体说明。 */
@@ -346,6 +379,13 @@ export interface TechniqueRecord {
   failures: number
   /** 最近一次验证时间。 */
   lastVerifiedAt?: number
+  /**
+   * 采用验收记录，**最新在前**，最多保留 5 条。
+   *
+   * 只在 `technique_apply` 附带可证伪证据时写入 —— 没有证据就没有这条记录，
+   * 也就不会推动状态迁移。老记录没有该字段，读取时按空数组处理。
+   */
+  verifications?: TechniqueVerification[]
   /** 产出途径。 */
   provenance: 'model' | 'rule' | 'human'
 }

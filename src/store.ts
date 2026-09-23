@@ -181,6 +181,8 @@ export function semanticText(record: SemanticRecord): string {
 export function techniqueText(record: TechniqueRecord): string {
   return [
     record.name,
+    // 只纳入**显式** gist：派生 gist 就是 summary 的首句，重复一遍会白白抬高该项的词频。
+    ...(record.gist === undefined ? [] : [record.gist]),
     record.when,
     record.summary,
     ...(record.domain === undefined ? [] : [record.domain]),
@@ -312,6 +314,10 @@ function mergeTechnique(
   existing.updatedAt = now
   existing.hits += 1
   if (draft.summary.length > existing.summary.length) existing.summary = draft.summary
+
+  // 显式 gist 与 summary 是两回事：summary 会被更长的观察替换，gist 只在缺失时补齐。
+  // 派生 gist（未显式给出时）不需要搬过来 —— 它每次都从 summary 现算。
+  if (existing.gist === undefined && draft.gist !== undefined) existing.gist = draft.gist.trim()
 
   const nextStatus = draft.status ?? 'draft'
   if (STATUS_RANK[nextStatus] > STATUS_RANK[existing.status]) existing.status = nextStatus
@@ -662,6 +668,7 @@ export class MemoryStore {
         status: draft.status ?? 'draft',
         sensitivity: draft.sensitivity ?? 'internal',
         name,
+        ...(draft.gist === undefined || draft.gist.trim().length === 0 ? {} : { gist: draft.gist.trim() }),
         when,
         summary: draft.summary.trim(),
         ...(draft.steps === undefined ? {} : { steps: [...draft.steps] }),

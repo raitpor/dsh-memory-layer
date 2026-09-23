@@ -118,7 +118,8 @@ M -> D : 情景摘要 + 语义事实 + 技巧草稿
 note right of M : 只有真正付出模型调用\n才推进水位
 
 == 采用回报 ==
-T -> M ++ : technique_apply(id, success)
+T -> M ++ : technique_apply(id, outcome, evidence)
+note right of M : evidence 必须可证伪\n拒绝时不记账
 M -> D -- : 置信度与状态迁移
 
 S -> M ++ : session/disposed
@@ -174,8 +175,8 @@ title 技巧的生命周期
 skinparam shadowing false
 
 [*] --> draft : 挖掘 / 反思 / technique_save\n出生即草稿
-draft --> validated : technique_apply(success) ≥ 1
-validated --> canonical : success ≥ 3 且 failure = 0\n且有代码证据
+draft --> validated : technique_apply(success, evidence) ≥ 1
+validated --> canonical : success ≥ 3 且 failure = 0\n有代码证据 + 至少 1 条验收记录
 validated --> deprecated : failure ≥ 2 且 failure > success
 canonical --> deprecated : 同上
 validated --> [*] : technique_export\n(写出 SKILL.md)

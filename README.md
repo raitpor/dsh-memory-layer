@@ -50,7 +50,7 @@
 | 分区 | 全局域按 `partition` 划分（默认 `default`），同一分区内互通、跨分区隔离 |
 | 敏感级别 | `public / internal / confidential`；`confidential` 默认不进全局域 |
 | 信任状态 | `draft → validated → canonical`，失败会 `deprecated`；**草稿不参与自动注入** |
-| 置信度 | 由 `technique_apply` 回报的成功/失败计数驱动，多仓库独立观测会累积证据 |
+| 置信度 | 由 `technique_apply` 回报的成功/失败计数驱动，多仓库独立观测会累积证据；**回报必须附可证伪的验收证据** |
 
 ### 会话内反思（默认开启）
 
@@ -85,8 +85,17 @@
 
 ### 采用回报：只有显式回报才计数
 
-被召回（注入）的技巧是否「被采用」，只认**模型显式调用 `technique_apply`**（`id` + `outcome`）。
-注入块头部会写明这一点。**没有回报的一律按「未采用」处理** —— 既不计成功也不计失败。
+被召回（注入）的技巧是否「被采用」，只认**模型显式调用 `technique_apply`**（`id` + `outcome` +
+`evidence`）。注入块头部会写明这一点。**没有回报的一律按「未采用」处理** —— 既不计成功也不计失败。
+
+`evidence` 必须是**可证伪**的：说清按什么判据检查、看到什么结果，具体到别人能照着复核
+（如「重跑 `npm test`：240/240 通过，改动前是 238」）。只有结论词（`ok` / `已采用` / `通过`）
+会被拒绝，且**拒绝时不记账** —— 这是因为「用了就算成功」的成功信号会饱和：实测一次任务里
+11 条技巧全报成功、0 条失败，置信度被系统性抬高。拒绝应答里会回显该技巧自己的 `verify`
+判据，作为补充证据的模板。验收记录随技巧落盘（最新在前、最多 5 条、单条证据收敛到 400 字符），
+落盘前同样过**统一安全管线**（凭据脱敏 → 私有标识占位 → 区外绝对路径占位）——
+`evidence` 是继四层正文之后新增的写入路径，与它们同口径；`technique_get`
+展开时可见，`canonical` 的晋升也额外要求至少一条带证据的验收记录。
 
 > 为什么不在注入块里另造一个文本标记（例如让模型写 `ADOPTED-TECHNIQUE: <id>`）：
 > 那等于给同一件事造第二条通道。工具是结构化的、会校验 id、能同时表达成功与失败，
@@ -334,12 +343,12 @@ dsh plugin --profile web add dsh-memory-layer
 | `memory_save` | 把一条长期事实/偏好写入语义层（立即去重合并） |
 | `memory_forget` | 按 id 删除：`sm_`/`ep_` 记在记忆层、`tq_` 转交技巧层（`memory_search` 返回三种 id，见「召回」），且**默认跨全部作用域**（id 全局唯一，而 `memory_save` 写的是语义层作用域）；`*` 清空某个作用域需显式 `confirm: true`，默认只清 `project` |
 | `memory_stats` | 查看各层条数、按层作用域与「经验复利」指标 |
-| `technique_search` | 按当前技术栈检索技巧（默认只返回已验证条目，`includeDrafts` 可看草稿） |
-| `technique_get` | 按 id 展开完整正文：步骤、调用面、示例、坑与验证判据 |
+| `technique_search` | 按当前技术栈检索技巧（默认只返回已验证条目，`includeDrafts` 可看草稿）。结果**分两档**：前 3 条给可执行要点（`gist`）+ 短 id，其余只给「还存在」的指针；`verbose: true` 退回完整索引行 |
+| `technique_get` | 按 id（完整 id 或唯一前缀，如 `tq_f6233ebe`）展开完整正文：要点、步骤、调用面、示例、坑、验证判据与历次验收证据；`ids` 可一次展开多条 |
 | `technique_learn` | 从一个代码仓库挖掘技巧（显式、受限；产出为草稿） |
 | `technique_export` | 把一条**已验证**技巧物化成 `SKILL.md`（confidential 拒绝导出） |
 | `technique_save` | 手工写入一条技巧草稿（与自动提炼走同一条脱敏 + 去标识化管线） |
-| `technique_apply` | 回报采用结果，驱动置信度与状态迁移（**采用回报的唯一通道**） |
+| `technique_apply` | 回报采用结果**与可证伪的验收证据**，驱动置信度与状态迁移（**采用回报的唯一通道**） |
 | `technique_forget` | 按 id 删除；`*` 清空需显式 `confirm: true` |
 | `failure_list` | 列出反复犯的错（按重复次数排序）；`includeResolved` 可看已解决记录及其触发方式、解决后复发次数 |
 | `failure_resolve` | 标记已解决，并记录**正确做法**与**触发场景**；场景再现时该记录会以 `[已解决…]` 条目提前提醒 |
@@ -440,7 +449,7 @@ dsh plugin --profile web add dsh-memory-layer
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（221 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（251 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 

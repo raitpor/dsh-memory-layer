@@ -177,3 +177,73 @@ test('countProjectEpisodic 汇总所有项目桶，且不把 global 算进去', 
     assert.equal(await store.countProjectEpisodic(), 3, '跨项目总数应为 3，global 不计')
   })
 })
+
+
+// ---- 白盒补充：失败层合并时 trigger 的「只填空、不覆盖」语义 ----------------------
+
+test('upsertFailures：trigger 只在缺失时补上，已有值不被后来的观测改写', async () => {
+  await withStore(async store => {
+    const fingerprint = { kind: 'machine' as const, key: 'k1', tool: 'bash', template: 'boom' }
+    const options = {
+      scope: 'global' as const,
+      partition: 'default',
+      sessionId: 's1',
+      enforcement: () => 'warn' as const,
+    }
+    // ① 首次写入带上 trigger。
+    await store.upsertFailures([{ fingerprint, symptom: 'boom', trigger: '使用 bash 时' }], options)
+    let [record] = await store.readFailures('global')
+    assert.equal(record?.trigger, '使用 bash 时')
+
+    // ② 再次观测带**不同** trigger：已有的语义结论不该被粗粒度推导覆盖。
+    await store.upsertFailures([{ fingerprint, symptom: 'boom again', trigger: '换了个推导' }], options)
+    ;[record] = await store.readFailures('global')
+    assert.equal(record?.trigger, '使用 bash 时', '已有 trigger 必须保留')
+    assert.equal(record?.occurrences, 2, '次数照常累加')
+    assert.equal(record?.symptom, 'boom again', '现象取最近一次')
+  })
+})
+
+test('upsertFailures：先无 trigger 后补上时，缺失的那次会被填上', async () => {
+  await withStore(async store => {
+    const fingerprint = { kind: 'machine' as const, key: 'k2', tool: 'bash', template: 'boom' }
+    const options = {
+      scope: 'global' as const,
+      partition: 'default',
+      sessionId: 's1',
+      enforcement: () => 'warn' as const,
+    }
+    await store.upsertFailures([{ fingerprint, symptom: 'boom' }], options)
+    let [record] = await store.readFailures('global')
+    assert.equal(record?.trigger, undefined, '未提供时不应凭空造出 trigger')
+
+    await store.upsertFailures([{ fingerprint, symptom: 'boom', trigger: '使用 bash 时遇到「boom」' }], options)
+    ;[record] = await store.readFailures('global')
+    assert.equal(record?.trigger, '使用 bash 时遇到「boom」', '缺失时应补上')
+  })
+})
+
+
+test('forgetFailure：按记录 id 删除与整域清空', async () => {
+  await withStore(async store => {
+    const options = {
+      scope: 'global' as const,
+      partition: 'default',
+      sessionId: 's1',
+      enforcement: () => 'warn' as const,
+    }
+    await store.upsertFailures([
+      { fingerprint: { kind: 'machine' as const, key: 'k1', tool: 'bash', template: 'a' }, symptom: 'a' },
+      { fingerprint: { kind: 'machine' as const, key: 'k2', tool: 'bash', template: 'b' }, symptom: 'b' },
+    ], options)
+    // 参数是**记录 id**，不是指纹 key —— 传 key 删不掉任何东西。
+    assert.equal(await store.forgetFailure('global', undefined, 'default', 'k1'), 0)
+    const records = await store.readFailures('global')
+    const target = records.find(record => record.fingerprint.key === 'k1')
+    assert.ok(target !== undefined)
+    assert.equal(await store.forgetFailure('global', undefined, 'default', target.id), 1)
+    assert.equal((await store.readFailures('global')).length, 1)
+    assert.equal(await store.forgetFailure('global', undefined, 'default', '*'), 1, '`*` 清空整域')
+    assert.equal((await store.readFailures('global')).length, 0)
+  })
+})

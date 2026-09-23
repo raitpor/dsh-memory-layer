@@ -253,6 +253,9 @@ export function abstractTechniqueDraft(
   return {
     ...draft,
     name: run(draft.name),
+    // gist 会出现在检索结果与展开正文里，必须和 name/when/summary 走同一条脱敏管线：
+    // `...draft` 只负责保留字段，不做脱敏，漏掉这里等于给私有标识开一条旁路。
+    ...(draft.gist === undefined ? {} : { gist: run(draft.gist) }),
     when: run(draft.when),
     summary: run(draft.summary),
     ...(draft.steps === undefined ? {} : { steps: draft.steps.map(run) }),

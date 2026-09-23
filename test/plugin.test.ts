@@ -20,6 +20,7 @@ import { apply } from '../src/index.js'
 import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from '../src/injection.js'
 import type { Config } from '../src/index.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
+import { DETAILED_HITS, MAX_VERIFICATION_CHARS } from '../src/technique.js'
 import { parseSkillFrontmatter, verifySkill } from '../src/skill.js'
 
 /** 一段注入到 system prompt 的注册记录。 */
@@ -285,6 +286,14 @@ function sectionText(fake: FakeContext, name: string): string {
   if (entry === undefined) return ''
   return typeof entry.text === 'function' ? entry.text({}) : entry.text
 }
+
+/**
+ * 一条**合格**的验收证据：带具体锚点（数字 + 反引号记号），能过 `checkVerificationEvidence`。
+ *
+ * 采用回报现在必须附可证伪证据，因此所有「只是想把技巧喂到 validated」的用例
+ * 都从这里取一条，避免每个用例各自编一句空话。
+ */
+const GOOD_EVIDENCE = 're-ran `node --test`: 240/240 pass, was 238 before the change'
 
 /** 取一个已注册的工具。 */
 function toolOf(fake: FakeContext, name: string): ToolDefinition {
@@ -934,7 +943,7 @@ async function seedValidatedTechnique(fake: FakeContext): Promise<string> {
   } as never, undefined as never))
   const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
   if (id === undefined) throw new Error(`技巧保存应答里没有 id：${saved}`)
-  await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success' } as never, undefined as never)
+  await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
   return id
 }
 
@@ -1103,7 +1112,7 @@ test('注入块必须中和 {{ ：否则 prompt 插值会整轮抛错', async ()
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
     assert.ok(id !== undefined, saved)
-    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success' } as never, undefined as never)
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
 
     const stored = (await new MemoryStore(root).readTechniques('global')).find(item => item.id === id)
     assert.ok(
@@ -1167,7 +1176,7 @@ test('技巧按技术栈过滤：Java 项目写入，TS 项目不注入、另一
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
     assert.ok(id !== undefined, `保存应答应含 id：${saved}`)
     assert.match(String(await toolOf(fake, 'technique_apply').execute(
-      { id, outcome: 'success' } as never, undefined as never,
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )), /validated/u)
 
     // 切到 TS 项目：技术栈不匹配 → 不注入（宁可少给，也不给错的）。
@@ -1208,7 +1217,7 @@ test('技巧注入块声明为不可信数据且示例不得执行', async () =>
     { query: 'authorize', includeDrafts: true } as never, undefined as never,
   ))
   const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
-  await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success' } as never, undefined as never)
+  await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
 
   const rendered = sectionText(fake, 'memory-layer:techniques')
   assert.match(rendered, /UNTRUSTED/u)
@@ -1673,6 +1682,34 @@ test('失败注入段两类条目连续编号（DEF-07）', async () => {
   }
 })
 
+test('注入预算落在「框架与整段正文之间」时：正文被截断而框架完整', async () => {
+  // 白盒：`renderBlock` 有三条路径 —— 预算 ≥ 正文（不截断）、0 < 预算 < 正文（截断正文）、
+  // 预算 ≤ 固定开销（不出正文）。第三条由 DEF-08 用例覆盖，这条补第二条。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, recallChars: 520 })
+  try {
+    const s = fakeSession('p1', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    for (let i = 0; i < 4; i += 1) {
+      await toolOf(fake, 'memory_save').execute({
+        text: `构建命令变体 ${i}：用 make target-${i}，${'补充说明'.repeat(10)}`,
+        kind: 'fact',
+      } as never, undefined as never)
+    }
+    await fake.flush()
+    fake.emit('session/event', s, userMessage('构建命令用哪个 make target'))
+    const rendered = sectionText(fake, 'memory-layer:recall')
+    assert.match(rendered, /--- BEGIN UNTRUSTED MEMORY ---/u, 'BEGIN 必须保留')
+    assert.match(rendered, /--- END UNTRUSTED MEMORY ---/u, 'END 必须保留')
+    assert.ok(rendered.length <= 520, `总长应受上限约束，实际 ${rendered.length}`)
+    assert.match(rendered, /…/u, '正文应被截断并带省略号')
+    // 条目编号行应至少出现一条（预算足够放下一部分正文）。
+    assert.match(rendered, /^1\. \(/mu, `应至少注入一条条目：${rendered.slice(0, 200)}`)
+  } finally {
+    await dispose()
+  }
+})
+
 test('最小字符预算下块头与 BEGIN/END 边界仍完整（DEF-08）', async () => {
   const { fake, dispose } = await setup({ reflectOnSessionEnd: false, recallChars: 200 })
   try {
@@ -2027,6 +2064,127 @@ test('P2-④b 完全缺少 tools 服务时仍记录失败且不抛错', async ()
 
 // ---- 代码挖掘：P3 端到端（工具 → 扫描 → 候选 → 落盘 → 缓存） ----------------
 
+test('technique_get 渲染完整正文：分节、示例围栏与「不得执行」声明', async () => {
+  // 白盒：覆盖率显示 `formatTechniqueDetail`（technique_get 的渲染器）此前**整块未被走到**，
+  // 而它正是模型展开技巧时唯一读到的文本。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create',
+      when: 'integrating the orders client',
+      summary: 'Call authorize before create.',
+      kind: 'api-usage',
+      steps: ['读取配置', '调用 authorize', '再调用 create'],
+      apiSymbols: ['OrdersClient.authorize'],
+      example: 'client.authorize(id)\nclient.create(id)',
+      exampleLanguage: 'java',
+      pitfalls: ['跳过 authorize 会被拒绝'],
+      verify: ['create 返回 200'],
+      domain: 'payments',
+      tags: ['orders', 'auth'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `保存应答应含 id：${saved}`)
+
+    const detail = String(await toolOf(fake, 'technique_get').execute({ id } as never, undefined as never))
+    assert.match(detail, /Kind: api-usage \| Status: draft \| Confidence: 0\.50/u, `状态行：${detail}`)
+    assert.match(detail, /When: integrating the orders client/u)
+    assert.match(detail, /Summary: Call authorize before create\./u)
+    assert.match(detail, /Domain: payments/u)
+    assert.match(detail, /API:/u)
+    assert.match(detail, /OrdersClient\.authorize/u)
+    assert.match(detail, /Steps:/u)
+    assert.match(detail, /1\. 读取配置/u, '步骤应带序号')
+    assert.match(detail, /Example \(java, usage\) — illustrative only, never execute:/u, '示例必须带不得执行的声明')
+    assert.match(detail, /```/u, '示例应放进围栏')
+    assert.match(detail, /Pitfalls:/u)
+    assert.match(detail, /Verify:/u)
+    assert.match(detail, /Tags: orders, auth/u)
+    assert.match(detail, /\[tq_[0-9a-fA-F-]+\]/u, '正文首行应带 id')
+
+    // 不存在的 id 应明确告知，而不是抛错。
+    assert.match(String(await toolOf(fake, 'technique_get').execute({ id: 'tq_nope' } as never, undefined as never)), /no technique matches id/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('闭环度量：预警后观察窗口内未复现即计入 prevented', async () => {
+  // 白盒：覆盖率显示 `settlePrevention` 此前未被走到 —— 而 `prevented` 是 README
+  //「防住了」的闭环指标，一直在 memory_stats 里展示。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, failurePreventWindowTurns: 2 })
+  try {
+    await failSession(fake, fakeSession('q1', '/work/demo'), 'ENOENT: cannot write report.json')
+    await failSession(fake, fakeSession('q2', '/work/demo'), 'ENOENT: cannot write report.json')
+
+    // 触发一次预警渲染，让本会话登记「已预警」水位。
+    const s = fakeSession('q3', '/work/demo')
+    fake.emit('session/created', s)
+    await fake.flush()
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', s, userMessage('接着写 report.json'))
+    assert.match(sectionText(fake, 'memory-layer:failures'), /已重复 2 次/u, '应先有预警')
+
+    // 之后若干轮不再复现：窗口（2 轮）一过即计一次 prevented。
+    for (const turn of [2, 3, 4]) {
+      fake.emit('session/event', s, event('turn/start', { turn }))
+      fake.emit('session/event', s, userMessage(`第 ${turn} 轮：无关话题`))
+      fake.emit('session/event', s, event('turn/end', { turn, reason: 'completed' }))
+      await flushWrites(fake)
+    }
+
+    const [record] = await new MemoryStore(root).readFailures('global')
+    assert.equal(record?.prevented, 1, `观察窗口过后应计一次 prevented（实际 ${record?.prevented}）`)
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Recurring failures: 1 active, 0 resolved, 1 prevented/u,
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('技巧草稿不得经记忆召回段注入（DEF-12）', async () => {
+  // 两条注入路径的历史口径不同：专用技巧段走 `recallTechniques()`（按状态硬过滤），
+  // 而记忆召回段走 `recall()`，其语料含 `toTechniqueDocs(...)` 且**完全不看状态** ——
+  // 于是草稿技巧曾带着 `(technique)` 标签进入上下文，让未经验证的知识获得注入权威。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: '草稿不得漏进召回段',
+      when: '检查草稿泄露时',
+      summary: '未经验证的技巧不应被自动注入。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `保存应答应含 id：${saved}`)
+
+    const s = fakeSession('r1', '/work/demo')
+    fake.emit('session/created', s)
+    await fake.flush()
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', s, userMessage('检查草稿泄露时'))
+    assert.doesNotMatch(
+      sectionText(fake, 'memory-layer:recall'),
+      /草稿不得漏进召回段/u,
+      '草稿不得经记忆召回段注入',
+    )
+    assert.doesNotMatch(
+      sectionText(fake, 'memory-layer:techniques'),
+      /草稿不得漏进召回段/u,
+      '草稿不得经技巧段注入',
+    )
+
+    // 升级为 validated 后，专用技巧段应当注入它。
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
+    await fake.flush()
+    fake.emit('session/event', s, userMessage('检查草稿泄露时'))
+    assert.match(sectionText(fake, 'memory-layer:techniques'), /草稿不得漏进召回段/u, '验证后应注入')
+  } finally {
+    await dispose()
+  }
+})
+
 test('technique_learn 从真实代码库挖掘并落盘为草稿，且不泄露项目路径', async () => {
   const repo = await mkdtemp(join(tmpdir(), 'dsh-mine-repo-'))
   try {
@@ -2102,16 +2260,234 @@ test('P4-① technique_apply 的成功/失败计数驱动状态迁移', async ()
     assert.equal(before[0]?.status, 'draft')
 
     assert.match(String(await toolOf(fake, 'technique_apply').execute(
-      { id, outcome: 'success' } as never, undefined as never,
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )), /validated/u)
     assert.equal((await new MemoryStore(root).readTechniques('global'))[0]?.status, 'validated')
 
-    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'failure' } as never, undefined as never)
-    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'failure' } as never, undefined as never)
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'failure', evidence: GOOD_EVIDENCE } as never, undefined as never)
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'failure', evidence: GOOD_EVIDENCE } as never, undefined as never)
     const deprecated = await new MemoryStore(root).readTechniques('global')
     assert.equal(deprecated[0]?.status, 'deprecated', '连续失败应废弃，避免继续误导')
     assert.equal(deprecated[0]?.successes, 1)
     assert.equal(deprecated[0]?.failures, 2)
+  } finally {
+    await dispose()
+  }
+})
+
+test('technique_apply 拒绝不可证伪的证据，且拒绝时不记账', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create',
+      when: 'integrating the orders client',
+      summary: 'Call authorize first.',
+      verify: ['响应里不再出现 401'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    assert.ok(id !== '', saved)
+
+    // 完全不给证据：工具契约层就挡住了（required 属性缺失）。
+    await assert.rejects(
+      async () => toolOf(fake, 'technique_apply').execute(
+        { id, outcome: 'success' } as never, undefined as never,
+      ),
+      /missing required property "evidence"/u,
+      '缺参数应在契约层被拒，而不是落进业务逻辑',
+    )
+
+    // 给了但不可证伪：契约层看不出区别，必须由证据校验挡住。
+    for (const bad of ['', '   ', 'ok', '已采用，效果良好', '通过']) {
+      const refused = String(await toolOf(fake, 'technique_apply').execute(
+        { id, outcome: 'success', evidence: bad } as never, undefined as never,
+      ))
+      assert.match(refused, /^Refused/u, `应拒绝：${JSON.stringify(bad)}`)
+      // 拒绝文本要能教会模型怎么补：既给出通用要求，也回显这条技巧自己的判据。
+      assert.match(refused, /falsifiable/u)
+      assert.match(refused, /响应里不再出现 401/u, '应回显这条技巧的验收判据')
+    }
+
+    const untouched = (await new MemoryStore(root).readTechniques('global'))[0]
+    assert.equal(untouched?.successes, 0, '被拒绝的回报不得改变计数')
+    assert.equal(untouched?.status, 'draft')
+    assert.equal(untouched?.verifications, undefined, '被拒绝的回报不得留下验收记录')
+  } finally {
+    await dispose()
+  }
+})
+
+test('technique_apply 把证据落盘，technique_get 能读回', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create',
+      when: 'integrating the orders client',
+      summary: 'Call authorize first.',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+
+    const recorded = String(await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    ))
+    assert.match(recorded, /Evidence #1/u)
+    assert.match(recorded, /240\/240/u, '应答应回显证据，便于当场核对')
+
+    const stored = (await new MemoryStore(root).readTechniques('global'))[0]
+    assert.equal(stored?.verifications?.length, 1, '验收记录必须落盘，否则证据只活在这一轮上下文里')
+    assert.equal(stored?.verifications?.[0]?.evidence, GOOD_EVIDENCE)
+
+    const detail = String(await toolOf(fake, 'technique_get').execute({ id } as never, undefined as never))
+    assert.match(detail, /Gist:/u)
+    assert.match(detail, new RegExp(`Verification \\(success`, 'u'), '展开时能看到历次验收证据')
+    assert.match(detail, /240\/240/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('technique_search 默认给紧凑行（带 gist 与短 id），verbose 才给完整索引行', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create',
+      when: 'integrating the orders client',
+      summary: 'Call authorize before create。否则客户端返回 401 而不是抛错。',
+      gist: '先 authorize 再 create，否则只拿到 401',
+      verify: ['不再出现 401'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+
+    const compact = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'authorize' } as never, undefined as never,
+    ))
+    assert.match(compact, /先 authorize 再 create/u, '紧凑行必须带着可执行要点')
+    assert.ok(!compact.includes(id), `紧凑行不应印完整 uuid：${compact}`)
+    const shortId = /id (tq_[0-9a-f]+)/u.exec(compact)?.[1] ?? ''
+    assert.ok(shortId.length > 3 && shortId.length < id.length, `应给出短 id：${compact}`)
+
+    // 短 id 必须真的能用：否则省下的字符要用一次失败调用还回去。
+    const expanded = String(await toolOf(fake, 'technique_get').execute({ id: shortId } as never, undefined as never))
+    assert.match(expanded, /authorize before create/u, '短 id 应能解析')
+
+    const verbose = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'authorize', verbose: true } as never, undefined as never,
+    ))
+    assert.ok(verbose.includes(id), 'verbose 仍按原样给完整 id 与触发条件')
+    assert.ok(verbose.length > compact.length, '紧凑行必须真的更短')
+  } finally {
+    await dispose()
+  }
+})
+
+test('验收证据落盘前过安全管线并被收敛（新增写入路径与其余四层同口径）', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create', when: 'orders client', summary: 'Call authorize first.',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+
+    // 凭据 + 工作区外绝对路径 + 超长：三种风险一次覆盖。
+    const secret = 'AKIAIOSFODNN7EXAMPLE'
+    const reply = String(await toolOf(fake, 'technique_apply').execute({
+      id,
+      outcome: 'success',
+      evidence: `复核 ${secret} 已移除；路径 /etc/ssl/private/legacy.pem 不再引用；${'很长'.repeat(300)} 240/240`,
+    } as never, undefined as never))
+    assert.doesNotMatch(reply, /^Refused/u, '含具体锚点，不应被校验拒绝')
+
+    const stored = (await new MemoryStore(root).readTechniques('global'))[0]
+    const evidence = stored?.verifications?.[0]?.evidence ?? ''
+    assert.ok(!evidence.includes(secret), `证据里的凭据不得明文落盘：${evidence.slice(0, 80)}`)
+    assert.match(evidence, /\[REDACTED:/u, '凭据应替换为种类化占位符')
+    assert.ok(!evidence.includes('/etc/ssl'), '区外绝对路径不得原样落盘')
+    assert.match(evidence, /\[(EXTERNAL-PATH|PATH)\]/u, '应替换为占位符')
+    assert.ok(evidence.length <= MAX_VERIFICATION_CHARS, `证据应收敛到上限：${evidence.length}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('检索无命中时明确说明，而不是返回空串', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    // 覆盖率指引：这条早退分支此前从未被执行过（lib/src/index.js 的 technique_search 早退）。
+    const reply = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'zzz-绝不存在的关键词-zzz' } as never, undefined as never,
+    ))
+    assert.match(reply, /No technique matched/u, '空结果要有明确说明')
+    assert.ok(reply.length > 0, '不得返回空串')
+  } finally {
+    await dispose()
+  }
+})
+
+test('检索结果分两档：只有前几条带可执行要点，其余只给指针', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    // 同一领域的多条技巧几乎同分 —— 这正是实测里模型「全部展开」的场景。
+    for (let index = 0; index < 5; index += 1) {
+      await toolOf(fake, 'technique_save').execute({
+        name: `authorize flow variant ${index}`,
+        when: `integrating the orders client, case ${index}`,
+        summary: `Call authorize before create, variant ${index}.`,
+        gist: 'GIST-MARKER 先 authorize 再 create',
+      } as never, undefined as never)
+    }
+
+    const compact = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'authorize', limit: 5, includeDrafts: true } as never, undefined as never,
+    ))
+    const withGist = compact.split('\n').filter(line => line.includes('GIST-MARKER')).length
+    assert.equal(withGist, DETAILED_HITS, `只有前 ${DETAILED_HITS} 条该给可执行要点`)
+    assert.match(compact, /also matching/u, '其余候选要显式说明「还存在」，而不是消失')
+    // 尾部候选仍然可用：名字 + 短 id，想细看时按 id 展开。
+    const tailLines = compact.split('\n').filter(line => /^\d+\./u.test(line) && !line.includes('GIST-MARKER'))
+    assert.equal(tailLines.length, 5 - DETAILED_HITS, '尾部候选条数')
+  } finally {
+    await dispose()
+  }
+})
+
+test('technique_get 支持一次展开多条，并逐个报告无法解析的 id', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const first = String(await toolOf(fake, 'technique_save').execute({
+      name: 'authorize before create', when: 'orders client', summary: 'One.',
+    } as never, undefined as never))
+    const second = String(await toolOf(fake, 'technique_save').execute({
+      name: 'registry order matters', when: 'blocks and items', summary: 'Two.',
+    } as never, undefined as never))
+    const idA = /tq_[0-9a-fA-F-]+/u.exec(first)?.[0] ?? ''
+    const idB = /tq_[0-9a-fA-F-]+/u.exec(second)?.[0] ?? ''
+
+    const both = String(await toolOf(fake, 'technique_get').execute(
+      { ids: [idA, 'tq_nope', idB] } as never, undefined as never,
+    ))
+    assert.match(both, /authorize before create/u, '批量展开应含第一条')
+    assert.match(both, /registry order matters/u, '批量展开应含第二条')
+    assert.match(both, /no technique matches id "tq_nope"/u, '无法解析的 id 要单独说明，不能整批失败')
+    assert.ok(both.includes('---'), '多条之间要有分隔，否则字段会看起来属于上一条')
+
+    // 两个参数都不给时不应静默返回空字符串。
+    assert.match(String(await toolOf(fake, 'technique_get').execute({} as never, undefined as never)), /Provide id or ids/u)
   } finally {
     await dispose()
   }
@@ -2132,7 +2508,7 @@ test('P4-② technique_export 产出合法 SKILL.md，描述含可检索的触�
       tags: ['orders'],
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
-    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success' } as never, undefined as never)
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
 
     const report = String(await toolOf(fake, 'technique_export').execute({ id } as never, undefined as never))
     assert.match(report, /Exported/u, report)
@@ -2203,7 +2579,7 @@ test('P4-③ confidential 技巧无法导出为 skill', async () => {
 
     // 先让它变成已验证，确认拒绝的原因是敏感级别而不是状态。
     await toolOf(fake, 'technique_apply').execute(
-      { id: records[0]?.id ?? '', outcome: 'success' } as never, undefined as never,
+      { id: records[0]?.id ?? '', outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )
     const refused = String(await toolOf(fake, 'technique_export').execute(
       { id: records[0]?.id ?? '' } as never, undefined as never,

@@ -169,3 +169,45 @@ test('模型超时也会回退规则', async () => {
   assert.equal(result.source, 'rule')
   assert.match(result.fallbackReason ?? '', /timeout|abort/iu)
 })
+
+
+test('模型提炼的调用面：symbol 必填，signature/notes 可选，超量被截断', async () => {
+  // 覆盖率显示 `apiSurfaces()` 整块此前未被走到 —— 而它是 api-usage 类技巧的正文。
+  const payload = {
+    title: 't',
+    summary: 's',
+    decisions: [],
+    todos: [],
+    files: [],
+    tags: [],
+    facts: [],
+    corrections: [],
+    techniques: [
+      {
+        kind: 'api-usage',
+        name: 'authorize before create',
+        when: 'integrating the orders client',
+        summary: 'Call authorize first.',
+        api: [
+          { symbol: 'OrdersClient.authorize', signature: 'authorize(id: string)', notes: 'call it first' },
+          { symbol: 'OrdersClient.create' },
+          { symbol: '' },                                   // 缺 symbol → 丢弃
+          { symbol: 'OrdersClient.cancel', signature: '', notes: '' }, // 空串不应写进字段
+          'not-an-object',                                  // 非对象 → 丢弃
+        ],
+      },
+    ],
+  }
+  const call = async () => JSON.stringify(payload)
+  const memory = await distillWithModel(call, { turns: [turn({ user: 'x' })] })
+  const api = memory.techniques[0]?.api ?? []
+  assert.deepEqual(api.map(surface => surface.symbol), [
+    'OrdersClient.authorize',
+    'OrdersClient.create',
+    'OrdersClient.cancel',
+  ], '空 symbol 与非对象条目应被丢弃')
+  assert.equal(api[0]?.signature, 'authorize(id: string)')
+  assert.equal(api[0]?.notes, 'call it first')
+  assert.equal(api[1]?.signature, undefined, '未给出就不写该字段')
+  assert.equal(api[2]?.notes, undefined, '空串同样不写')
+})

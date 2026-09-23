@@ -338,8 +338,10 @@ export interface TechniqueRecord {
   provenance: 'model' | 'rule' | 'human'
 }
 
-/** 技巧召回时携带的元信息，供过滤与加权使用。 */
+/** 召回时携带的元信息，供过滤、加权与**打标签**使用。 */
 export interface RecallMeta {
+  /** 语义专用：事实类别（`fact` / `preference` / `decision` / `constraint`）。 */
+  kind?: SemanticKind
   /** 技巧专用：信任状态。 */
   status?: TechniqueStatus
   /** 技巧专用：敏感级别。 */

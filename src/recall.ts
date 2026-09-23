@@ -122,11 +122,14 @@ export function toDocs(
       ts: record.ts,
       text: episodicText(record),
     })),
+    // `kind` 必须带出去：标签要按它区分偏好/决定/约束，否则一律显示成「长期事实」，
+    // 模型会把用户偏好当成客观事实（见 `recallLabel`）。
     ...semantic.map(record => ({
       layer: 'semantic' as const,
       id: record.id,
       ts: record.updatedAt,
       text: semanticText(record),
+      meta: { kind: record.kind },
     })),
   ]
 }

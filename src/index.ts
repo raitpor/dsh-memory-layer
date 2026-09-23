@@ -40,7 +40,7 @@ import { recall, recallTechniques, toDocs, toTechniqueDocs, tokenize } from './r
 import type { RecallDoc } from './recall.js'
 import { distill, isInjectedContext } from './distill.js'
 import type { LlmTextCaller, Transcript } from './distill.js'
-import { redact, sanitizeForInjection, sanitizeForPrompt, sanitizeForText } from './redact.js'
+import { redactAll, sanitizeForInjection, sanitizeForPrompt, sanitizeForText } from './redact.js'
 import { abstractTechniqueDraft, abstractText, identifiersFromPaths } from './abstract.js'
 import {
   createRepoView,
@@ -271,6 +271,44 @@ const LAYER_LABELS: Record<'episodic' | 'semantic' | 'technique' | 'failure', st
   semantic: 'long-term fact',
   technique: 'technique',
   failure: 'recurring failure',
+}
+
+/**
+ * 语义层的标签前缀：真正区分类别的是记录自带的 `kind`，不是「语义层」这个笼统归属。
+ *
+ * 把一条**偏好**标成 `long-term fact` 是实打实的误导：模型会把它当成客观事实，
+ * 而不是「用户希望这样做」，于是既不会在执行前重新确认，也不会在冲突时让位于新指令。
+ * `decision` / `constraint` 同理。
+ */
+const SEMANTIC_LABEL_PREFIX = 'long-term'
+
+/** 合法的语义类别。标签只允许取这四者之一，见 {@link recallLabel}。 */
+const SEMANTIC_KINDS: readonly string[] = ['fact', 'preference', 'decision', 'constraint']
+
+/**
+ * 渲染一条召回记录的来源标签。
+ *
+ * **注入与工具输出必须共用这一处**。历史上两处各写一份二元映射，technique / failure
+ * 被一致地标成 episodic；后来语义层又要按 `kind` 细分（fact / preference / decision /
+ * constraint），两份实现迟早会再次分叉。
+ *
+ * `kind` 按**白名单**收敛，而不是直接拼进标签：记忆库是明文文件，`readSemantic` 对读到的
+ * JSON 只做类型断言、不做校验，因此 `kind` 是**外部可改写的不可信输入**。标签又与正文同处
+ * 注入块的一行，一旦其中带换行就能伪造 `--- END UNTRUSTED MEMORY ---` 边界（已实测复现）。
+ * 所以这里只接受四个已知取值，其余一律回落 `fact` —— 白名单比「事后净化」更稳：
+ * 标签本就不该出现词表以外的任何字符。
+ *
+ * @param layer - 记录所属层。
+ * @param kind - 语义记录的类别；其余层忽略。按不可信输入对待。
+ * @returns 供模型阅读的标签。
+ */
+export function recallLabel(
+  layer: 'episodic' | 'semantic' | 'technique' | 'failure',
+  kind?: unknown,
+): string {
+  if (layer !== 'semantic') return LAYER_LABELS[layer]
+  const safe = typeof kind === 'string' && SEMANTIC_KINDS.includes(kind) ? kind : 'fact'
+  return `${SEMANTIC_LABEL_PREFIX} ${safe}`
 }
 
 /** 技巧层注入 section 名。 */
@@ -758,13 +796,21 @@ export function apply(ctx: Context, config: Config): void {
 
     const scope = settings.scopeFailure
     const cwd = scope === 'project' ? state.cwd : undefined
+    // 失败层同样要过统一安全管线。它的 symptom / remedy 会被注入后续会话，而
+    // scopeFailure 默认为 global —— 只脱敏不去标识化的话，错误首行里的项目路径与
+    // 私有标识会跨项目留存。指纹的 key 由**原文**算出，先算后洗，因此键保持稳定。
+    const fingerprint = observation.fingerprint.template === undefined
+      ? observation.fingerprint
+      : { ...observation.fingerprint, template: sanitizeForStore(observation.fingerprint.template, state) }
+    const symptom = sanitizeForStore(observation.symptom, state)
+    const cleanRemedy = remedy === undefined ? undefined : sanitizeForStore(remedy, state)
     void runFailureWrite(async () => {
       const { records } = await store.upsertFailures(
         [{
-          fingerprint: observation.fingerprint,
-          symptom: observation.symptom,
+          fingerprint,
+          symptom,
           ...(state.stack === undefined ? {} : { stack: state.stack }),
-          ...(remedy === undefined ? {} : { remedy }),
+          ...(cleanRemedy === undefined ? {} : { remedy: cleanRemedy }),
           ...(guard === undefined ? {} : { guard }),
         }],
         {
@@ -799,7 +845,8 @@ export function apply(ctx: Context, config: Config): void {
     void runFailureWrite(async () => {
       const record = failureByKey.get(key)
       if (record === undefined || record.remedy.length > 0) return
-      const updated: FailureRecord = { ...record, remedy, updatedAt: Date.now() }
+      // 与 `recordFailure` 同一口径：remedy 会进全局域并被注入，必须先过去标识化。
+      const updated: FailureRecord = { ...record, remedy: sanitizeForStore(remedy, state), updatedAt: Date.now() }
       failureById.set(updated.id, updated)
       failureByKey.set(key, updated)
       await store.updateFailure(updated, updated.scope === 'project' ? state.cwd : undefined)
@@ -858,6 +905,39 @@ export function apply(ctx: Context, config: Config): void {
     })
 
   /**
+   * 把**工作区外**的绝对路径替换为 `[EXTERNAL-PATH]`（工作区内路径保留原样）。
+   *
+   * @param value - 任意文本。
+   * @param cwd - 当前会话工作目录；缺省时不认为任何路径在工作区内。
+   * @returns 处理后的文本。
+   */
+  const scrubExternalPath = (value: string, cwd: string | undefined): string =>
+    value.replace(/\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+/gu, match =>
+      keepInsideWorkspace([match], cwd).length > 0 ? match : '[EXTERNAL-PATH]')
+
+  /**
+   * 落盘前的**统一安全管线**：凭据脱敏 → 项目私有标识占位 → 工作区外绝对路径占位。
+   *
+   * 四层共用这一条管线（技巧层走 {@link abstractDraft}，内部是同一套 `abstractText`）。
+   * 之所以必须逐层都过：`global` 作用域的层会跨项目复用，任何一层漏掉去标识化，
+   * 就等于给项目私有标识开了一条绕开策略的通道。
+   *
+   * 只用于**自由文本**。`tags` 这类检索元数据不套占位符 —— 元数据一旦被 `<Class1>`
+   * 之类占位符替换就再也检索不到（历史上把 `domain`/`tags` 打成 `<id1>` 就是这么来的），
+   * 它们只做凭据脱敏。
+   *
+   * @param value - 待落盘文本。
+   * @param state - 来源会话状态（用于推导项目私有标识）。
+   * @param cwd - 会话工作目录；缺省取 `state.cwd`。
+   * @returns 可落盘文本。
+   */
+  const sanitizeForStore = (value: string, state: LiveSession | undefined, cwd?: string): string => {
+    if (value.length === 0) return value
+    const identifiers = identifiersFromPaths((state?.turns ?? []).flatMap(turn => turn.files))
+    return scrubExternalPath(abstractText(value, { identifiers }).text, cwd ?? state?.cwd)
+  }
+
+  /**
    * 判断一条草稿是否允许写入目标作用域。
    *
    * `confidential` 默认只能留在项目域：它是业务机密，全局扩散的代价不可逆。
@@ -886,20 +966,20 @@ export function apply(ctx: Context, config: Config): void {
       ...(route === undefined ? {} : { call: modelCaller(route) }),
       timeoutMs: settings.distillTimeoutMs,
     })
-    // 纵深防御：记忆正文里出现的**工作区外绝对路径**同样属于敏感信息，
-    // 统一替换为占位符（文件列表另由 keepInsideWorkspace 归一为相对路径）。
-    const scrubExternalPath = (value: string): string =>
-      value.replace(/\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+/gu, match =>
-        keepInsideWorkspace([match], state.cwd).length > 0 ? match : '[EXTERNAL-PATH]')
+    // 情景层与语义层的自由文本都要过统一安全管线：凭据脱敏 + 项目私有标识占位 +
+    // 工作区外绝对路径占位。文件列表另由 keepInsideWorkspace 归一为相对路径，
+    // tags 是检索元数据，只做凭据脱敏（占位符会毁掉检索）。
     const raw = result.memory
+    const clean = (value: string): string => sanitizeForStore(value, state, state.cwd)
     const memory = {
       ...raw,
-      title: scrubExternalPath(raw.title),
-      summary: scrubExternalPath(raw.summary),
-      decisions: raw.decisions.map(scrubExternalPath),
-      todos: raw.todos.map(scrubExternalPath),
+      title: clean(raw.title),
+      summary: clean(raw.summary),
+      decisions: raw.decisions.map(clean),
+      todos: raw.todos.map(clean),
       files: keepInsideWorkspace(raw.files, state.cwd),
-      facts: raw.facts.map(fact => ({ kind: fact.kind, text: scrubExternalPath(fact.text) })),
+      tags: redactAll(raw.tags),
+      facts: raw.facts.map(fact => ({ kind: fact.kind, text: clean(fact.text) })),
       techniques: raw.techniques.map(draft => abstractDraft(draft, state)),
     }
 
@@ -1080,7 +1160,7 @@ export function apply(ctx: Context, config: Config): void {
     const hits = recall(query, docs, { limit: settings.recallLimit })
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
-      const kind = LAYER_LABELS[hit.layer]
+      const kind = recallLabel(hit.layer, hit.meta?.kind)
       return `${index + 1}. (${kind}) ${sanitizeForInjection(hit.text)}`
     })
     return clipHead(
@@ -1218,7 +1298,7 @@ export function apply(ctx: Context, config: Config): void {
       await refresh(current?.cwd)
       const record = failureById.get(id)
       if (record === undefined) return `No failure with id "${id}".`
-      const clean = remedy === undefined ? record.remedy : redact(remedy.trim())
+      const clean = remedy === undefined ? record.remedy : sanitizeForStore(remedy.trim(), current, projectCwd())
       const updated: FailureRecord = {
         ...record,
         remedy: clean,
@@ -1318,8 +1398,9 @@ export function apply(ctx: Context, config: Config): void {
     async save(text, kind) {
       const scope = settings.scopeSemantic
       const cwd = scope === 'project' ? projectCwd() : undefined
-      // 工具写入与自动提炼走同一条脱敏管线，避免绕过凭据过滤。
-      const clean = redact(text.trim())
+      // 工具写入与自动提炼走同一条安全管线：只脱敏不去标识化的话，
+      // 项目私有标识会经工具这条旁路进入（默认全局的）语义层。
+      const clean = sanitizeForStore(text.trim(), current, cwd)
       const records = await store.upsertSemantic([{ kind, text: clean }], {
         scope,
         partition: settings.partition,
@@ -1552,14 +1633,13 @@ export function apply(ctx: Context, config: Config): void {
         if (settings.failures && CORRECTION_MARKERS.some(marker => text.toLowerCase().includes(marker))) {
           const fingerprint = semanticFingerprint(text)
           if (fingerprint !== undefined) {
-            // 现象与 remedy 都会被注入后续会话，且默认落在**全局域**，因此必须先过脱敏 ——
-            // 指纹里的 template 自带脱敏，但 symptom / remedy 是另存的正文，漏掉这一步
-            // 就会把用户原话里的凭据直接写进全局库。
-            const clean = redact(text.trim().replace(/\s+/gu, ' '))
-            const remedy = clipHead(clean, 300)
+            // symptom 与 remedy 都会被注入后续会话，且默认落在**全局域**。
+            // `recordFailure` / `attachRemedyToLastFailure` 内部会过统一安全管线，
+            // 因此这里传原文即可，不在调用点重复脱敏（两处口径必须一致）。
+            const remedy = clipHead(text.trim().replace(/\s+/gu, ' '), 300)
             recordFailure(
               state,
-              { fingerprint, symptom: `用户纠偏：${clipHead(clean, 200)}` },
+              { fingerprint, symptom: `用户纠偏：${clipHead(text.trim().replace(/\s+/gu, ' '), 200)}` },
               remedy,
             )
             // 用户纠偏通常紧跟在一次失败之后：那句「应该怎么做」正是这条失败缺的 remedy。
@@ -2031,7 +2111,7 @@ function keepInsideWorkspace(files: readonly string[], cwd: string | undefined):
  * @returns 多行文本。
  */
 function formatHit(row: RecalledMemory): string {
-  const kind = LAYER_LABELS[row.layer]
+  const kind = recallLabel(row.layer, row.meta?.kind)
   return `${row.id} (${kind}, score ${row.score.toFixed(2)}, ${new Date(row.ts).toISOString()})\n  ${sanitizeForPrompt(row.text)}`
 }
 

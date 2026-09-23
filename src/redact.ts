@@ -58,7 +58,46 @@ const ANSI_OTHER = /\u001b[@-Z\\-_]/gu
  * 必须换成**不含** `-` / `*` 的符号：用反斜杠转义（`\- [`）仍保留 `- [` 子串，
  * 无法阻止内容冒充注入块的层级标签。
  */
-const BULLET_MARK = '• '
+const BULLET_MARK = '•'
+
+/**
+ * 注入块用来标识层级的标签词表。
+ *
+ * 与 `index.ts` 的 `recallLabel()` 可能产出的标签保持一致（语义层按 `kind` 细分成
+ * fact / preference / decision / constraint），另收 `long-term` / `episodic` 这类早期别名。
+ * `redact.test.ts` 有一条用例遍历「层 × 类别」的全部组合来验证，因此词表漂移会被测试抓住。
+ */
+const INJECTION_LABEL_WORDS: readonly string[] = [
+  'past session',
+  'long-term fact',
+  'long-term preference',
+  'long-term decision',
+  'long-term constraint',
+  'long-term',
+  'recurring failure',
+  'technique',
+  'episodic',
+  'semantic',
+  'transient',
+  'failure',
+]
+
+/** 把一个字面量转成正则安全的形式。 */
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+
+/**
+ * 「列表标记 + 层级标签」的伪造形态，例如 `- [long-term]`。
+ *
+ * 刻意**只**匹配标签词表里的词，而不是任意 `- [X]`：真实世界里的 `- [X]` 大量是
+ * 代码而非标签 —— PlantUML 的隐藏连线 `-[hidden]->`、组件连线 `DA - [First Component]`、
+ * 任务清单 `- [x]` 都会被「见 `- [` 就改写」的宽规则改坏（实测存量技巧里有 18 个字段
+ * 被改坏）。伪造面是**冒充本插件的层级标签**，所以按词表精确匹配即可，代价是
+ * `- [system-prompt]` 这类自造标签不会被改写 —— 但它并不对应任何真实层级。
+ */
+const FORGED_LABEL_MARKER = new RegExp(
+  `([-*+])(\\s*\\[\\s*(?:${INJECTION_LABEL_WORDS.map(escapeRegExp).join('|')})\\b)`,
+  'giu',
+)
 
 /**
  * 把文本中的凭据替换为占位符。
@@ -144,8 +183,12 @@ export function redactMemory(memory: DistilledMemory): DistilledMemory {
 }
 
 /**
- * 文本净化：剥离 ANSI 转义与控制字符，并把可与注入块结构混淆的列表标记
- * 改写为中性符号 `•`，但**保留换行**。
+ * 文本净化：剥离 ANSI 转义与控制字符，并把**冒充注入块层级标签**的列表标记
+ * 改写为中性符号 `•`（如 `- [long-term]` → `• [long-term]`），但**保留换行**。
+ *
+ * 只有标签词表（见 {@link INJECTION_LABEL_WORDS}）里的词会被改写，因此
+ * `-[hidden]->`、`DA - [First Component]` 这类代码形态原样保留 —— 防注入变换
+ * 一旦改写合法内容，记忆就会在读取路径上被悄悄改坏。
  *
  * 适合多行内容（如技巧的完整正文）——`sanitizeForPrompt` 会压平换行，
  * 那对单行注入行是对的，对结构化正文则会破坏排版。
@@ -159,7 +202,7 @@ export function sanitizeForText(text: string): string {
     .replace(ANSI_CSI, '')
     .replace(ANSI_OTHER, '')
     .replace(CONTROL_CHARS, '')
-  return stripped.replace(/([-*+])\s*(?=\[[A-Za-z\u4e00-\u9fff])/gu, BULLET_MARK)
+  return stripped.replace(FORGED_LABEL_MARKER, `${BULLET_MARK}$2`)
 }
 
 /**

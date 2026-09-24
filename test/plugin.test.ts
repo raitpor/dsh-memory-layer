@@ -21,6 +21,7 @@ import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from '../src/injection.js'
 import type { Config } from '../src/index.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
 import { createCodec } from '../src/crypto.js'
+import { RECALL_ENTRY_CHARS } from '../src/injection.js'
 import { DETAILED_HITS, MAX_VERIFICATION_CHARS } from '../src/technique.js'
 import { parseSkillFrontmatter, verifySkill } from '../src/skill.js'
 
@@ -975,7 +976,11 @@ test('技巧注入块要求用 technique_apply 回报采用，不自造文本标
     assert.match(rendered, /technique_apply/u, '应指向已有的结构化工具')
     assert.match(rendered, /counts as NOT adopted/u, '应说明不回报即视为未采用')
     assert.doesNotMatch(rendered, /ADOPTED-TECHNIQUE/u, '不应再有自造的文本标记')
-    assert.match(rendered, new RegExp(id, 'u'), '索引行要带 id，模型才有东西可回报')
+    // B5 起注入行印**短 id**（`tq_` + 8 位）：`technique_apply` / `technique_get` 都认唯一前缀，
+    // 这样每行省约 30 字符。断言「有一个可回报的句柄」而不是「印了完整 uuid」。
+    const short = /tq_[0-9a-f]{8}/u.exec(rendered)?.[0]
+    assert.ok(short !== undefined, `索引行要带可回报的 id 前缀：${rendered}`)
+    assert.ok(id.startsWith(short), '前缀必须真的指向这条技巧')
   } finally {
     await dispose()
   }
@@ -2298,14 +2303,13 @@ test('technique_apply 拒绝不可证伪的证据，且拒绝时不记账', asyn
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
     assert.ok(id !== '', saved)
 
-    // 完全不给证据：工具契约层就挡住了（required 属性缺失）。
-    await assert.rejects(
-      async () => toolOf(fake, 'technique_apply').execute(
-        { id, outcome: 'success' } as never, undefined as never,
-      ),
-      /missing required property "evidence"/u,
-      '缺参数应在契约层被拒，而不是落进业务逻辑',
-    )
+    // 完全不给证据：**执行期**拒绝（schema 要同时容纳 updates[] 形态，表达不了「这组或那组」；
+    // updates[] 的每一项仍是 schema required，见批量用例）。
+    const missing = String(await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success' } as never, undefined as never,
+    ))
+    assert.match(missing, /Provide either id \+ outcome \+ evidence, or updates\[\]/u, '缺参数要明确拒绝')
+    assert.match(missing, /Nothing was recorded/u, '并说明没有记账')
 
     // 给了但不可证伪：契约层看不出区别，必须由证据校验挡住。
     for (const bad of ['', '   ', 'ok', '已采用，效果良好', '通过']) {
@@ -2684,6 +2688,172 @@ test('本会话自己的情景摘要不回灌，别的会话的摘要照常注�
     const block = injection(fake)
     assert.match(block, /ZZZ-上一个会话的标记-ZZZ/u, '别的会话的摘要要照常注入')
     assert.ok(!block.includes('ZZZ-本会话自己的标记-ZZZ'), `本会话自己的摘要不该回灌：${block}`)
+  } finally {
+    await dispose()
+  }
+})
+
+// ---- 成本改造 B1/B2/B4/B6/B7 -------------------------------------------------
+
+test('B2：技巧注入块的固定开销有上限（采纳提示已压缩）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('集成 OrdersClient 并调用 authorize'))
+    const rendered = sectionText(fake, 'memory-layer:techniques')
+    assert.match(rendered, /counts as NOT adopted/u, '关键约定仍要在')
+    const lines = rendered.split('\n')
+    const entries = lines.filter(line => /^\d+\. /u.test(line))
+    const frame = rendered.length - entries.reduce((n, line) => n + line.length + 1, 0)
+    // 固定框的大头是**刻意保留**的不可信声明（安全边界），能压的是采纳提示那两行。
+    assert.ok(frame < 620, `固定框应从 721 字符降下来，实际 ${frame}`)
+    const notice = lines.filter(line => /technique_apply|NOT adopted/u.test(line))
+    const noticeChars = notice.reduce((n, line) => n + line.length + 1, 0)
+    assert.ok(notice.length <= 2, `采纳提示最多两行：${notice.length}`)
+    assert.ok(noticeChars < 200, `采纳提示应从 285 字符压到 200 以内，实际 ${noticeChars}`)
+    assert.ok(rendered.includes(id.slice(0, 11)), '条目仍要给出可回报的句柄')
+  } finally {
+    await dispose()
+  }
+})
+
+test('B4：送审转录保留首尾（不再只留一头）', async () => {
+  const captured: unknown[] = []
+  const llm = {
+    stream: async function* stream(options: unknown) {
+      captured.push(options)
+      const text = JSON.stringify({ summary: '摘要', facts: [], corrections: [], techniques: [] })
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    },
+  }
+  const { fake, dispose } = await setup({ provider: 'test', model: 'test', reflectMinTurns: 1 }, true, { llm })
+  try {
+    const head = 'HEAD-MARKER-开头讲打算做什么'
+    const tail = 'TAIL-MARKER-结尾给结论'
+    const filler = '中间过程。'.repeat(400)
+    // 走和既有反思用例同一条路径（带工具调用与文件，反思闸门才会放行）。
+    await runSession(fake, fakeSession('s1', '/work/demo'), '请把成本降下来', ['src/index.ts'], `${head}${filler}${tail}`)
+    fake.emit('session/disposed', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+
+    const request = captured.at(-1) as { messages?: { content?: { text?: string }[] }[] } | undefined
+    const text = request?.messages?.[0]?.content?.[0]?.text ?? ''
+    assert.ok(text.includes(head), '开头（意图）要保留')
+    assert.ok(text.includes(tail), '结尾（结论）要保留')
+    assert.ok(text.length < 3000, `截断后仍要收敛在 captureAssistantChars 量级：${text.length}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('B6：一次调用回报多条采用结果，合并成一次写入', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const ids: string[] = []
+    for (let index = 0; index < 3; index += 1) {
+      const saved = String(await toolOf(fake, 'technique_save').execute({
+        name: `bulk technique ${index}`, when: `case ${index}`, summary: `Summary ${index}.`,
+      } as never, undefined as never))
+      ids.push(/tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? '')
+    }
+    const reply = String(await toolOf(fake, 'technique_apply').execute({
+      updates: [
+        { id: ids[0], outcome: 'success', evidence: '`npm test` 240/240 通过' },
+        { id: ids[1], outcome: 'success', evidence: '渲染后目视：728×1010，无交叉边' },
+        { id: ids[2], outcome: 'success', evidence: '已采用' },
+      ],
+    } as never, undefined as never))
+    assert.match(reply, /Recorded 2\/3 in a single write/u, `第三条证据不合格应被单独拒掉：${reply}`)
+    assert.match(reply, /content-free verdict/u, '拒绝理由要说清是空话')
+
+    const stored = await new MemoryStore(root).readTechniques('global')
+    assert.equal(stored.filter(record => record.verifications?.length === 1).length, 2, '两条被记账')
+    assert.equal(stored.find(record => record.name === 'bulk technique 2')?.successes, 0, '被拒的那条不记账')
+  } finally {
+    await dispose()
+  }
+})
+
+test('B7：同一条失败预警在同一会话里只注入一次', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    // 用两次机械失败把同一条失败推到「该预警」的次数。
+    for (const turn of [1, 2]) {
+      fake.emit('session/event', session, event('turn/start', { turn }))
+      const failed = toolFailure(`c${turn}`, 'bash', 'Error: command failed with exit code 1', undefined, { command: 'npm test' })
+      fake.emit('session/event', session, failed.call)
+      fake.emit('session/event', session, failed.result)
+      fake.emit('session/event', session, event('turn/end', { turn, reason: 'completed' }))
+      await fake.flush()
+    }
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    fake.emit('session/event', session, userMessage('继续'))
+    const first = sectionText(fake, 'memory-layer:failures')
+    assert.ok(first.length > 0, `第三次应当看到预警：${first}`)
+    fake.emit('session/event', session, event('turn/start', { turn: 4 }))
+    fake.emit('session/event', session, userMessage('继续'))
+    const second = sectionText(fake, 'memory-layer:failures')
+    assert.equal(second, '', `同一会话不该重发同一条预警，实际：${second}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('B1：注入的召回条目逐条收敛，且不重复标题', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    // 首轮用户文本足够长：规则摘要的标题（≤120 字符）会成为「请求：」一行的前缀 ——
+    // 改造前这段开头会被印两遍（标题一行 + 请求一行）。
+    const opener = `请把注入成本降下来，逐条检查哪些地方可以省，并且不要降低记忆质量-${'细节'.repeat(40)}`
+    const a = fakeSession('past1', '/work/demo')
+    fake.emit('session/created', a)
+    await fake.flush()
+    fake.emit('session/event', a, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', a, userMessage(opener))
+    fake.emit('session/event', a, assistantMessage(1, '已列出清单。'))
+    fake.emit('session/event', a, event('turn/end', { turn: 1, reason: 'completed' }))
+    await fake.flush()
+
+    const b = fakeSession('self1', '/work/demo')
+    fake.emit('session/created', b)
+    await fake.flush()
+    fake.emit('session/event', b, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', b, userMessage('注入成本降下来怎么省'))
+    const block = injection(fake)
+    const entry = block.split('\n').find(line => /^1\. /u.test(line)) ?? ''
+    assert.ok(entry.length > 0, `应召回上一个会话：${block}`)
+    const body = entry.replace(/^1\. \(past session\) /u, '')
+    assert.ok(body.length <= RECALL_ENTRY_CHARS + 20, `条目应收敛到 ${RECALL_ENTRY_CHARS} 字符量级：${body.length}`)
+    const probe = opener.slice(0, 40)
+    assert.equal(body.split(probe).length - 1, 1, `同一段开头只应出现一次：${body.slice(0, 120)}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('B5：注入行带上做法（模型据此判断，省掉一次 technique_get 往返）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('集成 OrdersClient 并调用 authorize'))
+    const rendered = sectionText(fake, 'memory-layer:techniques')
+    assert.match(rendered, /做法: /u, `注入行要带一句话做法：${rendered}`)
+    assert.ok(rendered.includes(id.slice(0, 11)), '句柄仍在')
   } finally {
     await dispose()
   }

@@ -151,6 +151,16 @@ function clampLimit(value: number | undefined): number {
 
 // ---- 技巧经验层工具 ---------------------------------------------------------
 
+/** `technique_apply` 的单条输入（批量与单条共用同一形状与校验口径）。 */
+export interface TechniqueApplyInput {
+  /** 技巧 id，或唯一前缀。 */
+  id: string
+  /** 采用结果。 */
+  outcome: 'success' | 'failure'
+  /** 可证伪的验收证据。 */
+  evidence: string
+}
+
 /** `technique_save` 的输入：调用方补齐技术栈与证据后落盘。 */
 export interface TechniqueSaveInput {
   /** 知识形态。 */
@@ -212,6 +222,16 @@ export interface TechniqueToolDeps {
    * @returns 处理结果说明。
    */
   apply(id: string, outcome: 'success' | 'failure', evidence: string): Promise<string>
+  /**
+   * 一次回报多条采用结果。
+   *
+   * 与逐条 `apply` 的区别只在**往返次数**：每次调用都是一整轮模型请求（要重读整段上下文），
+   * 因此「一次带几条」比「快多少」重要。落地时合并成一次读-改-写，只取一次写者锁。
+   *
+   * @param updates - 每条含 id / outcome / evidence，校验口径与单条完全一致。
+   * @returns 逐条结果说明（含被拒条目及其原因）。
+   */
+  applyBatch(updates: readonly TechniqueApplyInput[]): Promise<string>
   /**
    * 删除技巧。
    * @param id - 技巧 id，或 `*` 表示清空。
@@ -357,15 +377,29 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
         '"rendered the diagram: 728x1010, no crossing edges".',
         'A bare verdict such as "ok" / "worked" / "已采用" is rejected, because it reads the same for any outcome.',
         'Successes promote a technique towards verification; repeated failures deprecate it.',
-        'Call this once per technique you used and could actually evaluate.',
+        'Call this for each technique you used and could actually evaluate; when you adopted several,',
+        'report them in ONE call via updates[] instead of one call per technique — each call is a full',
+        'model round trip, so batching is what keeps this cheap.',
       ].join(' '),
       parameters: {
-        id: { type: 'string', required: true, description: 'Technique id (full id or unique prefix) returned by technique_search.' },
-        outcome: { type: 'string', required: true, description: "'success' or 'failure'." },
+        id: { type: 'string', description: 'Technique id (full id or unique prefix) returned by technique_search. Omit when using updates.' },
+        outcome: { type: 'string', description: "'success' or 'failure'. Omit when using updates." },
         evidence: {
           type: 'string',
-          required: true,
           description: 'Falsifiable acceptance evidence: what you checked, and the concrete result you observed.',
+        },
+        updates: {
+          type: 'array',
+          description: 'Report several techniques in one call (preferred when you adopted more than one); same per-item rules as the single form.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string', required: true, description: 'Technique id or unique prefix.' },
+              outcome: { type: 'string', required: true, description: "'success' or 'failure'." },
+              evidence: { type: 'string', required: true, description: 'Falsifiable acceptance evidence for this technique.' },
+            },
+          },
         },
       },
       output: {
@@ -373,6 +407,19 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args) {
+        const batch = args.updates
+        if (batch !== undefined && batch.length > 0) {
+          return deps.applyBatch(batch.map(update => ({
+            id: String(update.id ?? ''),
+            outcome: update.outcome === 'failure' ? 'failure' : 'success',
+            evidence: String(update.evidence ?? ''),
+          })))
+        }
+        // 单条形态在这里**执行期校验**（而不是靠 schema 的 required）：两种形态二选一，
+        // schema 无法表达「这一组或那一组」，但拒绝文本仍然由证据校验给出，口径不松。
+        if (args.id === undefined || args.evidence === undefined) {
+          return 'Provide either id + outcome + evidence, or updates[]. Nothing was recorded.'
+        }
         return deps.apply(args.id, args.outcome === 'failure' ? 'failure' : 'success', args.evidence)
       },
     }),

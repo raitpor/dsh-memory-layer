@@ -286,6 +286,32 @@ export function techniqueIndexLine(record: TechniqueRecord): string {
 }
 
 /**
+ * 渲染**注入**用的技巧索引行。
+ *
+ * 与 {@link techniqueIndexLine} 的分工：那条供 `technique_search(verbose)` 用，讲「这条讲什么、
+ * 什么时候用、适用什么栈」；这条供 system prompt 注入用，额外带上 **{@link gistOf} 的一句话做法**，
+ * 好让模型**不必为了判断而调 `technique_get`** —— 一次工具往返要重读整段上下文，比在提示里
+ * 多带几十个字符贵得多。同时去掉 `适用:`（结果早已按栈过滤过，再印一遍是噪声），
+ * 并用**短 id**（`technique_apply` / `technique_get` 都认前缀）。
+ *
+ * @param record - 技巧记录。
+ * @returns 单行文本。
+ */
+export function techniqueInjectionLine(record: TechniqueRecord): string {
+  const parts = [
+    record.name,
+    `做法: ${gistOf(record)}`,
+    `何时用: ${record.when}`,
+    `id ${shortTechniqueId(record.id)}`,
+  ]
+  if (record.status !== 'draft') parts.splice(1, 0, `[${record.status}]`)
+  if (record.conflictsWith !== undefined && record.conflictsWith.length > 0) {
+    parts.push(`同一触发下另有做法: ${record.conflictsWith.join(', ')}`)
+  }
+  return parts.join(' — ')
+}
+
+/**
  * 判断一条技巧是否适用于给定的当前栈。
  * @param record - 技巧记录。
  * @param current - 当前项目的观测栈。

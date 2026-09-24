@@ -104,3 +104,32 @@ export const INJECTION_BLOCKS: readonly InjectionBlock[] = [RECALL_BLOCK, TECHNI
 export const HOST_CONTEXT_MARKERS: readonly string[] = [
   'Current runtime context.',
 ]
+
+/**
+ * 单条召回条目在注入时的字符上限。
+ *
+ * 为什么是**逐条**上限而不是只靠整块预算：整块预算用 `clipHead` 砍尾部，一个长条目
+ * 就能吃掉全部预算，后面命中的记忆会被从半句处截断甚至整条消失 —— 又贵又难看。
+ * 逐条封顶让「命中几条就注入几条」成立，也避免注入出现半截句子。
+ */
+export const RECALL_ENTRY_CHARS = 400
+
+/**
+ * 整形一条注入条目：去掉与正文重复的标题、收敛到 {@link RECALL_ENTRY_CHARS}。
+ *
+ * 只用于**注入**渲染，不改检索语料：标题是 BM25 的强信号，从语料里拿掉会伤召回。
+ *
+ * @param text - 召回到的原始条目文本（可能多行）。
+ * @returns 适合注入的紧凑文本。
+ */
+export function compactEntryText(text: string): string {
+  const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0)
+  // 情景条目的正文（summary）里已经含有首轮请求原文，标题再印一遍是纯重复。
+  if (lines.length > 1 && lines[0] !== undefined) {
+    const title = lines[0]
+    const rest = lines.slice(1).join('\n')
+    if (title.length >= 8 && rest.includes(title)) lines.shift()
+  }
+  const flat = lines.join(' ').replace(/\s+/gu, ' ').trim()
+  return flat.length <= RECALL_ENTRY_CHARS ? flat : `${flat.slice(0, RECALL_ENTRY_CHARS - 1)}…`
+}

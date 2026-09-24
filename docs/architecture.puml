@@ -118,8 +118,8 @@ M -> D : 情景摘要 + 语义事实 + 技巧草稿
 note right of M : 只有真正付出模型调用\n才推进水位
 
 == 采用回报 ==
-T -> M ++ : technique_apply(id, outcome, evidence)
-note right of M : evidence 必须可证伪\n拒绝时不记账
+T -> M ++ : technique_apply(id, outcome, evidence, updates[])
+note right of M : evidence 必须可证伪\nupdates[] 可批量\n拒绝时不记账
 M -> D -- : 置信度与状态迁移
 
 S -> M ++ : session/disposed

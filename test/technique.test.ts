@@ -34,6 +34,7 @@ import {
   symbolIndex,
   techniqueIndexLine,
   techniqueApplies,
+  techniqueInjectionLine,
   techniqueSearchLine,
   techniqueSymbols,
   techniqueTailLine,
@@ -498,4 +499,23 @@ test('技巧召回：调用名精确命中显著加权', () => {
 test('技巧召回：无命中时返回空，由调用方决定不注入', () => {
   const docs = toTechniqueDocs([record({ name: '唯一技巧', when: '唯一时机', summary: '唯一说明', status: 'validated' })])
   assert.deepEqual(recallTechniques('完全无关的词汇 zzzz', docs, {}), [])
+})
+
+test('注入行带做法与短 id，与检索用的完整索引行分工不同（B5）', () => {
+  const target = record({
+    id: 'tq_1234abcd-9999',
+    name: 'authorize 前置',
+    when: '首次集成 OrdersClient 时',
+    summary: '先 authorize 再 create。否则返回 401。',
+    status: 'validated',
+    stack: { languages: ['java'] },
+  })
+  const line = techniqueInjectionLine(target)
+  assert.match(line, /做法: /u, '注入行必须带一句话做法 —— 模型据此判断，省掉一次 technique_get 往返')
+  assert.match(line, /先 authorize 再 create。/u)
+  assert.match(line, /何时用: /u)
+  assert.match(line, /\[validated\]/u)
+  assert.ok(line.includes(shortTechniqueId('tq_1234abcd-9999')), '用短 id 当句柄')
+  assert.ok(!line.includes('tq_1234abcd-9999'), '不印完整 uuid')
+  assert.ok(!line.includes('适用:'), '适用栈已由过滤保证，注入行不再重复')
 })

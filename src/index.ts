@@ -60,6 +60,7 @@ import {
   injectable,
   resolveTechniqueId,
   techniqueIndexLine,
+  techniqueInjectionLine,
   techniqueSearchLine,
   techniqueTailLine,
 } from './technique.js'
@@ -82,7 +83,7 @@ import {
   shouldWarn,
 } from './failures.js'
 import type { EscalationThresholds, FailureObservation } from './failures.js'
-import { FAILURE_BLOCK, RECALL_BLOCK, TECHNIQUE_BLOCK } from './injection.js'
+import { FAILURE_BLOCK, RECALL_BLOCK, TECHNIQUE_BLOCK, compactEntryText } from './injection.js'
 import type { InjectionBlock } from './injection.js'
 import { renderSkill, verifySkill } from './skill.js'
 import { createFailureTools, createMemoryTools, createTechniqueTools } from './tools.js'
@@ -341,10 +342,8 @@ export const TECHNIQUE_INJECTION_FOOTER = TECHNIQUE_BLOCK.footer
  *    `session/disposed` 在长驻会话里根本不会触发 —— 那等于又埋一个「永不生效」。
  */
 export const TECHNIQUE_ADOPTION_NOTICE: readonly string[] = [
-  'If you actually APPLIED one of these techniques, report it with the `technique_apply` tool:',
-  'its id, plus outcome "success" (use "failure" if the technique turned out to be wrong).',
-  'Do not report techniques you merely read, quoted or considered — anything you do not report',
-  'counts as NOT adopted.',
+  'Report each technique you actually APPLIED via `technique_apply` (id or short prefix, outcome,',
+  'evidence) — one call can carry several. Anything you do not report counts as NOT adopted.',
 ]
 
 /** 失败预警注入 section 名。 */
@@ -556,6 +555,8 @@ export function apply(ctx: Context, config: Config): void {
     lastMachineTurn?: number
     lastSeenTurn: Map<string, number>
     warned: Map<string, { turn: number; recordId: string }>
+    /** 本会话已经注入过的预警（按指纹），避免同一段话每轮重发。 */
+    advisoriesSent: Set<string>
     forgiven: Set<string>
     /** 本地初筛命中的纠偏候选原文，等模型在反思里定夺（见 `applyCorrections`）。 */
     correctionCandidates: string[]
@@ -770,6 +771,7 @@ export function apply(ctx: Context, config: Config): void {
     lastMachineTurn?: number
     lastSeenTurn: Map<string, number>
     warned: Map<string, { turn: number; recordId: string }>
+    advisoriesSent: Set<string>
     forgiven: Set<string>
     /** 本地初筛命中的纠偏**候选**原文；是否真是纠偏由模型定夺，见 `persist`。 */
     correctionCandidates: string[]
@@ -781,6 +783,7 @@ export function apply(ctx: Context, config: Config): void {
         callArgs: new Map(),
         lastSeenTurn: new Map(),
         warned: new Map(),
+        advisoriesSent: new Set(),
         forgiven: new Set(),
         correctionCandidates: [],
       }
@@ -1310,7 +1313,8 @@ export function apply(ctx: Context, config: Config): void {
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
       const kind = recallLabel(hit.layer, hit.meta?.kind)
-      return `${index + 1}. (${kind}) ${sanitizeForInjection(hit.text)}`
+      // 逐条整形（去掉与正文重复的标题 + 封顶）：整块预算再砍尾巴时，至少不会出现半截条目。
+      return `${index + 1}. (${kind}) ${sanitizeForInjection(compactEntryText(hit.text))}`
     })
     return renderBlock(RECALL_BLOCK, [], lines, settings.recallChars)
   }
@@ -1340,7 +1344,7 @@ export function apply(ctx: Context, config: Config): void {
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
       const record = techniqueById.get(hit.id)
-      const body = record === undefined ? hit.text : techniqueIndexLine(record)
+      const body = record === undefined ? hit.text : techniqueInjectionLine(record)
       return `${index + 1}. ${sanitizeForInjection(body)}`
     })
     // 没注册工具时别提工具名：指向一个不存在的工具只会让模型白试一轮。
@@ -1434,6 +1438,11 @@ export function apply(ctx: Context, config: Config): void {
     const candidates = [...failureById.values()].filter(record =>
       shouldWarn(record, escalation)
       && !(session?.forgiven.has(record.fingerprint.key) ?? false)
+      // B7：同一条预警在本会话里只发一次。它是给「还没犯这个错」的会话看的；
+      // 同一场景每轮重发同一段文字，模型已经读过，只是噪声与开销
+      // （最多 3 条 × 1500 字符/请求）。场景真的再次发生时，机械失败会被重新观测到，
+      // 那时走的是「你又犯了」的计数路径，而不是重发这条历史预警。
+      && !session?.advisoriesSent.has(record.fingerprint.key)
       && failureApplies(record, state.stack)
       && (record.scope === 'project' || record.partition === settings.partition))
 
@@ -1451,6 +1460,7 @@ export function apply(ctx: Context, config: Config): void {
       if (session !== undefined && !session.warned.has(record.fingerprint.key)) {
         session.warned.set(record.fingerprint.key, { turn, recordId: record.id })
       }
+      session?.advisoriesSent.add(record.fingerprint.key)
       // 只在本会话确实见过这个指纹时才给出现场文件：全局域记录不带项目路径。
       const files = session?.lastSeenTurn.has(record.fingerprint.key) === true ? recentFiles : []
       return sanitizeForInjection(failureWarningLine(record, files))
@@ -1719,6 +1729,78 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
 
+  /** 一次待落盘的采用回报（校验已过、证据已脱敏收敛）。 */
+  interface PreparedAdoption {
+    record: TechniqueRecord
+    outcome: 'success' | 'failure'
+    evidence: string
+  }
+
+  /**
+   * 采用回报的公共前置：解析 id → 校验证据 → 组装新记录（**不落盘**）。
+   *
+   * 单条与批量共用同一条路径，保证「证据必须可证伪」的口径只有一处实现。
+   * 返回字符串表示拒绝（可直接回给模型），返回对象表示可以落盘。
+   *
+   * @param id - 技巧 id 或唯一前缀。
+   * @param outcome - 采用结果。
+   * @param evidence - 可证伪的验收证据。
+   * @returns 待落盘结果，或拒绝说明。
+   */
+  const prepareAdoption = async (
+    id: string,
+    outcome: 'success' | 'failure',
+    evidence: string,
+  ): Promise<PreparedAdoption | string> => {
+    await refresh(current?.cwd)
+    const resolved = resolveTechniqueId(id, [...techniqueById.values()])
+    if (!resolved.ok) return `No technique resolved for "${id}": ${resolved.reason}.`
+    const record = resolved.record
+
+    const check = checkVerificationEvidence(evidence)
+    if (!check.ok) {
+      // 拒绝时把「怎么才算合格」和这条技巧**自己的判据**一起回给模型：
+      // 只说 "invalid" 会让它重试同样的空话，而判据正是它该照着的模板。
+      const criteria = record.verify.length === 0
+        ? ['(this technique records no explicit verification criteria — state what you checked and what you observed)']
+        : record.verify.map(item => `  - ${item}`)
+      return [
+        `Refused: no verification recorded for "${record.name}" — ${check.reason}.`,
+        'Evidence must be falsifiable: say what you checked and the concrete result you observed.',
+        'Good: "re-ran `npm test`: 240/240 pass (was 238)". Bad: "works" / "已采用".',
+        'Verify criteria recorded for this technique:',
+        ...criteria,
+      ].join('\n')
+    }
+
+    // 证据是**新增的落盘写入路径**，必须与其余四层同口径：先过安全管线（凭据脱敏 →
+    // 私有标识占位 → 区外绝对路径占位），再收敛长度。两者都在校验之后：
+    // 校验看全文，避免把写在末尾的具体锚点截掉后反被判为不合格（DEF-15/16）。
+    const stored = clampVerificationEvidence(sanitizeForStore(check.value, current, current?.cwd))
+    const updated = applyOutcome(record, {
+      outcome,
+      evidence: stored,
+      at: Date.now(),
+      ...(current?.sessionId === undefined ? {} : { sessionId: current.sessionId }),
+      ...(current?.cwd === undefined ? {} : { cwd: current.cwd }),
+    })
+    return { record: updated, outcome, evidence: stored }
+  }
+
+  /**
+   * 把一次采用回报渲染成回给模型的一行。
+   * @param prepared - 待落盘结果。
+   * @param withEvidence - 是否附上证据原文（单条回报时附，批量时省略以省字符）。
+   * @returns 一行说明。
+   */
+  const adoptionLine = (prepared: PreparedAdoption, withEvidence: boolean): string => {
+    const { record } = prepared
+    const kept = record.verifications?.length ?? 0
+    const head = `Recorded ${prepared.outcome} for "${record.name}" `
+      + `(status ${record.status}, confidence ${confidenceOf(record).toFixed(2)}).`
+    return withEvidence ? `${head}\nEvidence #${kept}: ${prepared.evidence}` : head
+  }
+
   /** 技巧工具行为实现。 */
   const techniqueDeps = (): TechniqueToolDeps => ({
     async search(query, limit, includeDrafts, verbose) {
@@ -1789,50 +1871,44 @@ export function apply(ctx: Context, config: Config): void {
       const saved = stored.records.find(record => record.name === draft.name && record.when === draft.when)
       return `Saved technique (scope ${scope})${saved === undefined ? '' : ` [id ${saved.id}, status ${saved.status}]`}: "${draft.name}"`
     },
+    /**
+     * 单条采用回报的公共实现：解析 → 校验证据 → 组装新记录。
+     *
+     * 返回记录而不是直接落盘，是为让批量路径能把多条合并成**一次**读-改-写。
+     *
+     * @param id - 技巧 id 或唯一前缀。
+     * @param outcome - 采用结果。
+     * @param evidence - 可证伪的验收证据。
+     * @returns 命中时的新记录，或一句可直接回给模型的拒绝说明。
+     */
     async apply(id, outcome, evidence) {
+      const prepared = await prepareAdoption(id, outcome, evidence)
+      if (typeof prepared === 'string') return prepared
+      const ok = await store.updateTechniques([prepared.record], prepared.record.scope === 'project' ? projectCwd() : undefined)
       await refresh(current?.cwd)
-      const resolved = resolveTechniqueId(id, [...techniqueById.values()])
-      if (!resolved.ok) return `No technique resolved for "${id}": ${resolved.reason}.`
-      const record = resolved.record
-
-      const check = checkVerificationEvidence(evidence)
-      if (!check.ok) {
-        // 拒绝时把「怎么才算合格」和这条技巧**自己的判据**一起回给模型：
-        // 只说 "invalid" 会让它重试同样的空话，而判据正是它该照着的模板。
-        const criteria = record.verify.length === 0
-          ? ['(this technique records no explicit verification criteria — state what you checked and what you observed)']
-          : record.verify.map(item => `  - ${item}`)
-        return [
-          `Refused: no verification recorded for "${record.name}" — ${check.reason}.`,
-          'Evidence must be falsifiable: say what you checked and the concrete result you observed.',
-          'Good: "re-ran `npm test`: 240/240 pass (was 238)". Bad: "works" / "已采用".',
-          'Verify criteria recorded for this technique:',
-          ...criteria,
-        ].join('\n')
+      if (ok === 0) return `Could not update technique "${id}".`
+      return adoptionLine(prepared, true)
+    },
+    async applyBatch(updates) {
+      if (updates.length === 0) return 'Nothing to record: updates[] is empty.'
+      const prepared: PreparedAdoption[] = []
+      const lines: string[] = []
+      for (const [index, update] of updates.entries()) {
+        const label = `#${index + 1} "${update.id}"`
+        const result = await prepareAdoption(update.id, update.outcome, update.evidence)
+        if (typeof result === 'string') {
+          lines.push(`${label}: ${result.split('\n')[0]}`)
+          continue
+        }
+        prepared.push(result)
+        lines.push(`${label}: ${adoptionLine(result, false)}`)
       }
-
-      // 证据是**新增的落盘写入路径**，必须与其余四层同口径：先过安全管线（凭据脱敏 →
-      // 私有标识占位 → 区外绝对路径占位），再收敛长度。两者都在校验之后：
-      // 校验看全文，避免把写在末尾的具体锚点截掉后反被判为不合格（DEF-15/16）。
-      const stored = clampVerificationEvidence(
-        sanitizeForStore(check.value, current, current?.cwd),
-      )
-
-      const updated = applyOutcome(record, {
-        outcome,
-        evidence: stored,
-        at: Date.now(),
-        ...(current?.sessionId === undefined ? {} : { sessionId: current.sessionId }),
-        ...(current?.cwd === undefined ? {} : { cwd: current.cwd }),
-      })
-      const ok = await store.updateTechnique(updated, record.scope === 'project' ? projectCwd() : undefined)
-      await refresh(current?.cwd)
-      if (!ok) return `Could not update technique "${id}".`
-      const kept = updated.verifications?.length ?? 0
-      return [
-        `Recorded ${outcome} for "${record.name}" (status ${updated.status}, confidence ${confidenceOf(updated).toFixed(2)}).`,
-        `Evidence #${kept}: ${stored}`,
-      ].join('\n')
+      if (prepared.length > 0) {
+        const written = await store.updateTechniques(prepared.map(item => item.record), current?.cwd === undefined ? undefined : projectCwd())
+        await refresh(current?.cwd)
+        lines.push(`Recorded ${written}/${updates.length} in a single write.`)
+      }
+      return lines.join('\n')
     },
     async exportSkill(id) {
       await refresh(current?.cwd)
@@ -1941,7 +2017,7 @@ export function apply(ctx: Context, config: Config): void {
         if (isInjectedUserMessage(event.data)) break
         const text = messageText(event.data)
         const turn = turnOf(state, state.turns.at(-1)?.turn ?? 0)
-        turn.user = clipTail(`${turn.user}${text}\n`, settings.captureUserChars)
+        turn.user = clipHeadTail(`${turn.user}${text}\n`, settings.captureUserChars)
         // 纠偏判定是**两段式**的：这里只做本地初筛（零成本、宁可误收），把命中的原文
         // 记成候选；「这到底是不是纠偏、正确做法是什么」交给模型在反思时定夺
         // （见 `persist` 的 `correctionsMode`）。之所以不在这里直接落一条失败记录：
@@ -1957,7 +2033,7 @@ export function apply(ctx: Context, config: Config): void {
       }
       case 'assistant/message': {
         const turn = turnOf(state, event.data.turn)
-        turn.assistant = clipTail(`${turn.assistant}${messageText(event.data.message)}\n`, settings.captureAssistantChars)
+        turn.assistant = clipHeadTail(`${turn.assistant}${messageText(event.data.message)}\n`, settings.captureAssistantChars)
         break
       }
       case 'tool/call': {
@@ -2679,8 +2755,22 @@ function clipHead(text: string, limit: number): string {
  * @param limit - 字符上限。
  * @returns 截断后的文本。
  */
-function clipTail(text: string, limit: number): string {
-  return text.length <= limit ? text : `…${text.slice(text.length - limit + 1)}`
+/**
+ * 超过上限时**保留首尾、省略中段**。
+ *
+ * 为什么不是纯 `clipTail`：助手文本开头常是打算做什么、结尾才是结论与结果，
+ * 只留一头必然丢掉另一半；用户文本同理（首轮请求的开头 + 最新的补充）。
+ * 同样的字符预算下，首尾都留的信息量更高 —— 这是**等成本**的质量改进。
+ *
+ * @param text - 原始文本。
+ * @param limit - 上限字符数。
+ * @returns 不超过 `limit` 的文本。
+ */
+function clipHeadTail(text: string, limit: number): string {
+  if (text.length <= limit) return text
+  const head = Math.max(1, Math.floor(limit * 0.6))
+  const tail = Math.max(1, limit - head - 1)
+  return `${text.slice(0, head)}…${text.slice(text.length - tail)}`
 }
 
 /**

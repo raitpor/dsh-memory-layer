@@ -606,6 +606,20 @@ export class MemoryStore {
   }
 
   /**
+   * 一次写入多条技巧更新（加锁）。
+   *
+   * 存在的理由是**批量回报**：模型一次报多条采用结果时，逐个 `updateTechnique` 会让
+   * 同一个文件被读-改-写 N 次。这里合并成一次：读一次、改 N 条、写一次、只取一次锁。
+   *
+   * @param records - 更新后的技巧记录（按 id 命中）。
+   * @param cwd - 项目工作目录（project 作用域需要）。
+   * @returns 实际写入的条数。
+   */
+  async updateTechniques(records: readonly TechniqueRecord[], cwd?: string): Promise<number> {
+    return this.exclusive(() => this.updateTechniquesInner(records, cwd))
+  }
+
+  /**
    * 删除技巧记录（加锁）。
    * @param scope - 记忆作用域。
    * @param cwd - 项目工作目录。
@@ -1092,6 +1106,38 @@ export class MemoryStore {
    * @param id - 目标记录 id，或 `*` 表示清空该作用域全部技巧。
    * @returns 被删除的记录条数。
    */
+  private async updateTechniquesInner(records: readonly TechniqueRecord[], cwd?: string): Promise<number> {
+    if (records.length === 0) return 0
+    // 按「作用域 + 分区」分组：不同组落在不同文件上，不能合并成一次重写。
+    const groups = new Map<string, TechniqueRecord[]>()
+    for (const record of records) {
+      const key = `${record.scope}\u0000${record.partition}`
+      groups.set(key, [...(groups.get(key) ?? []), record])
+    }
+    let applied = 0
+    for (const group of groups.values()) {
+      const first = group[0]
+      if (first === undefined) continue
+      const all = await this.readTechniques(first.scope, cwd, first.partition)
+      const byId = new Map(all.map(record => [record.id, record]))
+      let touched = 0
+      for (const record of group) {
+        if (!byId.has(record.id)) continue
+        byId.set(record.id, record)
+        touched += 1
+      }
+      if (touched === 0) continue
+      const next = [...byId.values()]
+      assignConflicts(next)
+      await this.writeAtomic(
+        join(this.scopeDir(first.scope, cwd, first.partition), TECHNIQUE_FILE),
+        next.map(record => JSON.stringify(record)).join('\n') + '\n',
+      )
+      applied += touched
+    }
+    return applied
+  }
+
   private async forgetTechniqueInner(
     scope: MemoryScope,
     cwd: string | undefined,

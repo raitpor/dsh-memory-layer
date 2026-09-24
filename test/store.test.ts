@@ -400,3 +400,22 @@ test('锁文件内容损坏时，仍能报出「有别的实例在写」', async
     )
   })
 })
+
+test('updateTechniques：一批更新合并成一次写入', async () => {
+  await withStore(async (store) => {
+    const created = await store.upsertTechniques(
+      Array.from({ length: 3 }, (_, i) => draft(i)),
+      { scope: 'global', sessionId: 's1', provenance: 'model' },
+    )
+    const before = created.records.map(record => ({ ...record, name: `${record.name} (updated)` }))
+    const written = await store.updateTechniques(before)
+    assert.equal(written, 3, '三条都应写入')
+    const after = await store.readTechniques('global')
+    assert.equal(after.length, 3, '批量更新不得新增或丢记录')
+    assert.ok(after.every(record => record.name.endsWith('(updated)')))
+    // 不存在的 id 只是被跳过，不影响同一批里的其他记录。
+    const ghost = { ...before[0]!, id: 'tq_ghost' }
+    assert.equal(await store.updateTechniques([ghost, { ...before[1]!, name: 'again' }]), 1, '未知 id 跳过')
+    assert.equal((await store.readTechniques('global')).find(r => r.id === before[1]!.id)?.name, 'again')
+  })
+})

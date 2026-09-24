@@ -1292,7 +1292,15 @@ export function apply(ctx: Context, config: Config): void {
     // 更糟的是让未经验证的知识获得了注入权威。专用技巧段走 `recallTechniques()` 有硬过滤，
     // 这里补上同一口径。工具侧（`memory_search` / `technique_search(includeDrafts)`）不受影响：
     // 那是模型显式发起的检索，看得到草稿是特性。
+    //
+    // 另一条过滤：**本会话自己的情景摘要不注入**。模型手里已经有这段对话，
+    // 把自己的摘要再喂一遍既是纯重复（每轮都花 token、还占掉一个召回名额），
+    // 又会被标成「(past session)」—— 那是在谎报来源，模型会当第三方知识看。
+    // 记录照常落盘（后续会话要用），只是不回灌给写下它的那个会话；
+    // 显式检索（`memory_search`）不受影响，模型主动查仍查得到。
+    const selfSession = current?.sessionId
     const docs = corpusFor(current?.cwd).filter(doc => {
+      if (doc.layer === 'episodic' && selfSession !== undefined && doc.meta?.sessionId === selfSession) return false
       if (doc.layer !== 'technique') return true
       const record = techniqueById.get(doc.id)
       return record !== undefined && injectable(record)

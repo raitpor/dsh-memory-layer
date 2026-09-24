@@ -115,3 +115,12 @@ test('新鲜度加权让更近的记忆在同等命中下得分更高', () => {
   const hits = recall('pnpm', docs, { limit: 2, now })
   assert.equal(hits[0]?.id, 'fresh')
 })
+
+test('情景文档带出 sessionId，供注入侧挡掉本会话自己的摘要', () => {
+  const docs = toDocs([episodic({ id: 'ep_a', sessionId: 's-a' }), episodic({ id: 'ep_b', sessionId: 's-b' })], [])
+  assert.equal(docs[0]?.meta?.sessionId, 's-a')
+  assert.equal(docs[1]?.meta?.sessionId, 's-b')
+  // 语义层没有会话归属，不该凭空造一个。
+  const sem = toDocs([], [{ id: 'sm_1', key: 'k', kind: 'fact', text: 't', hits: 1, sources: ['s1'], tags: [], ts: 1, updatedAt: 1, scope: 'global', partition: 'default' }])
+  assert.equal(sem[0]?.meta?.sessionId, undefined)
+})

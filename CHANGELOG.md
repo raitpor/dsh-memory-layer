@@ -34,6 +34,13 @@
   单行 JSON 整表重写）。
 - **CI**：`.github/workflows/ci.yml` 跑 `typecheck` + `npm test`。
 
+### 变更
+
+- **本会话自己的情景摘要不再注入回本会话**：此前每轮都会把「本会话到目前为止」的摘要
+  当成 `(past session)` 重新喂给模型 —— 既是纯重复（实测 4 个查询 6 个注入名额里占 2 个，
+  其中两次是唯一命中），又在谎报来源。记录仍照常落盘供后续会话使用，`memory_search`
+  仍能搜到。为支持该判定，`RecallMeta` 增加 `sessionId`，情景文档会带出它。
+
 ### 交付
 
 - **离线安装包**：`npm run pack:offline` 产出 `dsh-memory-layer-<version>-offline.tar.gz`，

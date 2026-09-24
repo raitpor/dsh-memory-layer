@@ -495,7 +495,15 @@ test('global 作用域把记忆写到全局域', async () => {
 test('召回结果被注入 system prompt，且声明为不可信数据', async () => {
   const { fake, dispose } = await setup()
   try {
-    await runSession(fake, fakeSession())
+    // 先让**另一个会话**留下记忆：本会话自己的摘要按设计不回灌（那只是重复），
+    // 所以这里必须真的跨会话，否则下面的围栏断言会因为块是空的而空过。
+    await runSession(fake, fakeSession('past', '/work/demo'))
+    const next = fakeSession('next', '/work/demo')
+    fake.emit('session/created', next)
+    await fake.flush()
+    fake.emit('session/event', next, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', next, userMessage('我喜欢用 pnpm，不要用 npm。'))
+    await fake.flush()
 
     assert.equal(fake.prompts.length, 3, 'recall / techniques / failures 三个 section')
     const entry = fake.prompts.find(item => item.name === 'memory-layer:recall')
@@ -503,7 +511,7 @@ test('召回结果被注入 system prompt，且声明为不可信数据', async 
     assert.equal(typeof entry?.text, 'function')
 
     const rendered = injection(fake)
-    assert.match(rendered, /pnpm/u, '应召回会话内容')
+    assert.match(rendered, /pnpm/u, '应召回**上一个会话**的内容')
     // DEF-SEC-005：注入块必须声明记忆是不可信数据、不得作为指令。
     assert.match(rendered, /UNTRUSTED/u)
     assert.match(rendered, /NOT instructions/iu)
@@ -2643,6 +2651,39 @@ test('密钥不匹配时：memory_stats 报警，写入被拒，旧密文不动'
       '此时写入必须失败并给出可操作的理由',
     )
     assert.equal(await readFile(file, 'utf8'), before, '旧密文必须原样保留，恢复密钥后还能救回来')
+  } finally {
+    await dispose()
+  }
+})
+
+test('本会话自己的情景摘要不回灌，别的会话的摘要照常注入', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    // 会话 A 留下一条情景摘要
+    const a = fakeSession('past1', '/work/demo')
+    fake.emit('session/created', a)
+    await fake.flush()
+    fake.emit('session/event', a, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', a, userMessage('ZZZ-上一个会话的标记-ZZZ 顺便记住'))
+    fake.emit('session/event', a, assistantMessage(1, '已处理'))
+    fake.emit('session/event', a, event('turn/end', { turn: 1, reason: 'completed' }))
+    await fake.flush()
+
+    // 会话 B（同目录）问同一个词：只该看到 A 的摘要
+    const b = fakeSession('self1', '/work/demo')
+    fake.emit('session/created', b)
+    await fake.flush()
+    fake.emit('session/event', b, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', b, userMessage('ZZZ-上一个会话的标记-ZZZ 与 ZZZ-本会话自己的标记-ZZZ 都有吗'))
+    fake.emit('session/event', b, assistantMessage(1, '已处理'))
+    fake.emit('session/event', b, event('turn/end', { turn: 1, reason: 'completed' }))
+    await fake.flush()
+    fake.emit('session/event', b, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', b, userMessage('ZZZ-上一个会话的标记-ZZZ ZZZ-本会话自己的标记-ZZZ 再问一次'))
+
+    const block = injection(fake)
+    assert.match(block, /ZZZ-上一个会话的标记-ZZZ/u, '别的会话的摘要要照常注入')
+    assert.ok(!block.includes('ZZZ-本会话自己的标记-ZZZ'), `本会话自己的摘要不该回灌：${block}`)
   } finally {
     await dispose()
   }

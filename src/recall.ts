@@ -121,6 +121,9 @@ export function toDocs(
       id: record.id,
       ts: record.ts,
       text: episodicText(record),
+      // 带出 sessionId 供**自动注入**判定「这是不是本会话自己的摘要」；
+      // 显式检索（`memory_search`）不看这个字段，仍能搜到本会话的记录。
+      meta: { sessionId: record.sessionId },
     })),
     // `kind` 必须带出去：标签要按它区分偏好/决定/约束，否则一律显示成「长期事实」，
     // 模型会把用户偏好当成客观事实（见 `recallLabel`）。

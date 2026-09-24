@@ -404,6 +404,13 @@ export interface RecallMeta {
   stack?: StackProfile
   /** 技巧专用：业务领域。 */
   domain?: string
+  /**
+   * 情景专用：这条摘要来自哪个会话。
+   *
+   * 自动注入要靠它把**本会话自己的摘要**挡掉 —— 模型手里已经有这段对话，
+   * 再喂一遍自己的摘要既是重复花钱，又会被标成「(past session)」而误导。
+   */
+  sessionId?: string
   /** 技巧专用：规范化调用名。 */
   symbols?: readonly string[]
   /** 技巧专用：成功次数。 */

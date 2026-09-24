@@ -244,6 +244,9 @@ export function semanticText(record: SemanticRecord): string {
 export function techniqueText(record: TechniqueRecord): string {
   return [
     record.name,
+    // 结构化键必须进检索语料：`subject` 是代码单元主键，`appliesTo` 是版本/模块约束。
+    ...(record.subject === undefined ? [] : [record.subject]),
+    ...(record.appliesTo === undefined ? [] : [record.appliesTo]),
     // 只纳入**显式** gist：派生 gist 就是 summary 的首句，重复一遍会白白抬高该项的词频。
     ...(record.gist === undefined ? [] : [record.gist]),
     record.when,
@@ -403,6 +406,11 @@ function mergeTechnique(
   existing.evidence = unionEvidence(existing.evidence, [...draft.evidence, { kind: 'session', sessionId }])
   existing.stack = mergeStack(existing.stack, draft.stack)
   if (existing.example === undefined && draft.example !== undefined) existing.example = draft.example
+  // 逻辑卡的关键字段只在缺失时补齐：已有结论不被后来的观察覆盖。
+  if (existing.subject === undefined && draft.subject !== undefined) existing.subject = draft.subject
+  if (existing.location === undefined && draft.location !== undefined) existing.location = draft.location
+  if (existing.reuse === undefined && draft.reuse !== undefined) existing.reuse = draft.reuse
+  if (existing.appliesTo === undefined && draft.appliesTo !== undefined) existing.appliesTo = draft.appliesTo
 }
 
 /** 一次失败观测的输入形状（`upsertFailures` 的入参元素）。 */
@@ -1044,6 +1052,10 @@ export class MemoryStore {
         when,
         summary: draft.summary.trim(),
         ...(draft.steps === undefined ? {} : { steps: [...draft.steps] }),
+        ...(draft.subject === undefined ? {} : { subject: draft.subject }),
+        ...(draft.location === undefined ? {} : { location: draft.location }),
+        ...(draft.reuse === undefined ? {} : { reuse: draft.reuse }),
+        ...(draft.appliesTo === undefined ? {} : { appliesTo: draft.appliesTo }),
         ...(draft.invariants === undefined ? {} : { invariants: [...draft.invariants] }),
         ...(draft.api === undefined ? {} : { api: [...draft.api] }),
         ...(draft.example === undefined ? {} : { example: draft.example }),

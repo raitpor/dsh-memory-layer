@@ -2858,3 +2858,71 @@ test('B5：注入行带上做法（模型据此判断，省掉一次 technique_g
     await dispose()
   }
 })
+
+test('代码逻辑卡：结构化字段可存取、可按 subject 精确命中、且过安全管线', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const secret = 'AKIAIOSFODNN7EXAMPLE'
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      kind: 'code-logic',
+      name: '结算折扣先算等级折扣再叠加活动折扣',
+      when: '要给结算新增一种优惠玩法时',
+      summary: 'DiscountCalculator 先按会员等级取折扣率，再扣减活动折扣；两步顺序不可交换。',
+      subject: 'DiscountCalculator',
+      location: 'service/order-policy#resolveDiscount',
+      reuse: '新增玩法时在活动折扣那一步插入，不要动等级折扣；密钥示例 ' + secret,
+      appliesTo: 'module=settlement',
+      steps: ['读会员等级', '取等级折扣率', '扣减活动折扣', '写入结算明细'],
+      invariants: ['等级折扣必须先于活动折扣'],
+      apiSymbols: ['DiscountCalculator.resolve'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    assert.ok(id !== '', saved)
+
+    // 结构化锚点要能读回来：模型据此回查代码、判断能不能复用。
+    const detail = String(await toolOf(fake, 'technique_get').execute({ id } as never, undefined as never))
+    for (const expected of ['Subject: DiscountCalculator', 'Location: service/order-policy#resolveDiscount', 'Applies to: module=settlement', 'Reuse: ']) {
+      assert.match(detail, new RegExp(expected, 'u'), `缺少 ${expected}：${detail.slice(0, 200)}`)
+    }
+    assert.match(detail, /等级折扣必须先于活动折扣/u, '不变量要保留')
+
+    // subject 是结构化主键：按它检索必须命中。
+    const bySubject = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'DiscountCalculator 的折扣顺序', includeDrafts: true } as never, undefined as never,
+    ))
+    assert.match(bySubject, /DiscountCalculator/u, `按 subject 应命中：${bySubject}`)
+
+    // 逻辑卡的正文同样过安全管线（Reuse 里的凭据、Location 里的路径都不能原样落盘）。
+    const text = JSON.stringify(await new MemoryStore(root).readTechniques('global'))
+    assert.ok(!text.includes(secret), 'reuse 里的凭据不得明文落盘')
+    assert.match(text, /\[REDACTED:/u, '凭据应替换为占位符')
+  } finally {
+    await dispose()
+  }
+})
+
+test('代码逻辑卡的 subject 让「按代码单元提问」精确命中', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    for (const [subject, name] of [['OrderStateMachine', '订单状态机只允许 created→paid→shipped→closed'], ['RefundClient', '退款必须带幂等键']]) {
+      const saved = String(await toolOf(fake, 'technique_save').execute({
+        kind: 'code-logic', name, when: '改这块代码时', summary: '这块代码的约定。', subject,
+      } as never, undefined as never))
+      await toolOf(fake, 'technique_apply').execute(
+        { id: /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? '', outcome: 'success', evidence: '`npm test` 240/240 通过' } as never,
+        undefined as never,
+      )
+    }
+    // 只报代码单元名、不说意图 —— 这正是「按符号提问」的形态。
+    const hits = String(await toolOf(fake, 'technique_search').execute({ query: 'OrderStateMachine' } as never, undefined as never))
+    assert.match(hits, /订单状态机/u, `按符号应命中对应逻辑卡：${hits}`)
+    const first = hits.split('\n').find(line => /^\d+\. /u.test(line)) ?? ''
+    assert.match(first, /OrderStateMachine|订单状态机/u, `符号命中应排最前：${hits}`)
+  } finally {
+    await dispose()
+  }
+})

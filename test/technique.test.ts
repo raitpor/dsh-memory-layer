@@ -519,3 +519,11 @@ test('注入行带做法与短 id，与检索用的完整索引行分工不同�
   assert.ok(!line.includes('tq_1234abcd-9999'), '不印完整 uuid')
   assert.ok(!line.includes('适用:'), '适用栈已由过滤保证，注入行不再重复')
 })
+
+test('subject 进符号索引：代码单元名与调用名一样能当精确键', () => {
+  const card = record({ name: '结算折扣顺序', when: '加优惠玩法时', subject: 'DiscountCalculator', api: [{ symbol: 'DiscountCalculator.resolve' }] })
+  const symbols = techniqueSymbols(card)
+  assert.equal(symbols[0], 'DiscountCalculator', 'subject 排在最前')
+  assert.ok(symbols.includes('DiscountCalculator.resolve'), '调用面仍在')
+  assert.deepEqual(symbolIndex([card]).get('DiscountCalculator'), [card.id], '按 subject 能查到 id')
+})

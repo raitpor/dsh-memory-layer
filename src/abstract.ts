@@ -259,6 +259,12 @@ export function abstractTechniqueDraft(
     when: run(draft.when),
     summary: run(draft.summary),
     ...(draft.steps === undefined ? {} : { steps: draft.steps.map(run) }),
+    // 逻辑卡的四个新字段都是自由文本，必须和 name/summary 走同一条管线：
+    // `location` 尤其危险（它会带路径），漏了就等于给私有路径开旁路。
+    ...(draft.subject === undefined ? {} : { subject: run(draft.subject) }),
+    ...(draft.location === undefined ? {} : { location: run(draft.location) }),
+    ...(draft.reuse === undefined ? {} : { reuse: run(draft.reuse) }),
+    ...(draft.appliesTo === undefined ? {} : { appliesTo: run(draft.appliesTo) }),
     ...(draft.invariants === undefined ? {} : { invariants: draft.invariants.map(run) }),
     ...(draft.api === undefined
       ? {}

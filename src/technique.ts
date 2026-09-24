@@ -237,6 +237,9 @@ export function applyOutcome(record: TechniqueRecord, verification: TechniqueVer
  */
 export function techniqueSymbols(record: TechniqueRecord): string[] {
   const out: string[] = []
+  // `subject` 是代码单元主键：它和调用名一样能当精确键用，因此一并进符号索引。
+  const subject = record.subject?.trim()
+  if (subject !== undefined && subject.length > 0) out.push(subject)
   for (const surface of record.api ?? []) {
     const symbol = surface.symbol.trim()
     if (symbol.length > 0 && !out.includes(symbol)) out.push(symbol)

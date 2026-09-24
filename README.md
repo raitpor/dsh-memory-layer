@@ -385,7 +385,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `technique_get` | 按 id（完整 id 或唯一前缀，如 `tq_f6233ebe`）展开完整正文：要点、步骤、调用面、示例、坑、验证判据与历次验收证据；`ids` 可一次展开多条 |
 | `technique_learn` | 从一个代码仓库挖掘技巧（显式、受限；产出为草稿） |
 | `technique_export` | 把一条**已验证**技巧物化成 `SKILL.md`（confidential 拒绝导出） |
-| `technique_save` | 手工写入一条技巧草稿（与自动提炼走同一条脱敏 + 去标识化管线） |
+| `technique_save` | 手工写入一条技巧草稿（与自动提炼走同一条脱敏 + 去标识化管线）；`kind: 'code-logic'` 写**代码逻辑卡**：`subject`（代码单元主键，按它精确命中）、`location`（抽象锚点）、`steps`（逻辑顺序）、`invariants`（不变量）、`reuse`（新增业务时怎么接上去）、`appliesTo`（版本/模块范围） |
 | `technique_apply` | 回报采用结果**与可证伪的验收证据**，驱动置信度与状态迁移（**采用回报的唯一通道**）；`updates[]` 可一次回报多条，合并成一次写入 |
 | `technique_forget` | 按 id 删除；`*` 清空需显式 `confirm: true` |
 | `failure_list` | 列出反复犯的错（按重复次数排序）；`includeResolved` 可看已解决记录及其触发方式、解决后复发次数 |
@@ -475,6 +475,11 @@ dsh plugin --profile <name> install --offline                       #    重装�
 - 中文按相邻二字切 bigram、拉丁词与数字按词切分，中英混排都能命中；
 - 语义层权重高于情景层，并按时间做新鲜度加权；
 - 查询为空时退化为「最近记忆」；无命中时返回空，由调用方决定不注入任何内容。
+- **facet 召回**：任务型描述（"新增一种折扣类型，走完结算流程，最后补流程图和测试"）一句话含多个
+  主题，单次 BM25 只能命中其中一个 —— 实测那道题期望 11 条、最佳排名 7、**漏 6 条**。
+  `recallFacets()` 把描述切成若干子查询（标点与并列连词 + 语料词表 + 当前轮碰过的文件/调用名），
+  再**轮转交错**合并，保证每个 facet 先占一个位置。同一批查询实测：MRR `0.857 → 1.000`、
+  recall@5 `83% → 100%`，而单意图查询的排序完全不变。
 - **本会话自己的情景摘要不回灌**：模型手里已经有这段对话，把自己的摘要再喂一遍是纯重复
   （每轮花 token、还占掉一个召回名额），而且会顶着 `(past session)` 的标签谎报来源。
   记录照常落盘供后续会话使用，只是不注入给写下它的那个会话；`memory_search` 是模型显式
@@ -488,7 +493,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 |---|---|
 | 情景摘要 | `past session` |
 | 语义事实 / 偏好 / 决定 / 约束 | `long-term fact` / `long-term preference` / `long-term decision` / `long-term constraint` |
-| 技巧 | `technique` |
+| 技巧（含代码逻辑卡） | `technique` |
 | 反复失败 | `recurring failure` |
 
 语义层必须按 `kind` 细分：把一项**偏好**标成 `long-term fact`，模型会把它读成客观事实，
@@ -497,6 +502,23 @@ dsh plugin --profile <name> install --offline                       #    重装�
 标签由 `recallLabel()` 的**固定词表**生成，记录里的 `kind` 一律按白名单收敛（非法值回落
 `fact`）：记忆库是明文文件、读入时只做类型断言，标签又和正文同处注入块的一行 —— 若把
 `kind` 直接拼进去，一个带换行的取值就能伪造 `--- END UNTRUSTED MEMORY ---` 边界。
+
+## 代码逻辑卡（`kind: 'code-logic'`）
+
+技巧层不只有"怎么调库"，还有**这段代码在做什么**。逻辑卡的目标是：读需求时理解既有逻辑，
+加新业务时知道该接在哪里、哪一步不能绕开。
+
+| 字段 | 作用 |
+|---|---|
+| `subject` | **代码单元主键**（类/模块/函数）。检索按它精确命中，比措辞可靠；同时进符号索引 |
+| `location` | 抽象化代码锚点，如 `service/order-policy#resolve`（不存绝对路径，过安全管线） |
+| `steps` | 逻辑顺序：输入 → 判断 → 状态变化 → 输出 |
+| `invariants` | 不变量与顺序约束（例如"等级折扣必须先于活动折扣"） |
+| `reuse` | **新增业务时怎么复用**：在哪扩展、什么不能绕开、复用时注意什么 |
+| `appliesTo` | 适用范围：版本/模块，如 `module=settlement`、`mc=1.21.1` |
+
+写入方式：`technique_save` 显式写，或由代码挖掘从仓库里产出草稿。逻辑卡**同样是草稿起步**，
+只有被采用并附可证伪证据后才 `validated`、才有资格自动注入 —— 与其它技巧一条规则。
 
 ## 上下文成本
 
@@ -520,7 +542,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（273 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（284 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 

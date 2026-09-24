@@ -157,6 +157,7 @@ export function toTechniqueDocs(records: readonly TechniqueRecord[]): RecallDoc[
       successes: record.successes,
       failures: record.failures,
       evidenceCount: record.evidence.length,
+      tags: record.tags,
       ...(record.domain === undefined ? {} : { domain: record.domain }),
     },
   }))
@@ -357,4 +358,118 @@ function recencyFactor(ageMs: number): number {
   const day = 24 * 60 * 60 * 1000
   const age = Math.max(0, ageMs) / day
   return 1 / (1 + age / 7)
+}
+
+/** facet 子查询的数量上限。 */
+export const MAX_FACETS = 8
+
+/**
+ * 把一段任务描述切成若干 **facet 子查询**（零模型、纯词法）。
+ *
+ * 存在的理由来自实测：单意图查询用 BM25 已经能排到第 1，但**任务型**描述（"新增一种折扣类型，
+ * 走完整结算流程，最后补流程图和测试"）一句话里含多个主题，一次查询只能命中其中一个 ——
+ * 实测那道多 facet 查询漏掉 6/11 条。模型当时的应对是**自己换四种措辞检索四次**，代价是
+ * 16.8k token。切 facet 就是把这一步自动化。
+ *
+ * 两类来源：
+ * 1. **子句切分**：按标点与并列连词切开（保守，只切明确的分隔符）；
+ * 2. **语料词表**：把语料里出现过的主题词（标签 / 领域 / 调用面的末段）里，**在查询中出现的**
+ *    那些词各自作为一次查询 —— 词表是封闭集合，因此不会凭空造出无关子查询。
+ *
+ * @param query - 任务描述或普通查询。
+ * @param docs - 当前语料（用于取词表）。
+ * @param extra - 额外的结构化查询词（当前轮触达的文件、调用名、工具名）。
+ * @returns 去重后的子查询（含原查询本身，且原查询排第一）。
+ */
+export function facetQueries(
+  query: string,
+  docs: readonly RecallDoc[],
+  extra: readonly string[] = [],
+): string[] {
+  // 原查询永远是第一个 —— **哪怕是空串**：空查询在 `recallTechniques` 里会退化为
+  // 「按时间取最近记忆」，facet 化不能把这个既有语义弄丢（去掉它会让空查询变成"什么都不注入"）。
+  const out: string[] = [query]
+  const push = (value: string): void => {
+    const text = value.replace(/\s+/gu, ' ').trim()
+    if (text.length >= 2 && !out.includes(text)) out.push(text)
+  }
+
+  // 1) 子句切分：标点 + 并列连词。连词只在「两侧都是 ≥2 个汉字」时才切，
+  //    避免把「和平」「以及时」这类词内部切开；即便如此仍可能误切，那也只是多一个子查询。
+  const separated = query.replace(
+    /(?<=[\u4e00-\u9fa5]{2})(?:并且|以及|同时|然后|最后|和|与|及|或)(?=[\u4e00-\u9fa5]{2})/gu,
+    '\u0000',
+  )
+  for (const clause of separated.split(/[\u0000，,；;。\n]/u)) push(clause)
+
+  // 2) 语料词表：标签、领域、调用面末段 —— 只取在查询里真实出现的。
+  const vocabulary = new Set<string>()
+  for (const doc of docs) {
+    const meta = doc.meta
+    if (meta === undefined) continue
+    if (meta.domain !== undefined) vocabulary.add(meta.domain)
+    for (const tag of meta.tags ?? []) if (tag.length >= 2) vocabulary.add(tag)
+    for (const symbol of meta.symbols ?? []) {
+      const tail = symbol.split(/[.#]/u).at(-1)
+      if (tail !== undefined && tail.length >= 3) vocabulary.add(tail)
+    }
+  }
+  const lower = query.toLowerCase()
+  for (const term of vocabulary) {
+    if (term.length >= 2 && lower.includes(term.toLowerCase())) push(term)
+  }
+
+  // 3) 结构化词：文件路径末段与调用名本身就是极强的键。
+  for (const value of extra) {
+    for (const token of value.split(/[\\/]+/u)) {
+      if (token.length >= 4) push(token)
+    }
+  }
+  // 上限：子查询是线性成本（每个都要打一次分），必须封顶。
+  return out.slice(0, MAX_FACETS)
+}
+
+/**
+ * 多 facet 召回：每个子查询各算一次，**轮转交错**合并去重。
+ *
+ * 合并算法是这里唯一要紧的取舍：
+ * - 按分数合并不可行 —— BM25 原始分跨查询不可比（长查询分天然高），会系统性偏向最长子查询；
+ * - 按最好名次合并也不够 —— 实测会把"某个 facet 的第 2 名"排到"另一个 facet 的第 1 名"之后，
+ *   于是前 5 条被少数 facet 占满，剩下几个 facet **整块消失**（这正是要修的病）；
+ * - 轮转交错（第 1 轮取每个 facet 的第 1 名，第 2 轮取第 2 名……）保证**每个 facet 先占一个位置**，
+ *   再按名次加深。它优化的是「覆盖几个主题」，而那才是任务型查询的真正需求。
+ *
+ * 入口只收**原始查询**，切分在这里做：调用方（工具与注入路径）不该知道 facet 这回事，
+ * 否则「一句话覆盖多个主题」就变成了调用方的责任。
+ *
+ * @param query - 原始任务描述或查询。
+ * @param docs - 语料。
+ * @param options - 与 {@link recallTechniques} 相同的过滤/加权选项，外加结构化补充词 `extra`。
+ * @returns 合并后的召回结果。
+ */
+export function recallFacets(
+  query: string,
+  docs: readonly RecallDoc[],
+  options: TechniqueRecallOptions & { extra?: readonly string[] } = {},
+): RecalledMemory[] {
+  const limit = options.limit ?? 5
+  if (limit <= 0) return []
+  const queries = facetQueries(query, docs, options.extra ?? [])
+  if (queries.length === 0) return []
+  // 每个子查询多取一些：交错时要按轮次取到较深的位次。
+  const perQuery = queries.map(query => recallTechniques(query, docs, { ...options, limit: Math.max(limit, 10) }))
+
+  const out: RecalledMemory[] = []
+  const seen = new Set<string>()
+  const depth = Math.max(0, ...perQuery.map(hits => hits.length))
+  for (let round = 0; round < depth && out.length < limit; round += 1) {
+    for (const hits of perQuery) {
+      const hit = hits[round]
+      if (hit === undefined || seen.has(hit.id)) continue
+      seen.add(hit.id)
+      out.push(hit)
+      if (out.length >= limit) break
+    }
+  }
+  return out
 }

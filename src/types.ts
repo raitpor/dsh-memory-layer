@@ -204,7 +204,17 @@ export interface StackProfile {
 }
 
 /** 技巧的知识形态。 */
-export type TechniqueKind = 'api-usage' | 'business-rule' | 'procedure' | 'pitfall' | 'env-recipe'
+export type TechniqueKind =
+  | 'api-usage'
+  | 'business-rule'
+  | 'procedure'
+  | 'pitfall'
+  | 'env-recipe'
+  /**
+   * 代码逻辑卡：讲清**一段代码在做什么、按什么顺序、什么条件下走哪条路**，
+   * 目的是让模型在读需求 / 加新业务时既理解既有逻辑，也能复用其中一部分。
+   */
+  | 'code-logic'
 
 /** 信任状态：`draft` 不参与自动注入。 */
 export type TechniqueStatus = 'draft' | 'validated' | 'canonical' | 'deprecated'
@@ -287,8 +297,24 @@ export interface TechniqueDraft {
   when: string
   /** 主体：2–4 句总结性说明。 */
   summary: string
-  /** 可选的有序步骤（散文式，非代码）。 */
+  /** 可选的有序步骤（散文式，非代码）。`code-logic` 卡里它就是**逻辑顺序**。 */
   steps?: string[]
+  /**
+   * 这条知识讲的是**哪个代码单元**（类 / 模块 / 函数 / 表），如 `OrderService`。
+   *
+   * 它是这一层的**结构化主键**：检索时按它精确命中，比措辞可靠；`code-logic` 卡必填。
+   */
+  subject?: string
+  /** 代码位置的抽象化锚点，如 `service/order-policy#resolve`；供人回查，不存绝对路径。 */
+  location?: string
+  /**
+   * 新增业务时**怎么复用它**：在哪扩展、哪一步不能绕开、复用时要注意什么。
+   *
+   * 与 `steps` 的分工：`steps` 说「它现在怎么跑」，`reuse` 说「你要加东西时怎么接上去」。
+   */
+  reuse?: string
+  /** 适用范围：版本 / 模块 / 分支等约束，如 `mc=1.21.1`、`module=settlement`。 */
+  appliesTo?: string
   /** 业务规则类专用：不变量与顺序约束。 */
   invariants?: string[]
   /** API 用法类专用：规范化调用面。 */
@@ -341,6 +367,14 @@ export interface TechniqueRecord {
   summary: string
   /** 可选步骤。 */
   steps?: string[]
+  /** 代码单元主键（见 `TechniqueDraft.subject`）。 */
+  subject?: string
+  /** 抽象化后的代码位置锚点。 */
+  location?: string
+  /** 新增业务时的接入方式。 */
+  reuse?: string
+  /** 适用范围（版本 / 模块）。 */
+  appliesTo?: string
   /** 不变量。 */
   invariants?: string[]
   /** 调用面。 */
@@ -404,6 +438,8 @@ export interface RecallMeta {
   stack?: StackProfile
   /** 技巧专用：业务领域。 */
   domain?: string
+  /** 技巧专用：检索标签（facet 切分要用它当封闭词表）。 */
+  tags?: readonly string[]
   /**
    * 情景专用：这条摘要来自哪个会话。
    *

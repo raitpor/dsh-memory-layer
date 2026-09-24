@@ -175,6 +175,16 @@ export interface TechniqueSaveInput {
   summary: string
   /** 有序步骤。 */
   steps?: string[]
+  /** 不变量与顺序约束（业务规则 / 逻辑卡常用）。 */
+  invariants?: string[]
+  /** 代码单元主键。 */
+  subject?: string
+  /** 抽象化代码位置。 */
+  location?: string
+  /** 新增业务时的接入方式。 */
+  reuse?: string
+  /** 适用范围。 */
+  appliesTo?: string
   /** 规范化调用名（`api-usage` 用）。 */
   apiSymbols?: string[]
   /** 极小示例正文。 */
@@ -333,8 +343,13 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
         gist: { type: 'string', description: 'One-line actionable core (<=90 chars) shown in search results; derived from summary when omitted.' },
         when: { type: 'string', required: true, description: 'Trigger: the symptom, intent or task type that should recall it.' },
         summary: { type: 'string', required: true, description: 'The method itself, in 2-4 sentences.' },
-        kind: { type: 'string', description: "'api-usage', 'business-rule', 'procedure', 'pitfall' or 'env-recipe' (default 'procedure')." },
-        steps: { type: 'array', items: { type: 'string' }, description: 'Optional ordered steps, as prose.' },
+        kind: { type: 'string', description: "'api-usage', 'business-rule', 'procedure', 'pitfall', 'env-recipe' or 'code-logic' (default 'procedure')." },
+        steps: { type: 'array', items: { type: 'string' }, description: 'Optional ordered steps, as prose. For kind=code-logic this is the logic order.' },
+        invariants: { type: 'array', items: { type: 'string' }, description: 'Invariants and ordering constraints that must hold (essential for business-rule and code-logic).' },
+        subject: { type: 'string', description: 'Code unit this knowledge is about (class/module/function). Exact-match retrieval key; required for kind=code-logic.' },
+        location: { type: 'string', description: 'Abstracted code anchor such as service/order-policy#resolve. Never an absolute path.' },
+        reuse: { type: 'string', description: 'How to reuse it when adding new business: where to extend, what must not be bypassed.' },
+        appliesTo: { type: 'string', description: 'Scope such as version or module, e.g. "module=settlement" or "mc=1.21.1".' },
         apiSymbols: { type: 'array', items: { type: 'string' }, description: 'Canonical call names, e.g. OrdersClient.create.' },
         example: { type: 'string', description: 'At most a few illustrative lines. Placeholders instead of project-specific names.' },
         exampleLanguage: { type: 'string', description: 'Language of the example, e.g. java.' },
@@ -355,6 +370,11 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
           when: args.when,
           summary: args.summary,
           ...(args.steps === undefined ? {} : { steps: args.steps }),
+          ...(args.invariants === undefined ? {} : { invariants: args.invariants }),
+          ...(args.subject === undefined ? {} : { subject: args.subject }),
+          ...(args.location === undefined ? {} : { location: args.location }),
+          ...(args.reuse === undefined ? {} : { reuse: args.reuse }),
+          ...(args.appliesTo === undefined ? {} : { appliesTo: args.appliesTo }),
           ...(args.apiSymbols === undefined ? {} : { apiSymbols: args.apiSymbols }),
           ...(args.example === undefined ? {} : { example: args.example }),
           ...(args.exampleLanguage === undefined ? {} : { exampleLanguage: args.exampleLanguage }),
@@ -494,7 +514,7 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
 /** 解析技巧形态，未知取值按 `procedure` 处理。 */
 function parseTechniqueKind(value: string | undefined): TechniqueKind {
   return value === 'api-usage' || value === 'business-rule' || value === 'procedure'
-    || value === 'pitfall' || value === 'env-recipe'
+    || value === 'pitfall' || value === 'env-recipe' || value === 'code-logic'
     ? value
     : 'procedure'
 }

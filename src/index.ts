@@ -36,7 +36,7 @@ import type { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import { KEY_ENV, KEY_FILE_NAME, createCodec, resolveKey } from './crypto.js'
 import type { StoreCodec } from './crypto.js'
 import { MemoryStore, MAX_SUMMARY_CHARS, MINE_CACHE_FILE, emptyMetrics, techniqueText } from './store.js'
-import { recall, recallTechniques, toDocs, toTechniqueDocs, tokenize } from './recall.js'
+import { facetQueries, recall, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
 import type { RecallDoc } from './recall.js'
 import { distill, isInjectedContext } from './distill.js'
 import type { LlmTextCaller, Transcript } from './distill.js'
@@ -1335,11 +1335,13 @@ export function apply(ctx: Context, config: Config): void {
     if (!settings.techniques) return ''
     const docs = corpusFor(current?.cwd)
     if (docs.length === 0) return ''
-    const hits = recallTechniques(query, docs, {
+    const extras = searchExtrasFor(current?.turns ?? [], query)
+    const hits = recallFacets(query, docs, {
       limit: settings.techniqueLimit,
       ...(current?.stack === undefined ? {} : { stack: current.stack }),
       partition: settings.partition,
       symbols: symbolsInText(query),
+      extra: extras,
     })
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
@@ -1361,6 +1363,11 @@ export function apply(ctx: Context, config: Config): void {
       when: input.when.trim(),
       summary: input.summary.trim(),
       ...(input.steps === undefined ? {} : { steps: [...input.steps] }),
+      ...(input.invariants === undefined ? {} : { invariants: [...input.invariants] }),
+      ...(input.subject === undefined ? {} : { subject: input.subject.trim() }),
+      ...(input.location === undefined ? {} : { location: input.location.trim() }),
+      ...(input.reuse === undefined ? {} : { reuse: input.reuse.trim() }),
+      ...(input.appliesTo === undefined ? {} : { appliesTo: input.appliesTo.trim() }),
       ...(input.apiSymbols === undefined ? {} : { api: input.apiSymbols.map(symbol => ({ symbol })) }),
       ...(input.example === undefined
         ? {}
@@ -1806,16 +1813,22 @@ export function apply(ctx: Context, config: Config): void {
     async search(query, limit, includeDrafts, verbose) {
       const cwd = current?.cwd
       await refresh(cwd)
-      const hits = recallTechniques(query, corpusFor(cwd), {
+      const docs = corpusFor(cwd)
+      const extras = searchExtrasFor(current?.turns ?? [], query)
+      const facets = facetQueries(query, docs, extras)
+      const hits = recallFacets(query, docs, {
         limit,
         ...(current?.stack === undefined ? {} : { stack: current.stack }),
         partition: settings.partition,
         includeDrafts,
         symbols: symbolsInText(query),
+        extra: extras,
       })
       if (hits.length === 0) {
         return `No technique matched "${query}" for the current stack.`
       }
+      // 把 facet 写进表头：一次调用覆盖了哪几个主题是**可核对**的，而不是黑箱。
+      const facetNote = facets.length > 1 ? ` (facets: ${facets.slice(1, 5).join(' | ')})` : ''
       // 候选分两档付钱：前几条给可执行要点，其余只给「还存在」的指针。
       // 依据是实测 —— 逐条都展开时模型无从判断该看哪条，结果全部展开（12 次 technique_get）。
       const render = (hit: (typeof hits)[number], index: number, detailed: boolean): string => {
@@ -1829,7 +1842,7 @@ export function apply(ctx: Context, config: Config): void {
       const detailed = hits.slice(0, DETAILED_HITS)
       const tail = hits.slice(DETAILED_HITS)
       const lines = [
-        `${hits.length} technique(s) for "${query}"${includeDrafts ? ' (including drafts)' : ''}:`,
+        `${hits.length} technique(s) for "${query}"${includeDrafts ? ' (including drafts)' : ''}${facetNote}:`,
         ...detailed.map((hit, index) => render(hit, index, true)),
       ]
       if (tail.length > 0) {
@@ -2534,6 +2547,11 @@ function formatTechniqueDetail(record: TechniqueRecord): string {
   const stack = stackSummary(record.stack)
   if (stack.length > 0) lines.push(`Stack: ${stack}`)
   if (record.domain !== undefined) lines.push(`Domain: ${record.domain}`)
+  // 逻辑卡的结构化锚点：模型要能据此回查代码、判断可否复用。
+  if (record.subject !== undefined) lines.push(`Subject: ${record.subject}`)
+  if (record.location !== undefined) lines.push(`Location: ${record.location}`)
+  if (record.appliesTo !== undefined) lines.push(`Applies to: ${record.appliesTo}`)
+  if (record.reuse !== undefined) lines.push(`Reuse: ${record.reuse}`)
   if (record.api !== undefined && record.api.length > 0) {
     lines.push('API:', ...record.api.map(surface => [
       '  - ',
@@ -2720,6 +2738,25 @@ function hasCorrectionSignal(turns: readonly LiveTurn[]): boolean {
 function hasLearningSignal(turns: readonly LiveTurn[]): boolean {
   return turns.some(turn => turn.files.length > 0 || turn.tools.length > 0)
     || hasCorrectionSignal(turns)
+}
+
+/**
+ * 当前轮的结构化检索线索：最近几轮触达的文件名与工具名。
+ *
+ * 为什么要把它们塞进检索：用户问「为什么这个测试挂了」时，正文里往往**没有**任何符号名，
+ * 但当前轮读过 `Foo.java`、跑过 `npm test` —— 这些是比措辞更可靠的键。
+ *
+ * @param query - 本轮查询文本（用于抽调用名）。
+ * @returns 去重后的补充查询词。
+ */
+function searchExtrasFor(turns: readonly { tools: readonly string[]; files: readonly string[] }[], query: string): string[] {
+  const out: string[] = []
+  for (const turn of turns.slice(-3)) {
+    for (const file of turn.files) out.push(file)
+    for (const tool of turn.tools) out.push(tool)
+  }
+  for (const symbol of symbolsInText(query)) out.push(symbol)
+  return [...new Set(out)]
 }
 
 /** 从文本里抽取可能的调用名（供 `symbol` 精确加权）。 */

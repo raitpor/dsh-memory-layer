@@ -364,6 +364,14 @@ function recencyFactor(ageMs: number): number {
 export const MAX_FACETS = 8
 
 /**
+ * 外部打分器：给定一次查询，返回按相关度倒序的 id。
+ *
+ * 存在的意义是让**索引后端可选**：SQLite/FTS5 路径给出 id 列表，未提供或返回 `undefined`
+ * 时由本模块用内存 BM25 顶上 —— 回退是自动的，调用方不必判断后端状态。
+ */
+export type TechniqueScorer = (query: string, limit: number) => string[] | undefined
+
+/**
  * 把一段任务描述切成若干 **facet 子查询**（零模型、纯词法）。
  *
  * 存在的理由来自实测：单意图查询用 BM25 已经能排到第 1，但**任务型**描述（"新增一种折扣类型，
@@ -450,20 +458,54 @@ export function facetQueries(
 export function recallFacets(
   query: string,
   docs: readonly RecallDoc[],
-  options: TechniqueRecallOptions & { extra?: readonly string[] } = {},
+  options: TechniqueRecallOptions & { extra?: readonly string[]; scorer?: TechniqueScorer } = {},
 ): RecalledMemory[] {
   const limit = options.limit ?? 5
   if (limit <= 0) return []
   const queries = facetQueries(query, docs, options.extra ?? [])
   if (queries.length === 0) return []
   // 每个子查询多取一些：交错时要按轮次取到较深的位次。
-  const perQuery = queries.map(query => recallTechniques(query, docs, { ...options, limit: Math.max(limit, 10) }))
+  const depth = Math.max(limit, 10)
+  const byId = new Map(docs.map(doc => [doc.id, doc]))
+  const perQuery = queries.map(sub => {
+    const ids = options.scorer?.(sub, depth)
+    // 打分器给了结果就用它；没给（不可用/无 token/出错）就地回退内存 BM25。
+    if (ids === undefined) return recallTechniques(sub, docs, { ...options, limit: depth })
+    return ids
+      .map((id, index) => {
+        const doc = byId.get(id)
+        if (doc === undefined) return undefined
+        return {
+          layer: doc.layer,
+          id,
+          // 名次分：跨后端/跨子查询的原始分不可比，顺序才是要保住的信息。
+          score: 1 / (index + 1),
+          text: doc.text,
+          ts: doc.ts,
+          ...(doc.meta === undefined ? {} : { meta: doc.meta }),
+        } satisfies RecalledMemory
+      })
+      .filter((hit): hit is RecalledMemory => hit !== undefined)
+  })
+  return mergeInterleaved(perQuery, limit)
+}
 
+/**
+ * 轮转交错合并多路召回：第 1 轮取每路的第 1 名，第 2 轮取第 2 名……
+ *
+ * 这是 facet 覆盖的关键算法，情景/语义层与技巧层共用同一份实现 ——
+ * 两处各写一遍必然走样（改一处忘一处），所以抽成单一事实来源。
+ *
+ * @param hitLists - 每个子查询各自的召回结果（已按相关度排序）。
+ * @param limit - 合并后的条数上限。
+ * @returns 合并去重后的结果。
+ */
+export function mergeInterleaved(hitLists: readonly (readonly RecalledMemory[])[], limit: number): RecalledMemory[] {
   const out: RecalledMemory[] = []
   const seen = new Set<string>()
-  const depth = Math.max(0, ...perQuery.map(hits => hits.length))
+  const depth = Math.max(0, ...hitLists.map(hits => hits.length))
   for (let round = 0; round < depth && out.length < limit; round += 1) {
-    for (const hits of perQuery) {
+    for (const hits of hitLists) {
       const hit = hits[round]
       if (hit === undefined || seen.has(hit.id)) continue
       seen.add(hit.id)
@@ -472,4 +514,29 @@ export function recallFacets(
     }
   }
   return out
+}
+
+/**
+ * 面向**任意层**（情景 / 语义 / 技巧）的 facet 召回。
+ *
+ * 技巧层有 `recallTechniques` 那一套过滤与加权，这里走通用 {@link recall}：
+ * 情景/语义层同样会"一句话讲了好几件事"，单查询只能命中其中一件 ——
+ * 和技巧层实测到的是同一个病，因此共用同一套切分与合并。
+ *
+ * @param query - 查询文本。
+ * @param docs - 语料。
+ * @param options - 通用召回选项，外加结构化补充词 `extra`。
+ * @returns 合并后的召回结果。
+ */
+export function recallDocsFacets(
+  query: string,
+  docs: readonly RecallDoc[],
+  options: { limit?: number; now?: number; recencyWeight?: number; extra?: readonly string[] } = {},
+): RecalledMemory[] {
+  const limit = options.limit ?? 5
+  if (limit <= 0 || docs.length === 0) return []
+  const queries = facetQueries(query, docs, options.extra ?? [])
+  // 每个子查询多取一些：交错合并要按轮次取到较深的位次。
+  const perQuery = queries.map(sub => recall(sub, docs, { ...options, limit: Math.max(limit, 10) }))
+  return mergeInterleaved(perQuery, limit)
 }

@@ -41,6 +41,9 @@ import type {
   TechniqueStatus,
 } from './types.js'
 
+/** 可选的 FTS5 检索索引文件名（**派生物**，可随时删除重建）。 */
+export const SQLITE_INDEX_FILE = 'index.sqlite'
+
 /** 情景层 JSONL 文件名。 */
 export const EPISODIC_FILE = 'episodic.jsonl'
 

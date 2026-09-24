@@ -216,6 +216,9 @@ export type TechniqueKind =
    */
   | 'code-logic'
 
+/** 全部知识形态的**单一事实来源**：新增 kind 只改这里（此前三处白名单各写一份，漏一处就静默降级）。 */
+export const TECHNIQUE_KINDS = ['api-usage', 'business-rule', 'procedure', 'pitfall', 'env-recipe', 'code-logic'] as const
+
 /** 信任状态：`draft` 不参与自动注入。 */
 export type TechniqueStatus = 'draft' | 'validated' | 'canonical' | 'deprecated'
 

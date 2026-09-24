@@ -380,3 +380,102 @@ test('规则候选只陈述结构事实，不臆造语义', () => {
   assert.equal(candidate.draft.api?.[0]?.symbol, 'client.send')
   assert.ok(wordSequence(candidate.source).length > 0, '候选需携带来源文本供泄漏校验')
 })
+
+test('A：模型路径产出代码逻辑卡（subject/location/reuse/appliesTo 齐全，且排在最前）', async () => {
+  // 同一次模型调用同时返回技巧与逻辑卡 —— 不额外增加调用次数。
+  const withCard = async (): Promise<string> => JSON.stringify({
+    techniques: [{
+      kind: 'api-usage',
+      name: '结算入口要先校验幂等键',
+      when: '调用结算入口时',
+      summary: '结算入口每次调用都要带幂等键，重复提交会被拒绝而不是重复扣款。',
+      tags: ['settlement'],
+    }],
+    codeLogic: {
+      subject: 'SettlementService',
+      location: 'service/settlement#settle',
+      when: '给结算链路加新业务时',
+      summary: 'SettlementService 先校验幂等键，再取折扣，最后写结算明细并投递事件。',
+      steps: ['校验幂等键', '取折扣', '写结算明细', '投递 settlement.completed'],
+      invariants: ['幂等键校验必须先于任何写操作'],
+      reuse: '新增玩法时插在「取折扣」这一步，不要绕过幂等校验；事件消费者要自带幂等。',
+      appliesTo: 'module=settlement',
+      tags: ['settlement', 'logic'],
+    },
+  })
+  const outcome = await mineRepository({
+    view: repoView(FIXTURE),
+    stack: JAVA_STACK,
+    cache: emptyMineCache(),
+    model: 'fake',
+    call: withCard,
+    options: {
+      maxFiles: 100, maxBytes: 100_000, minOccurrences: 2, maxModelCalls: 3,
+      exampleMaxLines: 8, exampleMaxChars: 480, timeoutMs: 10_000,
+    },
+  })
+  const card = outcome.candidates.find(candidate => candidate.draft.kind === 'code-logic')?.draft
+  assert.ok(
+    card !== undefined,
+    `应产出逻辑卡：kinds=${JSON.stringify(outcome.candidates.map(c => c.draft.kind))} rejected=${JSON.stringify(outcome.rejected)}`,
+  )
+  assert.equal(card.subject, 'SettlementService')
+  assert.equal(card.location, 'service/settlement#settle')
+  assert.deepEqual(card.steps, ['校验幂等键', '取折扣', '写结算明细', '投递 settlement.completed'])
+  assert.deepEqual(card.invariants, ['幂等键校验必须先于任何写操作'])
+  assert.match(card.reuse ?? '', /插在「取折扣」这一步/u)
+  assert.equal(card.appliesTo, 'module=settlement')
+  assert.equal(card.status, 'draft', '逻辑卡同样是草稿，不参与自动注入')
+
+  // 同一簇内排在最前：规则候选整体在前（先跑），但**模型这部分**的首要产物应是逻辑卡。
+  const model = outcome.candidates.filter(candidate => candidate.origin === 'model')
+  assert.equal(model[0]?.draft.kind, 'code-logic', `模型候选应以逻辑卡打头：${model.map(c => c.draft.kind).join(',')}`)
+})
+
+test('A：模型没给 codeLogic 时不产出逻辑卡（宁缺勿造）', async () => {
+  const withoutCard = async (): Promise<string> => JSON.stringify({
+    techniques: [{
+      kind: 'procedure', name: '提交流程', when: '提交订单时',
+      summary: '先校验幂等键再落库。', tags: [],
+    }],
+    codeLogic: null,
+  })
+  const outcome = await mineRepository({
+    view: repoView(FIXTURE),
+    stack: JAVA_STACK,
+    cache: emptyMineCache(),
+    model: 'fake',
+    call: withoutCard,
+    options: {
+      maxFiles: 100, maxBytes: 100_000, minOccurrences: 2, maxModelCalls: 3,
+      exampleMaxLines: 8, exampleMaxChars: 480, timeoutMs: 10_000,
+    },
+  })
+  assert.ok(
+    outcome.candidates.every(candidate => candidate.draft.kind !== 'code-logic'),
+    '没有依据就不该产出逻辑卡',
+  )
+})
+
+test('A：逻辑卡缺 subject 或 steps 时被丢弃（不留空壳）', async () => {
+  const thinCard = async (): Promise<string> => JSON.stringify({
+    techniques: [],
+    // 有 subject 但没有 steps：描述不出逻辑，不该入库。
+    codeLogic: { subject: 'SettlementService', summary: '结算服务。', when: '改这块时' },
+  })
+  const outcome = await mineRepository({
+    view: repoView(FIXTURE),
+    stack: JAVA_STACK,
+    cache: emptyMineCache(),
+    model: 'fake',
+    call: thinCard,
+    options: {
+      maxFiles: 100, maxBytes: 100_000, minOccurrences: 2, maxModelCalls: 3,
+      exampleMaxLines: 8, exampleMaxChars: 480, timeoutMs: 10_000,
+    },
+  })
+  assert.ok(
+    outcome.candidates.every(candidate => candidate.draft.kind !== 'code-logic'),
+    '缺步骤的逻辑卡应被丢弃',
+  )
+})

@@ -80,6 +80,31 @@
 - 四个新字段全部走**统一安全管线**：`location` 会带路径，漏了就等于给私有路径开旁路。
 - `technique_get` 渲染 `Subject / Location / Applies to / Reuse`，模型可据此回查代码。
 
+### 挖掘产出代码逻辑卡
+
+- `technique_learn` 的模型路径**在同一次调用里**额外产出 `codeLogic`（不增加调用次数）：
+  `subject` / `location` / `steps`（逻辑顺序）/ `invariants` / `reuse` / `appliesTo`。
+- 缺失字段用**簇里的事实**兜底（调用名与文件路径），而不是编一个；没有 `subject` 或没有
+  逻辑步骤的卡直接丢弃 —— **宁缺勿造**。规则路径（纯结构分析）不产逻辑卡，因为那需要读实现。
+- 修掉两处「静默丢字段」：草稿归一化一直丢 `invariants`（提炼路径能写、挖掘路径写不进），
+  且新字段不会透传；`kind` 白名单此前在三个文件里各写一份，`code-logic` 一加就被悄悄降级成
+  `procedure`。现在统一为 `TECHNIQUE_KINDS` 单一事实来源。
+
+### 情景/语义层共用 facet 召回
+
+- `recallDocsFacets()`：情景与语义层同样会「一句话讲了好几件事」，现在和技巧层共用同一套
+  facet 切分与**轮转交错**合并（合并算法抽成 `mergeInterleaved` 单一实现，避免两处走样）。
+- 结构化补充词（当前轮碰到的文件、工具名）也接进了注入路径与 `memory_search`：
+  用户问「为什么这个测试挂了」时正文里没有符号名，但 turn 里有。
+
+### SQLite 索引后端（可选）
+
+- `indexBackend: 'sqlite'`：把技巧层派生成 FTS5 索引，拿到**字段加权 BM25** 与 SQL 侧过滤。
+- **可回退**：`node:sqlite` 不可用 / 索引损坏 / 查询无 token → 打分器返回 `undefined`，
+  自动回退内存 BM25；索引文件随时可删，下次 `refresh()` 重建。真源始终是 JSONL。
+- **中文必须预分词**：FTS5 默认分词器对中文无效（实测三条查询 0 命中），因此写入与查询
+  共用同一套 `tokenize`（中文二字 bigram），既命中中文又保住列权重。
+
 ### 交付
 
 - **离线安装包**：`npm run pack:offline` 产出 `dsh-memory-layer-<version>-offline.tar.gz`，

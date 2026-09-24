@@ -22,6 +22,7 @@ package "dsh-memory-layer" as ML {
   component "distill.ts\n提炼(模型 + 规则兜底)" as DIST
   component "injection.ts\n注入块定义(块首即识别标记)" as INJ
   component "recall.ts\nBM25 召回 + 分层过滤" as REC
+  component "sqlite-index.ts\n可选 FTS5 索引(可回退)" as SQLIDX
   component "technique.ts\n置信度 · 状态迁移" as TECH
   component "failures.ts\n错误指纹 · 升级处置" as FAIL
   component "mine.ts\n代码挖掘流水线" as MINE
@@ -70,6 +71,7 @@ STORE --> CRY
 STORE --> DB
 
 REC -down-> STORE
+REC -down-> SQLIDX : 可选索引后端
 TECH -down-> STORE
 FAIL -down-> STORE
 

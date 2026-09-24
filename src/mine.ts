@@ -539,9 +539,15 @@ export function ruleCandidate(cluster: SymbolCluster, stack: StackProfile, root:
 export const MINE_SYSTEM_PROMPT = [
   'You mine reusable engineering knowledge from a code base excerpt.',
   'Return ONE JSON object and nothing else, in this shape:',
-  '{"techniques":[{"kind":"api-usage"|"business-rule"|"procedure"|"pitfall"|"env-recipe","name":string,"when":string,"summary":string,"steps":string[],"invariants":string[],"api":[{"symbol":string,"signature":string,"notes":string}],"example":{"language":string,"kind":"usage"|"signature"|"config","code":string},"pitfalls":string[],"verify":string[],"domain":string,"tags":string[],"sensitivity":"public"|"internal"|"confidential"}]}',
+  '{"techniques":[{"kind":"api-usage"|"business-rule"|"procedure"|"pitfall"|"env-recipe","name":string,"when":string,"summary":string,"steps":string[],"invariants":string[],"api":[{"symbol":string,"signature":string,"notes":string}],"example":{"language":string,"kind":"usage"|"signature"|"config","code":string},"pitfalls":string[],"verify":string[],"domain":string,"tags":string[],"sensitivity":"public"|"internal"|"confidential"}],'
+  + '"codeLogic":{"subject":string,"location":string,"when":string,"summary":string,"steps":string[],"invariants":string[],"reuse":string,"appliesTo":string,"tags":string[]}|null}',
   'Rules:',
   '- Emit at most 2 techniques for the given excerpt; prefer one high-quality entry over several vague ones.',
+  '- ALSO return `codeLogic` when the excerpt shows a code unit whose LOGIC can be described: `subject` is the',
+  '  owning class/module, `steps` is the logic order (input -> decision -> state change -> output),',
+  '  `invariants` are ordering/consistency rules that must hold, and `reuse` says how to hook into it when',
+  '  adding new business (where to extend, what must not be bypassed). Use null when the excerpt does not',
+  '  support a logic description — do NOT guess. Never invent a step the excerpt does not show.',
   '- The payload is `summary` (2-4 sentences of the actual method) plus `when` (the trigger).',
   '- NEVER copy implementation code. The example is at most 8 lines and must be REWRITTEN as an illustration.',
   '- Replace project-specific identifiers with <Placeholder> names; keep library and SDK symbols.',
@@ -573,7 +579,7 @@ export interface MineCache {
 export const MINE_CACHE_VERSION = 1
 
 /** 提示版本：模型提示词变化时必须递增，否则会跳过需要重挖的文件。 */
-export const MINE_PROMPT_VERSION = 'p1'
+export const MINE_PROMPT_VERSION = 'p2'
 
 /** 计算文件内容的哈希。 */
 export function contentHash(content: string): string {
@@ -678,6 +684,41 @@ function sanitizeForMining(text: string): string {
 }
 
 /**
+ * 把模型给出的 `codeLogic` 归一成一张 `code-logic` 草稿。
+ *
+ * `subject` / `location` 缺失时用**簇里的事实**兜底（调用名与文件），而不是编一个：
+ * 这是「结构化字段必须有据」的最小保证 —— 模型没说清代码单元时，至少不能凭空造名字。
+ *
+ * @param input - 模型输出里的 `codeLogic` 字段（可为 null）。
+ * @param cluster - 该簇的结构化事实。
+ * @param stack - 当前技术栈。
+ * @returns 草稿；模型没给或给得太空时返回 `undefined`。
+ */
+function logicCard(input: unknown, cluster: SymbolCluster, stack: StackProfile): TechniqueDraft | undefined {
+  if (typeof input !== 'object' || input === null) return undefined
+  const record = { ...(input as Record<string, unknown>) }
+  const file = cluster.files[0]?.path
+  const unit = file === undefined ? undefined : file.split('/').at(-1)?.replace(/\.[^.]+$/u, '')
+  if (record.subject === undefined && unit !== undefined) record.subject = unit
+  if (record.location === undefined && file !== undefined) {
+    record.location = `${file}#${cluster.symbol.split('.').at(-1) ?? cluster.symbol}`
+  }
+  if (record.when === undefined) record.when = `改动 ${cluster.symbol} 所在代码时`
+  // 名字由既有事实拼出来：模型没被要求给 `name`（那是技巧的字段），
+  // 而草稿归一化要求 name/when/summary 齐全，缺一条就会被丢掉。
+  if (record.name === undefined) {
+    const unitName = record.subject ?? cluster.symbol
+    record.name = `${unitName} 的代码逻辑`
+  }
+  if (record.summary === undefined) record.summary = ''
+  const drafts = normalizeTechniqueDrafts([{ ...record, kind: 'code-logic' }], stack)
+  const draft = drafts[0]
+  // 没有 `subject` 或没有逻辑步骤的卡没有信息量：宁可不要，也别塞一条空壳进库。
+  if (draft === undefined || draft.subject === undefined || (draft.steps ?? []).length === 0) return undefined
+  return draft
+}
+
+/**
  * 由模型归纳一簇候选。
  * @param cluster - 调用簇。
  * @param stack - 当前技术栈。
@@ -697,8 +738,17 @@ export async function modelCandidates(
     excerpt: cluster.excerpt,
   }
   const output = await call(MINE_SYSTEM_PROMPT, `Mine reusable techniques from this excerpt (JSON):\n${JSON.stringify(packet)}`)
-  const drafts = normalizeTechniqueDrafts(parseJsonObject(output)?.techniques, stack)
-  return drafts.map(draft => ({ draft, source: cluster.excerpt, origin: 'model' as const }))
+  const parsed = parseJsonObject(output)
+  const drafts = normalizeTechniqueDrafts(parsed?.techniques, stack)
+  const out: MineCandidate[] = []
+
+  // 逻辑卡排在最前：一簇候选的**首要产物**是「这个代码单元在做什么」，
+  // 其次才是围绕它的调用面技巧。两次输出共用**同一次模型调用**，因此不增加成本。
+  const card = logicCard(parsed?.codeLogic, cluster, stack)
+  if (card !== undefined) out.push({ draft: card, source: cluster.excerpt, origin: 'model' as const })
+
+  out.push(...drafts.map(draft => ({ draft, source: cluster.excerpt, origin: 'model' as const })))
+  return out
 }
 
 /** 从模型输出里截出第一个 JSON 对象；解析失败返回 `undefined`。 */

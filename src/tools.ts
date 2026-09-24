@@ -14,6 +14,7 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import { TECHNIQUE_KINDS } from './types.js'
 import type { MemoryScope, SemanticKind, TechniqueKind } from './types.js'
 
 /** 工具行为依赖，由插件入口注入。 */
@@ -513,9 +514,8 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
 
 /** 解析技巧形态，未知取值按 `procedure` 处理。 */
 function parseTechniqueKind(value: string | undefined): TechniqueKind {
-  return value === 'api-usage' || value === 'business-rule' || value === 'procedure'
-    || value === 'pitfall' || value === 'env-recipe' || value === 'code-logic'
-    ? value
+  return typeof value === 'string' && (TECHNIQUE_KINDS as readonly string[]).includes(value)
+    ? value as TechniqueKind
     : 'procedure'
 }
 

@@ -89,6 +89,9 @@
         skillAllowedTools: []
         # 暴露 memory_* / technique_* / failure_* 工具
         registerTools: true
+        # 检索索引后端：memory = 纯内存 BM25（零依赖）；sqlite = 从真源派生的 FTS5 索引
+        # （字段加权 + 结构化过滤，可重建、可回退；需要 Node >= 22.5 的内置 node:sqlite）
+        indexBackend: memory
         # 会话结束提炼的超时；超时或缺少 llm 时自动回退到规则提炼
         distillTimeoutMs: 30000
         # 提炼调用使用的模型路由；留空则复用本会话最近一次请求的 provider/model

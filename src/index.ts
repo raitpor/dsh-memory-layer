@@ -35,8 +35,10 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import { KEY_ENV, KEY_FILE_NAME, createCodec, resolveKey } from './crypto.js'
 import type { StoreCodec } from './crypto.js'
-import { MemoryStore, MAX_SUMMARY_CHARS, MINE_CACHE_FILE, emptyMetrics, techniqueText } from './store.js'
-import { facetQueries, recall, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
+import { MemoryStore, MAX_SUMMARY_CHARS, MINE_CACHE_FILE, SQLITE_INDEX_FILE, emptyMetrics, techniqueText } from './store.js'
+import { facetQueries, recallDocsFacets, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
+import type { TechniqueScorer } from './recall.js'
+import { SqliteTechniqueIndex, loadSqlite } from './sqlite-index.js'
 import type { RecallDoc } from './recall.js'
 import { distill, isInjectedContext } from './distill.js'
 import type { LlmTextCaller, Transcript } from './distill.js'
@@ -127,6 +129,14 @@ export interface Config {
   promptOrder?: number
   /** 是否注册 memory_search / memory_save / memory_forget / memory_stats 工具。 */
   registerTools?: boolean
+  /**
+   * 检索索引后端。
+   *
+   * `memory`（默认）：纯内存 BM25，零依赖、零额外文件。
+   * `sqlite`：从真源派生的 FTS5 索引（列权重 + SQL 过滤），**可重建、可回退** ——
+   *   建不起来、读不出来、`node:sqlite` 不可用（Node < 22.5）时自动退回内存路径。
+   */
+  indexBackend?: 'memory' | 'sqlite'
   /** 每轮捕获的用户文本上限（字符）。 */
   captureUserChars?: number
   /** 每轮捕获的助手文本上限（字符）。 */
@@ -363,6 +373,7 @@ export const Config: z<Config> = z.object({
   injectPrompt: z.boolean().default(true),
   promptOrder: z.number().default(250),
   registerTools: z.boolean().default(true),
+  indexBackend: z.union([z.const('memory'), z.const('sqlite')]).default('memory'),
   captureUserChars: z.natural().min(80).max(20_000).default(2000),
   captureAssistantChars: z.natural().min(80).max(20_000).default(1200),
   maxTurnsPerSession: z.natural().min(1).max(500).default(60),
@@ -457,6 +468,7 @@ interface Settings {
   injectPrompt: boolean
   promptOrder: number
   registerTools: boolean
+  indexBackend: 'memory' | 'sqlite'
   captureUserChars: number
   captureAssistantChars: number
   maxTurnsPerSession: number
@@ -597,6 +609,19 @@ export function apply(ctx: Context, config: Config): void {
    *
    * @param cwd - 目标项目目录；缺省用当前会话。
    */
+  /**
+   * 技巧层的可选 FTS5 索引（真源仍是 JSONL）。
+   *
+   * 只在配置开启且 `node:sqlite` 可用时创建；之后所有失败都表现为「打分器返回 undefined」，
+   * 由 `recallFacets` 自动回退内存 BM25 —— 因此它坏了不会让检索变不可用，只会变慢。
+   */
+  const techniqueIndex = settings.indexBackend === 'sqlite' && loadSqlite() !== undefined
+    ? new SqliteTechniqueIndex(join(settings.dir, SQLITE_INDEX_FILE))
+    : undefined
+  if (settings.indexBackend === 'sqlite' && techniqueIndex === undefined) {
+    logger.warn('memory: indexBackend=sqlite requested but node:sqlite is unavailable (needs Node >= 22.5); falling back to in-memory BM25')
+  }
+
   /** 「整库解不开」与「个别坏行」各自只吼一次，避免每轮刷屏。 */
   let integrityWarned = false
   let undecodableWarned = false
@@ -629,6 +654,15 @@ export function apply(ctx: Context, config: Config): void {
     }
     const techniques = dedupeById([...projectTech, ...globalTech])
     for (const record of techniques) techniqueById.set(record.id, record)
+    // 索引从真源派生：签名没变就跳过，变了就全量重建（几百条是毫秒级）。
+    // 重建失败只记一条日志，检索随后自动走内存路径。
+    try {
+      if (techniqueIndex?.build(techniques) === true) {
+        logger.debug(`memory: rebuilt sqlite index for ${techniques.length} techniques`)
+      }
+    } catch (error) {
+      logger.warn(`memory: sqlite index rebuild failed, using in-memory retrieval: ${describe(error)}`)
+    }
     corpora.set(key, [
       ...toDocs([...episodic, ...globalEpisodic], [...semantic, ...globalSemantic]),
       ...toTechniqueDocs(techniques),
@@ -1309,7 +1343,12 @@ export function apply(ctx: Context, config: Config): void {
       return record !== undefined && injectable(record)
     })
     if (docs.length === 0) return ''
-    const hits = recall(query, docs, { limit: settings.recallLimit })
+    // 与技巧层同一套 facet 机制：情景/语义层同样会「一句话讲了好几件事」，
+    // 而且**当前轮碰过的文件**是比措辞更可靠的键（"为什么这个测试挂了"里没有文件名）。
+    const hits = recallDocsFacets(query, docs, {
+      limit: settings.recallLimit,
+      extra: searchExtrasFor(current?.turns ?? [], query),
+    })
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
       const kind = recallLabel(hit.layer, hit.meta?.kind)
@@ -1342,6 +1381,7 @@ export function apply(ctx: Context, config: Config): void {
       partition: settings.partition,
       symbols: symbolsInText(query),
       extra: extras,
+      scorer: indexScorer(false),
     })
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
@@ -1660,7 +1700,11 @@ export function apply(ctx: Context, config: Config): void {
     async search(query, limit, scope) {
       const cwd = current?.cwd
       await refresh(cwd)
-      const hits = recall(query, corpusFor(cwd), { limit })
+      // 与注入路径、技巧检索同一套 facet 机制。
+      // 待办（已知缺陷，未在本次改动范围内）：`scope` 目前只出现在表头文案里，
+      // 没有真正过滤 —— 语料是 project + global 合并的，而 `RecallDoc` 不携带作用域。
+      // 修它需要给 `RecallDoc.meta` 加 `scope` 并在召回处过滤，另配用例。
+      const hits = recallDocsFacets(query, corpusFor(cwd), { limit, extra: searchExtrasFor(current?.turns ?? [], query) })
       if (hits.length === 0) return `No memory matched "${query}" (scope ${scope}).`
       return [
         `${hits.length} memory item(s) for "${query}" (scope ${scope}):`,
@@ -1808,6 +1852,28 @@ export function apply(ctx: Context, config: Config): void {
     return withEvidence ? `${head}\nEvidence #${kept}: ${prepared.evidence}` : head
   }
 
+  /**
+   * 索引打分器：给 `recallFacets` 用。
+   *
+   * 返回 `undefined` 表示「这次用不了索引，请回退内存 BM25」——索引未启用、查询没有 token、
+   * 或索引读取出错都走这条路。回退是**静默且自动**的，因为检索可用性不该依赖可选后端。
+   *
+   * @param includeDrafts - 是否包含草稿（工具显式检索时为 true）。
+   * @returns 打分器函数。
+   */
+  const indexScorer = (includeDrafts: boolean): TechniqueScorer => (query, limit) => {
+    if (techniqueIndex === undefined) return undefined
+    try {
+      return techniqueIndex.search(query, limit, {
+        includeDrafts,
+        partition: settings.partition,
+        ...(current?.stack === undefined ? {} : { stack: current.stack }),
+      })
+    } catch {
+      return undefined
+    }
+  }
+
   /** 技巧工具行为实现。 */
   const techniqueDeps = (): TechniqueToolDeps => ({
     async search(query, limit, includeDrafts, verbose) {
@@ -1823,6 +1889,7 @@ export function apply(ctx: Context, config: Config): void {
         includeDrafts,
         symbols: symbolsInText(query),
         extra: extras,
+        scorer: indexScorer(includeDrafts),
       })
       if (hits.length === 0) {
         return `No technique matched "${query}" for the current stack.`
@@ -2289,6 +2356,7 @@ function resolveSettings(config: Config): Settings {
     injectPrompt: config.injectPrompt ?? true,
     promptOrder: config.promptOrder ?? 250,
     registerTools: config.registerTools ?? true,
+    indexBackend: config.indexBackend ?? 'memory',
     captureUserChars: config.captureUserChars ?? 2000,
     captureAssistantChars: config.captureAssistantChars ?? 1200,
     maxTurnsPerSession: config.maxTurnsPerSession ?? 60,

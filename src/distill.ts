@@ -16,6 +16,7 @@
 import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from './injection.js'
 import { redactMemory } from './redact.js'
 import { MAX_SUMMARY_CHARS } from './store.js'
+import { TECHNIQUE_KINDS } from './types.js'
 import type {
   ApiSurface,
   CorrectionDraft,
@@ -268,6 +269,14 @@ export function normalizeTechniqueDrafts(input: unknown, stack: StackProfile | u
     if (name.length === 0 || when.length === 0 || summary.length === 0) continue
 
     const steps = strings(record.steps, FIELD_LIMITS.techniqueSteps, FIELD_LIMITS.item)
+    const invariants = strings(record.invariants, FIELD_LIMITS.techniqueSteps, FIELD_LIMITS.item)
+    // 逻辑卡的结构化字段。历史上这里漏掉了 `invariants`（提炼路径写过，但挖掘路径的
+    // 草稿在归一化时被丢掉），因此把「可选字段一律透传」当规矩写下来。
+    const subject = clip(string(record.subject), 160)
+    const location = clip(string(record.location), 200)
+    const reuse = clip(string(record.reuse), FIELD_LIMITS.item)
+    const appliesTo = clip(string(record.appliesTo), 120)
+    const gist = clip(string(record.gist), 120)
     const api = apiSurfaces(record.api)
     const example = techniqueExample(record.example)
     const domain = clip(string(record.domain), 48)
@@ -277,6 +286,12 @@ export function normalizeTechniqueDrafts(input: unknown, stack: StackProfile | u
       when,
       summary,
       ...(steps.length === 0 ? {} : { steps }),
+      ...(invariants.length === 0 ? {} : { invariants }),
+      ...(subject.length === 0 ? {} : { subject }),
+      ...(location.length === 0 ? {} : { location }),
+      ...(reuse.length === 0 ? {} : { reuse }),
+      ...(appliesTo.length === 0 ? {} : { appliesTo }),
+      ...(gist.length === 0 ? {} : { gist }),
       ...(api.length === 0 ? {} : { api }),
       ...(example === undefined ? {} : { example }),
       pitfalls: strings(record.pitfalls, FIELD_LIMITS.techniqueSteps, FIELD_LIMITS.item),
@@ -330,9 +345,8 @@ function techniqueExample(input: unknown): TechniqueExample | undefined {
 
 /** 归一化技巧形态，未知取值按 `procedure` 处理。 */
 function techniqueKind(value: unknown): TechniqueKind {
-  return value === 'api-usage' || value === 'business-rule' || value === 'procedure'
-    || value === 'pitfall' || value === 'env-recipe'
-    ? value
+  return typeof value === 'string' && (TECHNIQUE_KINDS as readonly string[]).includes(value)
+    ? value as TechniqueKind
     : 'procedure'
 }
 

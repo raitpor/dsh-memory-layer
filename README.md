@@ -336,6 +336,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `recallLimit` | `5` | 单次召回条数上限（1–20） |
 | `recallChars` | `4000` | **条目正文**的字符上限；块头（不可信声明）与 `BEGIN/END` 边界永不截断 —— 安全围栏不能被预算裁掉，因此上限小于块头开销时实际长度会略超上限 |
 | `registerTools` | `true` | 是否注册记忆工具 |
+| `indexBackend` | `memory` | 检索索引后端：`memory`（默认，纯内存 BM25）或 `sqlite`（从真源派生的 FTS5 索引，可重建、可回退） |
 | `distillOnTurnEnd` | `true` | 每轮末用规则提炼兜底落盘 |
 | `distillTimeoutMs` | `30000` | 会话结束提炼的超时；超时回退规则 |
 | `provider` / `model` | 空 | 提炼调用的模型路由；留空则复用本会话最近一次请求的路由 |
@@ -520,6 +521,24 @@ dsh plugin --profile <name> install --offline                       #    重装�
 写入方式：`technique_save` 显式写，或由代码挖掘从仓库里产出草稿。逻辑卡**同样是草稿起步**，
 只有被采用并附可证伪证据后才 `validated`、才有资格自动注入 —— 与其它技巧一条规则。
 
+## 检索索引后端（可选）
+
+默认 `indexBackend: memory`：纯内存 BM25，零依赖、零额外文件。改成 `sqlite` 后，`refresh()`
+会把技巧层派生成一份 **FTS5 索引**（`<dir>/index.sqlite`），拿到两样东西：
+
+- **字段加权 BM25**：`name / subject / when / summary / tags / api` 六列各自权重，不必自己实现 BM25F；
+- **SQL 侧过滤**：状态、分区、语言在查询里过滤，规模上来后不必每次全量扫内存。
+
+三条边界写死在实现里：
+
+1. **索引不是真源**：真源永远是 JSONL/JSON。索引文件可以随时删，下次 `refresh()` 自动重建。
+2. **失败必然回退**：`node:sqlite` 不可用（Node < 22.5）、索引损坏、查询没有 token ——
+   任何一条都让打分器返回 `undefined`，由 `recallFacets` 静默回退内存 BM25。
+   检索可用性不依赖可选后端。
+3. **中文靠预分词**：FTS5 开箱对中文无效（`unicode61` 把整段中文当一个 token、`trigram`
+   把整句当短语，实测三条中文查询全部 0 命中）。因此**写入与查询共用同一套分词**
+   （中文出二字 bigram），既命中中文又保住列权重。
+
 ## 上下文成本
 
 插件只有四处花 token，而且都有明确上限（实测脚本在 `.verify/measure/`，不入库）：
@@ -542,7 +561,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（284 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（297 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 

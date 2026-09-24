@@ -15,7 +15,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { facetQueries, recallFacets, recallTechniques, toTechniqueDocs } from '../src/recall.js'
+import { facetQueries, recallDocsFacets, recallFacets, recallTechniques, toTechniqueDocs } from '../src/recall.js'
 import type { StackProfile, TechniqueKind, TechniqueRecord } from '../src/types.js'
 
 const STACK: StackProfile = { languages: ['java'], frameworks: ['spring-boot'] }
@@ -269,4 +269,38 @@ test('facet 化不得丢掉空查询语义：空查询退化为最近记忆', ()
   assert.deepEqual(facets, [''], '空查询的 facet 列表就是它自己')
   const hits = recallFacets('', DOCS, { limit: 3, stack: STACK })
   assert.equal(hits.length, 3, '空查询应退回"最近记忆"，而不是空结果')
+})
+
+// ---- B：情景/语义层共用同一套 facet 机制 ------------------------------------
+
+test('facet 机制对任意层生效：情景摘要也能一次覆盖多个主题', () => {
+  // 情景/语义文档没有 `meta.tags`，词表帮不上忙，全靠子句切分 —— 这正是要验证的路径。
+  const episodic = [
+    { layer: 'episodic' as const, id: 'ep_a', ts: 1, text: '会话摘要：修了登录超时的问题。' },
+    { layer: 'episodic' as const, id: 'ep_b', ts: 2, text: '会话摘要：调整了导出报表的列顺序。' },
+    { layer: 'episodic' as const, id: 'ep_c', ts: 3, text: '会话摘要：重构了缓存淘汰策略。' },
+    { layer: 'episodic' as const, id: 'ep_d', ts: 4, text: '会话摘要：加了两个集成测试。' },
+  ]
+  const hits = recallDocsFacets('登录超时还没修完，顺便看下导出报表，另外测试也要补', episodic, { limit: 3 })
+  const ids = hits.map(hit => hit.id)
+  assert.ok(ids.includes('ep_a'), `「登录超时」主题应在：${ids.join(', ')}`)
+  assert.ok(ids.includes('ep_b'), `「导出报表」主题应在：${ids.join(', ')}`)
+  assert.equal(new Set(ids).size, ids.length, '不得重复')
+})
+
+test('facet 机制吃结构化补充词：只有文件路径能连上的旧会话也能被召回', () => {
+  const episodic = [
+    { layer: 'episodic' as const, id: 'ep_x', ts: 1, text: '会话摘要：改过 order-policy 的折扣分支。' },
+    { layer: 'episodic' as const, id: 'ep_y', ts: 2, text: '会话摘要：处理了一个无关的构建告警。' },
+  ]
+  // 查询词与 ep_x 毫无词面重叠，只有 extra 里的文件路径能连上。
+  const plain = recallDocsFacets('这个文件为什么这么写', episodic, { limit: 2 }).map(hit => hit.id)
+  const withExtra = recallDocsFacets('这个文件为什么这么写', episodic, {
+    limit: 2,
+    extra: ['src/order/order-policy.ts'],
+  }).map(hit => hit.id)
+  assert.ok(
+    withExtra.includes('ep_x'),
+    `带结构化线索时应召回 ep_x：无 extra=${plain.join(',')} 有 extra=${withExtra.join(',')}`,
+  )
 })

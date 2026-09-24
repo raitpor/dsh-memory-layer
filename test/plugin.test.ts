@@ -297,6 +297,11 @@ function sectionText(fake: FakeContext, name: string): string {
  */
 const GOOD_EVIDENCE = 're-ran `node --test`: 240/240 pass, was 238 before the change'
 
+/** 判断路径是否存在（只在少量用例里用）。 */
+async function exists(path: string): Promise<boolean> {
+  try { await stat(path); return true } catch { return false }
+}
+
 /** 取一个已注册的工具。 */
 function toolOf(fake: FakeContext, name: string): ToolDefinition {
   const found = fake.tools.find(tool => tool.name === name)
@@ -2922,6 +2927,42 @@ test('代码逻辑卡的 subject 让「按代码单元提问」精确命中', as
     assert.match(hits, /订单状态机/u, `按符号应命中对应逻辑卡：${hits}`)
     const first = hits.split('\n').find(line => /^\d+\. /u.test(line)) ?? ''
     assert.match(first, /OrderStateMachine|订单状态机/u, `符号命中应排最前：${hits}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('indexBackend=sqlite：索引被建立、检索仍然正确，索引丢失后自动重建', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, indexBackend: 'sqlite' })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      kind: 'code-logic',
+      name: '结算折扣先算等级折扣再叠加活动折扣',
+      when: '新增优惠玩法时',
+      summary: 'DiscountCalculator 先按会员等级取折扣率，再扣减活动折扣，顺序不可交换。',
+      subject: 'DiscountCalculator',
+      steps: ['读会员等级', '取等级折扣率', '扣减活动折扣'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: '`npm test` 240/240 通过' } as never, undefined as never,
+    )
+
+    // 索引文件是**派生**的：它应该被建出来，但绝不是真源。
+    assert.ok(await exists(join(root, 'index.sqlite')), 'sqlite 后端应落一个索引文件')
+    const hits = String(await toolOf(fake, 'technique_search').execute({ query: 'DiscountCalculator' } as never, undefined as never))
+    assert.match(hits, /结算折扣/u, `索引后端下检索应命中：${hits}`)
+
+    // 把索引删掉（等价于索引损坏/被清理）：检索必须照常，并在下一次 refresh 重建。
+    await rm(join(root, 'index.sqlite'), { force: true })
+    const again = String(await toolOf(fake, 'technique_search').execute({ query: 'DiscountCalculator' } as never, undefined as never))
+    assert.match(again, /结算折扣/u, `索引丢失后应回退/重建而不是检索失效：${again}`)
+
+    // 真源始终在：JSONL 里能读到这条记录。
+    const records = await new MemoryStore(root).readTechniques('global')
+    assert.ok(records.some(record => record.id === id), '真源不受索引影响')
   } finally {
     await dispose()
   }

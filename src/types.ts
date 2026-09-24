@@ -119,6 +119,16 @@ export interface SemanticRecord {
   sources: string[]
   /** 检索标签。 */
   tags: string[]
+  /**
+   * 被哪条新事实取代（`sm_` id）。
+   *
+   * 事实**改口**产生的是新记录（合并键是归一化文本），旧的那条若不标记就会继续被注入；
+   * 而容量淘汰是「先保命中多的」，于是过时的那条因为 `hits` 高反而更长寿。
+   * 标记后：不再注入，但**保留在库里**可追溯（`memory_search` 仍能看到并标 `superseded`）。
+   */
+  supersededBy?: string
+  /** 取代发生时间（Unix 毫秒）。 */
+  supersededAt?: number
 }
 
 /** 瞬时层元素：当前会话里一轮对话的要点。 */
@@ -431,6 +441,12 @@ export interface TechniqueRecord {
 export interface RecallMeta {
   /** 语义专用：事实类别（`fact` / `preference` / `decision` / `constraint`）。 */
   kind?: SemanticKind
+  /**
+   * 语义专用：这条事实已被新版本取代（见 {@link SemanticRecord.supersededBy}）。
+   *
+   * 自动注入会跳过它，显式检索仍会返回并标注 —— 「改口之后旧话还在不在」是可核对的。
+   */
+  superseded?: boolean
   /** 技巧专用：信任状态。 */
   status?: TechniqueStatus
   /** 技巧专用：敏感级别。 */
@@ -439,6 +455,14 @@ export interface RecallMeta {
   partition?: string
   /** 技巧专用：适用技术栈。 */
   stack?: StackProfile
+  /**
+   * 技巧专用：适用范围约束原文（如 `module=settlement`、`mc=1.21.1`）。
+   *
+   * 注入与 `technique_search` 按它做闸门判定（见 `appliesToAllows`）：判得出来且明确不符
+   * 就不给，判不出来一律放行。`memory_search` 不做这道过滤 —— 那是模型显式发起的检索，
+   * 也是「这条为什么没出现」的逃生口。
+   */
+  appliesTo?: string
   /** 技巧专用：业务领域。 */
   domain?: string
   /** 技巧专用：检索标签（facet 切分要用它当封闭词表）。 */
@@ -450,6 +474,13 @@ export interface RecallMeta {
    * 再喂一遍自己的摘要既是重复花钱，又会被标成「(past session)」而误导。
    */
   sessionId?: string
+  /**
+   * 这条记录来自哪个作用域，供 `memory_search(scope)` 真正过滤。
+   *
+   * 取值**取自读取时所在的桶**（`project` / `global` 是两个不同目录），而不是记录里
+   * 冗余的 `scope` 字段：桶才是唯一事实来源，字段缺失或写错也不会让过滤错位。
+   */
+  scope?: MemoryScope
   /** 技巧专用：规范化调用名。 */
   symbols?: readonly string[]
   /** 技巧专用：成功次数。 */

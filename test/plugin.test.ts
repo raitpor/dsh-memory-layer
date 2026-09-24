@@ -694,6 +694,69 @@ test('memory_forget 按 id 默认跨作用域删除，无需调用方知道记�
   }
 })
 
+test('memory_search 的 scope 是真过滤：项目桶与全局桶互不串味', async () => {
+  // 曾经的缺陷：`scope` 只出现在表头文案里，语料永远是「项目 + 全局」合并的 ——
+  // 于是 `scope: 'project'` 会把全局库（以及其他项目）的内容一并返回，调用方被表头骗了。
+  // 做法：同一个根目录下，插件按 project 作用域写两条，全局那条用裸 store 直接落盘
+  // （测试替身的监听器表是模块级的，两个插件实例无法同时活着），再用同一个查询分别检索。
+  const shared = await mkdtemp(join(tmpdir(), 'dsh-memory-scope-'))
+  await new MemoryStore(shared).upsertSemantic(
+    [{ kind: 'fact', text: 'SCOPEKEY 全局事实：pnpm store 在 HOME 下' }],
+    { scope: 'global', sessionId: 'manual', tags: ['manual'] },
+  )
+  const { fake, dispose } = await setup({
+    dir: shared,
+    distillOnTurnEnd: false,
+    reflectOnSessionEnd: false,
+    layerScopes: { semantic: 'project', technique: 'project' },
+  })
+  const cwd = '/work/scope-demo'
+  try {
+    const session = fakeSession('s-scope', cwd)
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    const saved = String(await toolOf(fake, 'memory_save').execute({
+      text: 'SCOPEKEY 项目约定：本仓库统一用 pnpm',
+      kind: 'constraint',
+    } as never, undefined as never))
+    assert.match(saved, /\(project\)/u, `这条事实应落在项目域：${saved}`)
+    await toolOf(fake, 'technique_save').execute({
+      name: 'SCOPEKEY 项目技巧',
+      when: 'SCOPEKEY 场景下',
+      summary: 'SCOPEKEY 的做法。',
+      kind: 'procedure',
+    } as never, undefined as never)
+
+    const search = async (scope?: string): Promise<string> => String(
+      await toolOf(fake, 'memory_search').execute(
+        { query: 'SCOPEKEY', ...(scope === undefined ? {} : { scope }) } as never,
+        undefined as never,
+      ),
+    )
+
+    // 默认（all）：两个桶都覆盖 —— 先证明这条查询确实能同时命中两边，
+    // 否则下面的「查不到」可能只是关键词没命中，而不是过滤生效。
+    const all = await search()
+    assert.match(all, /项目约定/u, `scope=all 应命中项目桶：${all}`)
+    assert.match(all, /全局事实/u, `scope=all 应命中全局桶：${all}`)
+
+    const onlyProject = await search('project')
+    assert.match(onlyProject, /scope project/u, `表头应写明作用域：${onlyProject}`)
+    assert.match(onlyProject, /项目约定/u, `scope=project 应命中项目桶：${onlyProject}`)
+    assert.match(onlyProject, /SCOPEKEY 项目技巧/u, `技巧层同样按作用域过滤：${onlyProject}`)
+    assert.doesNotMatch(onlyProject, /全局事实/u, `scope=project 不得返回全局桶内容：${onlyProject}`)
+
+    const onlyGlobal = await search('global')
+    assert.match(onlyGlobal, /全局事实/u, `scope=global 应命中全局桶：${onlyGlobal}`)
+    assert.doesNotMatch(onlyGlobal, /项目约定/u, `scope=global 不得返回项目桶内容：${onlyGlobal}`)
+    assert.doesNotMatch(onlyGlobal, /SCOPEKEY 项目技巧/u, `技巧层不得跟着全局域漏出来：${onlyGlobal}`)
+  } finally {
+    await dispose()
+    await rm(shared, { recursive: true, force: true })
+  }
+})
+
 test('memory_forget 的 * 通配需要显式 confirm（DEF-SEC-009）', async () => {
   const { fake, dispose } = await setup()
   try {
@@ -995,23 +1058,120 @@ test('召回与检索按层打标签：技巧不得被标成 episodic', async ()
   // 曾经注入与检索两处都写成 `layer === 'semantic' ? 'long-term' : 'episodic'`，
   // 于是 technique / failure 记录一律被标成 episodic —— 模型会把「一条可复用的技巧」
   // 误读成「某次会话的摘要」，来源判断直接错。
+  //
+  // 这里同时钉住**跨块去重**（DEF-29）：技巧段已经给过的技巧不得在召回段再付一遍 token。
+  // 办法是种 4 条都命中查询的技巧：技巧段只给前 3 条（`techniqueLimit`），第 4 条仍应由
+  // 召回段呈现 —— 于是「去重」与「召回段仍会带技巧条目且标签正确」两件事在一个用例里可判。
   const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
   try {
-    const id = await seedValidatedTechnique(fake)
+    const seeded: Array<{ id: string; name: string }> = []
+    for (const variant of [1, 2, 3, 4]) {
+      const name = `authorize before create ${variant}`
+      const saved = String(await toolOf(fake, 'technique_save').execute({
+        name,
+        when: 'integrating the orders client',
+        summary: `Call authorize before create (variant ${variant}).`,
+        kind: 'api-usage',
+      } as never, undefined as never))
+      const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+      assert.ok(id !== undefined, `保存应答里应有 id：${saved}`)
+      await toolOf(fake, 'technique_apply').execute({
+        id, outcome: 'success', evidence: GOOD_EVIDENCE,
+      } as never, undefined as never)
+      seeded.push({ id, name })
+    }
+
     const session = fakeSession('s1', '/work/demo')
     fake.emit('session/created', session)
     await fake.flush()
     fake.emit('session/event', session, event('turn/start', { turn: 1 }))
     fake.emit('session/event', session, userMessage('集成 OrdersClient 并调用 authorize'))
 
+    // 按真实渲染顺序读：召回段（order 250）先于技巧段（order 260）。
     const injected = sectionText(fake, 'memory-layer:recall')
-    assert.match(injected, /\(technique\)/u, `注入块应标 technique：${injected}`)
+    const techniqueBlock = sectionText(fake, 'memory-layer:techniques')
+
+    // 技巧段印短 id（`tq_` + 8 位），据它判断哪 3 条已经给过。
+    // 只取「— id …」这个句柄：同一行的「同一触发下另有做法」会把**完整** uuid 也印出来，
+    // 直接 `includes(短 id)` 会把那 3 条并置条目的 id 也算成「已给过」。
+    const blockIds = new Set([...techniqueBlock.matchAll(/— id (tq_[0-9a-f]{8})/gu)].map(match => match[1]))
+    const inBlock = seeded.filter(item => blockIds.has(item.id.slice(0, 11)))
+    assert.equal(inBlock.length, 3, `技巧段应按 techniqueLimit 给 3 条：${techniqueBlock}`)
+    for (const item of inBlock) {
+      assert.doesNotMatch(injected, new RegExp(item.name, 'u'),
+        `技巧段已给过的技巧不得在召回段重复：${injected}`)
+    }
+    // 第 4 条不在技巧段里，因此召回段仍应带上它（否则等于「去重」把知识也去掉了），
+    // 且标签必须是 technique 而不是 episodic。
+    const onlyInRecall = seeded.filter(item => !inBlock.includes(item))
+    assert.equal(onlyInRecall.length, 1)
+    assert.match(injected, /\(technique\)/u, `召回段应标 technique：${injected}`)
+    assert.match(injected, new RegExp(onlyInRecall[0]!.name, 'u'),
+      `不在技巧段里的那条仍应由召回段呈现：${injected}`)
 
     const found = String(await toolOf(fake, 'memory_search').execute(
       { query: 'authorize', scope: 'all' } as never, undefined as never,
     ))
-    assert.match(found, new RegExp(id, 'u'), `检索应命中该技巧：${found}`)
+    assert.match(found, new RegExp(seeded[0]!.id, 'u'), `检索应命中该技巧：${found}`)
     assert.match(found, /\(technique,/u, `检索结果应标 technique：${found}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('DEF-30 appliesTo 是真闸门：模块对不上就不注入，判不出来仍放行', async () => {
+  // 此前 `appliesTo` 只写不读：写入有、进检索语料有、technique_get 也渲染，就是没有任何
+  // 过滤读它 —— 一条标着 `module=alpha` 的逻辑卡在改别的模块时照样注入。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('s-gate-seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    fake.emit('session/event', seed, event('turn/start', { turn: 1 }))
+    for (const [name, appliesTo] of [
+      ['gate technique alpha', 'module=alpha'],
+      ['gate technique general', undefined],
+    ] as const) {
+      const saved = String(await toolOf(fake, 'technique_save').execute({
+        name,
+        when: 'touching GATEKEY',
+        summary: `GATEKEY ${name} summary.`,
+        kind: 'procedure',
+        ...(appliesTo === undefined ? {} : { appliesTo }),
+      } as never, undefined as never))
+      const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+      assert.ok(id !== undefined, `保存应答里应有 id：${saved}`)
+      await toolOf(fake, 'technique_apply').execute({
+        id, outcome: 'success', evidence: GOOD_EVIDENCE,
+      } as never, undefined as never)
+    }
+
+    const section = (): string => sectionText(fake, 'memory-layer:techniques')
+    const search = async (): Promise<string> => String(
+      await toolOf(fake, 'technique_search').execute({ query: 'GATEKEY' } as never, undefined as never),
+    )
+
+    // ① 本轮只碰 beta：alpha 专用那条不给，通用那条照给。
+    await runSession(fake, fakeSession('s-gate-beta', '/work/demo'), '改一下 GATEKEY 相关的东西', ['src/beta/x.ts'])
+    assert.match(section(), /gate technique general/u, `通用技巧应注入：${section()}`)
+    assert.doesNotMatch(section(), /gate technique alpha/u, `模块对不上就不该注入：${section()}`)
+    assert.doesNotMatch(await search(), /gate technique alpha/u, 'technique_search 同一口径')
+
+    // ② 本轮碰 alpha：两条都给。
+    await runSession(fake, fakeSession('s-gate-alpha', '/work/demo'), '改一下 GATEKEY 相关的东西', ['src/alpha/y.ts'])
+    assert.match(section(), /gate technique alpha/u, `模块对得上就该注入：${section()}`)
+    assert.match(section(), /gate technique general/u)
+
+    // ③ 本轮没有任何文件证据：判不出来 → 放行（与「画像缺失不拦截」同一原则）。
+    await runSession(fake, fakeSession('s-gate-none', '/work/demo'), '说说 GATEKEY 怎么用', [])
+    assert.match(section(), /gate technique alpha/u, `没有文件证据时不得静默扣掉知识：${section()}`)
+
+    // ④ 逃生口：`memory_search` 不做这道闸门 —— 否则「这条为什么没出现」无从查起。
+    await runSession(fake, fakeSession('s-gate-escape', '/work/demo'), '改一下 GATEKEY 相关的东西', ['src/beta/x.ts'])
+    const explicit = String(await toolOf(fake, 'memory_search').execute(
+      { query: 'GATEKEY alpha', scope: 'all' } as never, undefined as never,
+    ))
+    assert.match(explicit, /gate technique alpha/u, `显式检索应当能查到被闸门挡下的技巧：${explicit}`)
   } finally {
     await dispose()
   }
@@ -1065,6 +1225,82 @@ test('语义层按 kind 打标签：偏好不得被标成 long-term fact', async
     // 注入块走的是同一份标签逻辑，也必须区分。
     const injected = sectionText(fake, 'memory-layer:recall')
     assert.match(injected, /\(long-term preference\) 提交代码前/u, `注入块应标出偏好：${injected}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('DEF-31 memory_save(supersedes)：旧事实停止注入，但仍在库里可见并标 superseded', async () => {
+  // 语义层的合并键是归一化文本：用户改口写的是**新记录**，旧的那条会继续被注入；
+  // 而容量淘汰「先保命中多的」，过时的那条因为 hits 高反而更长寿。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const session = fakeSession('s-supersede', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+
+    const first = String(await toolOf(fake, 'memory_save').execute({
+      text: '部署走 npm run deploy 这条老命令',
+      kind: 'constraint',
+    } as never, undefined as never))
+    const oldId = /sm_[0-9a-fA-F-]+/u.exec(first)?.[0]
+    assert.ok(oldId !== undefined, `保存应答里应有 id：${first}`)
+
+    const second = String(await toolOf(fake, 'memory_save').execute({
+      text: '部署改走 pnpm deploy 这条新命令',
+      kind: 'constraint',
+      supersedes: oldId,
+    } as never, undefined as never))
+    assert.match(second, new RegExp(`supersedes ${oldId}`, 'u'), `应答应说明取代了谁：${second}`)
+
+    // 显式检索：两条都在（历史可追溯），旧的那条带 superseded 标注。
+    const search = async (query: string): Promise<string> => String(
+      await toolOf(fake, 'memory_search').execute({ query, scope: 'all' } as never, undefined as never),
+    )
+    const found = await search('部署 deploy 命令')
+    assert.match(found, /部署走 npm run deploy/u, `旧事实应仍在库里：${found}`)
+    assert.match(found, /superseded/u, `旧事实必须被标注：${found}`)
+    assert.match(found, /部署改走 pnpm deploy/u)
+
+    // 自动注入：新会话里旧的不得再出现（否则模型会照着作废的约定干活）。
+    const fresh = fakeSession('s-supersede-after', '/work/demo')
+    fake.emit('session/created', fresh)
+    await fake.flush()
+    fake.emit('session/event', fresh, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', fresh, userMessage('部署这步该用哪条命令？'))
+    const injected = sectionText(fake, 'memory-layer:recall')
+    assert.match(injected, /部署改走 pnpm deploy/u, `新事实应注入：${injected}`)
+    assert.doesNotMatch(injected, /部署走 npm run deploy/u, `被取代的事实不得注入：${injected}`)
+
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /1 superseded, not injected/u,
+      '统计要说明有几条被取代（否则条数看起来仍在生效）',
+    )
+
+    // 目标不存在 / 不是语义 id：整条拒绝，绝不留下半件事。
+    const missing = String(await toolOf(fake, 'memory_save').execute({
+      text: '这条不该被写进去',
+      kind: 'fact',
+      supersedes: 'sm_不存在',
+    } as never, undefined as never))
+    assert.match(missing, /No memory matched/u, `未知 id 应拒绝：${missing}`)
+    assert.match(missing, /nothing was saved/iu)
+    // 直接看落盘内容：检索输出里会回显查询词，拿它断言等于自己满足自己。
+    const stored = await new MemoryStore(root).readSemantic('global')
+    assert.ok(
+      !stored.some(record => record.text.includes('这条不该被写进去')),
+      '被拒绝时不得落盘',
+    )
+
+    assert.match(
+      String(await toolOf(fake, 'memory_save').execute({
+        text: 'x', kind: 'fact', supersedes: 'tq_12345678',
+      } as never, undefined as never)),
+      /not a semantic fact id/u,
+      '技巧 id 不该被当成可取代的事实',
+    )
   } finally {
     await dispose()
   }
@@ -1370,6 +1606,36 @@ test('P1-⑤ failure_forgive 在本会话内抑制预警', async () => {
     // 新会话不再受放行影响。
     await failSession(fake, fakeSession('s3', '/work/demo'), 'EACCES: permission denied')
     assert.match(sectionText(fake, 'memory-layer:failures'), /已重复 3 次/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('DEF-27 memory_forget 能删掉 failure_list 给出的 fa_ id（失败层此前没有删除路径）', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    await failSession(fake, fakeSession('s1', '/work/demo'), 'EACCES: permission denied')
+    await failSession(fake, fakeSession('s2', '/work/demo'), 'EACCES: permission denied')
+    const listed = String(await toolOf(fake, 'failure_list').execute({} as never, undefined as never))
+    const id = /fa_[0-9a-fA-F-]+/u.exec(listed)?.[0]
+    assert.ok(id !== undefined, `failure_list 应给出 id：${listed}`)
+
+    const removed = String(await toolOf(fake, 'memory_forget').execute(
+      { id } as never, undefined as never,
+    ))
+    assert.match(removed, /Removed 1 failure record/u, `按 id 删除应命中失败层：${removed}`)
+    assert.equal((await new MemoryStore(root).readFailures('global')).length, 0, '记录应真的落盘删除')
+    assert.match(
+      String(await toolOf(fake, 'failure_list').execute({ includeResolved: true } as never, undefined as never)),
+      /No recurring failure/u,
+      '删除后列表不应再有它',
+    )
+
+    // 反向：`*` 是破坏性通配，**不得**顺手扩到失败层（扩大破坏面比少删更糟）。
+    await failSession(fake, fakeSession('s3', '/work/demo'), 'EACCES: permission denied')
+    await failSession(fake, fakeSession('s4', '/work/demo'), 'EACCES: permission denied')
+    await toolOf(fake, 'memory_forget').execute({ id: '*', scope: 'global', confirm: true } as never, undefined as never)
+    assert.equal((await new MemoryStore(root).readFailures('global')).length, 1, '`*` 只清情景/语义层，不动失败层')
   } finally {
     await dispose()
   }
@@ -2506,6 +2772,59 @@ test('technique_get 支持一次展开多条，并逐个报告无法解析的 id
 
     // 两个参数都不给时不应静默返回空字符串。
     assert.match(String(await toolOf(fake, 'technique_get').execute({} as never, undefined as never)), /Provide id or ids/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('DEF-32 technique_save(id=…) 就地更新：只换给的字段，计数与验收记录不动', async () => {
+  // 此前只能新建（合并键是 name+when+domain）：改一句措辞要么精确重贴三键、要么
+  // forget 再 save —— 后者会把 successes 与验收记录一起丢掉，等于把信任清零。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const before = String(await toolOf(fake, 'technique_get').execute({ id } as never, undefined as never))
+    const confidenceBefore = /Confidence: ([\d.]+)/u.exec(before)?.[1]
+    const verificationsBefore = before.split('Verification (').length - 1
+    assert.ok(confidenceBefore !== undefined, `展开应有置信度：${before}`)
+    assert.equal(verificationsBefore, 1, `种下的技巧应有一条验收记录：${before}`)
+
+    const reply = String(await toolOf(fake, 'technique_save').execute({
+      id,
+      when: 'integrating the orders client (wording fixed)',
+    } as never, undefined as never))
+    assert.match(reply, /Updated technique/u, `应回报就地更新：${reply}`)
+    assert.match(reply, /fields: when/u, `应说明改了哪些字段：${reply}`)
+
+    const after = String(await toolOf(fake, 'technique_get').execute({ id } as never, undefined as never))
+    assert.match(after, /wording fixed/u, 'when 应被替换')
+    assert.match(after, /authorize before create/u, '没给的字段应保持原样')
+    assert.match(after, /Status: validated/u, '状态不得被重置成 draft')
+    assert.equal(
+      /Confidence: ([\d.]+)/u.exec(after)?.[1],
+      confidenceBefore,
+      '计数与证据不得被清零（置信度是 successes/failures/evidence 的函数）',
+    )
+    assert.equal(after.split('Verification (').length - 1, 1, '验收记录必须保留')
+
+    // 不新建副本：库里仍然只有这一条。
+    assert.equal((await new MemoryStore(root).readTechniques('global')).length, 1, '就地更新不得产生新记录')
+
+    // 认不出的 id / 没给可改字段：返回可照做的说明，且不写坏任何东西。
+    assert.match(
+      String(await toolOf(fake, 'technique_save').execute({ id: 'tq_nope', when: 'x' } as never, undefined as never)),
+      /No technique resolved for "tq_nope"/u,
+    )
+    assert.match(
+      String(await toolOf(fake, 'technique_save').execute({ id } as never, undefined as never)),
+      /Provide at least one of/u,
+      '只给 id 时应说明要改什么',
+    )
+    // 新建形态仍然要求三件套齐全（契约层就挡住，不靠执行期抛错）。
+    assert.match(
+      String(await toolOf(fake, 'technique_save').execute({ name: 'only a name' } as never, undefined as never)),
+      /Provide name, when and summary/u,
+    )
   } finally {
     await dispose()
   }

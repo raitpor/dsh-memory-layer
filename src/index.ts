@@ -35,7 +35,15 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import { KEY_ENV, KEY_FILE_NAME, createCodec, resolveKey } from './crypto.js'
 import type { StoreCodec } from './crypto.js'
-import { MemoryStore, MAX_SUMMARY_CHARS, MINE_CACHE_FILE, SQLITE_INDEX_FILE, emptyMetrics, techniqueText } from './store.js'
+import {
+  MemoryStore,
+  MAX_SUMMARY_CHARS,
+  MAX_TECHNIQUE_TAGS,
+  MINE_CACHE_FILE,
+  SQLITE_INDEX_FILE,
+  emptyMetrics,
+  techniqueText,
+} from './store.js'
 import { facetQueries, recallDocsFacets, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
 import type { TechniqueScorer } from './recall.js'
 import { SqliteTechniqueIndex, loadSqlite } from './sqlite-index.js'
@@ -51,7 +59,7 @@ import {
   withCacheEntries,
 } from './mine.js'
 import type { MineCache } from './mine.js'
-import { createFileView, detectStack, stackSummary } from './stack/index.js'
+import { appliesToAllows, createFileView, detectStack, stackSummary } from './stack/index.js'
 import {
   DETAILED_HITS,
   applyOutcome,
@@ -88,7 +96,7 @@ import type { EscalationThresholds, FailureObservation } from './failures.js'
 import { FAILURE_BLOCK, RECALL_BLOCK, TECHNIQUE_BLOCK, compactEntryText } from './injection.js'
 import type { InjectionBlock } from './injection.js'
 import { renderSkill, verifySkill } from './skill.js'
-import { createFailureTools, createMemoryTools, createTechniqueTools } from './tools.js'
+import { UPDATABLE_TECHNIQUE_FIELDS, createFailureTools, createMemoryTools, createTechniqueTools } from './tools.js'
 import type { FailureToolDeps, MemoryToolDeps, TechniqueSaveInput, TechniqueToolDeps } from './tools.js'
 import type {
   CorrectionDraft,
@@ -325,10 +333,14 @@ const SEMANTIC_KINDS: readonly string[] = ['fact', 'preference', 'decision', 'co
 export function recallLabel(
   layer: 'episodic' | 'semantic' | 'technique' | 'failure',
   kind?: unknown,
+  superseded?: boolean,
 ): string {
   if (layer !== 'semantic') return LAYER_LABELS[layer]
   const safe = typeof kind === 'string' && SEMANTIC_KINDS.includes(kind) ? kind : 'fact'
-  return `${SEMANTIC_LABEL_PREFIX} ${safe}`
+  // 已被取代的事实只在**显式检索**里出现（注入已过滤）。标注是必须的：模型否则会把
+  // 一句已经作废的偏好当成现行约定。
+  const suffix = superseded === true ? ' (superseded)' : ''
+  return `${SEMANTIC_LABEL_PREFIX} ${safe}${suffix}`
 }
 
 /** 技巧层注入 section 名。 */
@@ -626,6 +638,14 @@ export function apply(ctx: Context, config: Config): void {
   let integrityWarned = false
   let undecodableWarned = false
 
+  /**
+   * 本轮技巧段会注入哪些技巧（缓存：查询词 → id 列表）。
+   *
+   * 记忆召回段的语料里也含技巧层，两块各自渲染时同一条技巧会以两种形态各付一遍 token。
+   * 缓存让**两个 section 共享同一份判定**，谁先渲染谁算；`refresh()` 一旦重建语料就作废。
+   */
+  let techniqueHitCache: { query: string; hits: readonly RecalledMemory[] } | undefined
+
   const refresh = async (cwd?: string): Promise<void> => {
     const directory = resolveCwd(cwd)
     const key = bucketKey(directory)
@@ -648,12 +668,24 @@ export function apply(ctx: Context, config: Config): void {
       store.readFailures('project', directory, settings.partition),
       store.readFailures('global', undefined, settings.partition),
     ])
+    // DEF-28：这两张表必须**先清空再重建**。只 `set` 不 `clear` 时，被删除的记录会永远留在
+    // 内存索引里 —— `failure_list` / `failure_resolve` / `failure_forgive` / `technique_get`
+    // 读的都是这张表，于是「删掉了但还看得见、还能展开」。（`clear` 与下面的重建循环之间
+    // 没有 `await`，因此不存在读到半空表的窗口。）
+    failureById.clear()
+    failureByKey.clear()
     for (const record of dedupeById([...projectFail, ...globalFail])) {
       failureById.set(record.id, record)
       failureByKey.set(record.fingerprint.key, record)
     }
     const techniques = dedupeById([...projectTech, ...globalTech])
+    techniqueById.clear()
     for (const record of techniques) techniqueById.set(record.id, record)
+    // 技巧的作用域同样按**读取的桶**定：同 id 出现在两个桶时以项目桶为准，
+    // 与上面 `dedupeById([...projectTech, ...globalTech])` 的先后顺序一致。
+    const techniqueScopes = new Map<string, MemoryScope>()
+    for (const record of globalTech) techniqueScopes.set(record.id, 'global')
+    for (const record of projectTech) techniqueScopes.set(record.id, 'project')
     // 索引从真源派生：签名没变就跳过，变了就全量重建（几百条是毫秒级）。
     // 重建失败只记一条日志，检索随后自动走内存路径。
     try {
@@ -663,9 +695,13 @@ export function apply(ctx: Context, config: Config): void {
     } catch (error) {
       logger.warn(`memory: sqlite index rebuild failed, using in-memory retrieval: ${describe(error)}`)
     }
+    // 作用域按**读取的桶**打标（项目桶 / 全局桶是两个目录），而不是记录里冗余的
+    // `scope` 字段 —— `memory_search(scope)` 的过滤要靠它才真起作用。
     corpora.set(key, [
-      ...toDocs([...episodic, ...globalEpisodic], [...semantic, ...globalSemantic]),
-      ...toTechniqueDocs(techniques),
+      ...toDocs(episodic, semantic, 'project'),
+      ...toDocs(globalEpisodic, globalSemantic, 'global'),
+      ...toTechniqueDocs(techniques.filter(record => techniqueScopes.get(record.id) === 'project'), 'project'),
+      ...toTechniqueDocs(techniques.filter(record => techniqueScopes.get(record.id) === 'global'), 'global'),
     ])
     // 整份文件解不开（密钥不匹配/密文损坏）时，读取会静默返回空库，而写入又已被拒绝。
     // 两条都没声音的话，用户只会看到「记忆突然没了」，所以这里主动吼一声（每进程一次）。
@@ -682,6 +718,8 @@ export function apply(ctx: Context, config: Config): void {
         + 'are tolerated, but a whole-file failure blocks writes.',
       )
     }
+    // 语料换了，跨块去重的判定必须跟着作废（否则删掉技巧后召回段仍按旧结果排除它）。
+    techniqueHitCache = undefined
   }
 
   /**
@@ -1335,10 +1373,18 @@ export function apply(ctx: Context, config: Config): void {
     // 又会被标成「(past session)」—— 那是在谎报来源，模型会当第三方知识看。
     // 记录照常落盘（后续会话要用），只是不回灌给写下它的那个会话；
     // 显式检索（`memory_search`）不受影响，模型主动查仍查得到。
+    // 第三条过滤：**技巧段已经给过的技巧不再在召回段重复一遍**。两块各有各的形态
+    // （召回段给的是完整正文，技巧段给的是要点 + id），同一条各付一次纯属浪费 ——
+    // 实测真库上技巧段 3 条里有 2 条在召回段重复，合计 1857 字符，比技巧段全文还长。
+    // 技巧层关掉时不去重（没有技巧段可与之重复）。
+    const injectedTechniqueIds = new Set(injectedTechniqueHits(query).map(hit => hit.id))
     const selfSession = current?.sessionId
-    const docs = corpusFor(current?.cwd).filter(doc => {
+    const docs = gatedCorpus(current?.cwd).filter(doc => {
+      // 已被取代的语义事实不注入（`memory_search` 仍能看到，并标 `superseded`）。
+      if (doc.meta?.superseded === true) return false
       if (doc.layer === 'episodic' && selfSession !== undefined && doc.meta?.sessionId === selfSession) return false
       if (doc.layer !== 'technique') return true
+      if (injectedTechniqueIds.has(doc.id)) return false
       const record = techniqueById.get(doc.id)
       return record !== undefined && injectable(record)
     })
@@ -1359,6 +1405,49 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * 注入与技巧检索共用的语料：按 `appliesTo` 闸门筛掉「判得出来且明确不适用」的技巧。
+   *
+   * 过滤放在语料层而不是打分之后，是为了让**两条后端**（内存 BM25 与 SQLite 索引）口径一致：
+   * 打分器返回的 id 也要能在这份语料里找到，找不到就被丢掉。
+   *
+   * @param cwd - 会话工作目录。
+   * @returns 已过滤的文档。
+   */
+  const gatedCorpus = (cwd: string | undefined): RecallDoc[] => {
+    const files = (current?.turns ?? []).flatMap(turn => turn.files)
+    const stack = current?.stack
+    return corpusFor(cwd).filter(doc => doc.layer !== 'technique'
+      || appliesToAllows(doc.meta?.appliesTo, { files, ...(stack === undefined ? {} : { stack }) }))
+  }
+
+  /**
+   * 本轮技巧段会注入哪几条技巧（同一轮只算一次）。
+   *
+   * 两个 section 都从这里取，为的是**跨块去重**：记忆召回段的语料里也含技巧层，
+   * 各渲染各的时同一条技巧会以两种形态各付一遍 token —— 实测真库上技巧段 3 条里有 2 条
+   * 在召回段又出现一次，而且召回段那份是更长的正文（1857 字符 vs 技巧段全文 1137）。
+   * section 的渲染顺序不保证，所以谁先渲染谁算，另一个人直接拿缓存。
+   *
+   * @param query - 本轮召回查询词。
+   * @returns 技巧段将注入的命中；未开启技巧层时为空。
+   */
+  const injectedTechniqueHits = (query: string): readonly RecalledMemory[] => {
+    if (!settings.techniques) return []
+    if (techniqueHitCache?.query === query) return techniqueHitCache.hits
+    const docs = gatedCorpus(current?.cwd)
+    const hits = docs.length === 0 ? [] : recallFacets(query, docs, {
+      limit: settings.techniqueLimit,
+      ...(current?.stack === undefined ? {} : { stack: current.stack }),
+      partition: settings.partition,
+      symbols: symbolsInText(query),
+      extra: searchExtrasFor(current?.turns ?? [], query),
+      scorer: indexScorer(false),
+    })
+    techniqueHitCache = { query, hits }
+    return hits
+  }
+
+  /**
    * 渲染技巧层的**索引**注入。
    *
    * 只给索引行（名称 / 状态 / 适用栈 / 触发条件 / id），完整步骤与示例交给
@@ -1372,17 +1461,7 @@ export function apply(ctx: Context, config: Config): void {
    */
   const renderTechniqueInjection = (query: string): string => {
     if (!settings.techniques) return ''
-    const docs = corpusFor(current?.cwd)
-    if (docs.length === 0) return ''
-    const extras = searchExtrasFor(current?.turns ?? [], query)
-    const hits = recallFacets(query, docs, {
-      limit: settings.techniqueLimit,
-      ...(current?.stack === undefined ? {} : { stack: current.stack }),
-      partition: settings.partition,
-      symbols: symbolsInText(query),
-      extra: extras,
-      scorer: indexScorer(false),
-    })
+    const hits = injectedTechniqueHits(query)
     if (hits.length === 0) return ''
     const lines = hits.map((hit, index) => {
       const record = techniqueById.get(hit.id)
@@ -1394,35 +1473,105 @@ export function apply(ctx: Context, config: Config): void {
     return renderBlock(TECHNIQUE_BLOCK, extraHeader, lines, settings.techniqueChars)
   }
 
-  /** 手工写入时构造草稿：与自动提炼走同一条脱敏 + 去标识化管线。 */
-  const manualDraft = (input: TechniqueSaveInput): TechniqueDraft => {
-    const base: TechniqueDraft = {
-      kind: input.kind,
-      name: input.name.trim(),
-      ...(input.gist === undefined ? {} : { gist: input.gist.trim() }),
-      when: input.when.trim(),
-      summary: input.summary.trim(),
-      ...(input.steps === undefined ? {} : { steps: [...input.steps] }),
-      ...(input.invariants === undefined ? {} : { invariants: [...input.invariants] }),
-      ...(input.subject === undefined ? {} : { subject: input.subject.trim() }),
-      ...(input.location === undefined ? {} : { location: input.location.trim() }),
-      ...(input.reuse === undefined ? {} : { reuse: input.reuse.trim() }),
-      ...(input.appliesTo === undefined ? {} : { appliesTo: input.appliesTo.trim() }),
-      ...(input.apiSymbols === undefined ? {} : { api: input.apiSymbols.map(symbol => ({ symbol })) }),
-      ...(input.example === undefined
-        ? {}
-        : { example: { language: input.exampleLanguage ?? 'text', kind: 'usage', code: input.example } }),
-      pitfalls: [...(input.pitfalls ?? [])],
-      verify: [...(input.verify ?? [])],
-      stack: current?.stack ?? { languages: [] },
-      ...(input.domain === undefined ? {} : { domain: input.domain }),
-      tags: (input.tags ?? []).map(tag => tag.toLowerCase()),
-      evidence: [],
-      sensitivity: 'internal',
-      status: 'draft',
+  /**
+   * 把工具入参整理成草稿：与自动提炼走同一条脱敏 + 去标识化管线。
+   *
+   * `base` 给定时是**按 id 就地更新**（DEF-32）：只覆盖显式给出的字段，其余沿用原记录；
+   * 适用栈与敏感级别也沿用原记录 —— 改一句措辞不该顺手改掉它的适用性闸门。
+   *
+   * @param input - 工具入参。
+   * @param base - 被更新的原记录；新建时省略。
+   * @returns 已过安全管线的草稿。
+   */
+  const manualDraft = (input: TechniqueSaveInput, base?: TechniqueRecord): TechniqueDraft => {
+    const gist = input.gist === undefined ? base?.gist : input.gist.trim()
+    const steps = input.steps ?? base?.steps
+    const invariants = input.invariants ?? base?.invariants
+    const subject = input.subject === undefined ? base?.subject : input.subject.trim()
+    const location = input.location === undefined ? base?.location : input.location.trim()
+    const reuse = input.reuse === undefined ? base?.reuse : input.reuse.trim()
+    const appliesTo = input.appliesTo === undefined ? base?.appliesTo : input.appliesTo.trim()
+    const api = input.apiSymbols === undefined
+      ? base?.api
+      : input.apiSymbols.map(symbol => ({ symbol }))
+    const example = input.example === undefined
+      ? base?.example
+      : { language: input.exampleLanguage ?? 'text', kind: 'usage' as const, code: input.example }
+    const domain = input.domain ?? base?.domain
+    const draft: TechniqueDraft = {
+      kind: input.kind ?? base?.kind ?? 'procedure',
+      name: (input.name ?? base?.name ?? '').trim(),
+      ...(gist === undefined ? {} : { gist }),
+      when: (input.when ?? base?.when ?? '').trim(),
+      summary: (input.summary ?? base?.summary ?? '').trim(),
+      ...(steps === undefined ? {} : { steps: [...steps] }),
+      ...(invariants === undefined ? {} : { invariants: [...invariants] }),
+      ...(subject === undefined ? {} : { subject }),
+      ...(location === undefined ? {} : { location }),
+      ...(reuse === undefined ? {} : { reuse }),
+      ...(appliesTo === undefined ? {} : { appliesTo }),
+      ...(api === undefined ? {} : { api: [...api] }),
+      ...(example === undefined ? {} : { example }),
+      pitfalls: [...(input.pitfalls ?? base?.pitfalls ?? [])],
+      verify: [...(input.verify ?? base?.verify ?? [])],
+      stack: base?.stack ?? current?.stack ?? { languages: [] },
+      ...(domain === undefined ? {} : { domain }),
+      tags: (input.tags ?? base?.tags ?? []).map(tag => tag.toLowerCase()),
+      evidence: base?.evidence ?? [],
+      sensitivity: base?.sensitivity ?? 'internal',
+      status: base?.status ?? 'draft',
     }
-    return abstractDraft(base, current)
+    return abstractDraft(draft, current)
   }
+
+  /**
+   * 用草稿的**内容字段**覆盖记录，簿记字段一律沿用原记录。
+   *
+   * 就地更新最容易犯的错是「顺手把计数清了」：`successes` / `verifications` / `status` 是
+   * 这条技巧为什么被信任的全部依据，改措辞不该让它们归零。
+   *
+   * @param record - 原记录。
+   * @param draft - 已过安全管线的新内容。
+   * @param now - 更新时间。
+   * @returns 可直接写入的记录。
+   */
+  const applyTechniqueContent = (record: TechniqueRecord, draft: TechniqueDraft, now: number): TechniqueRecord => ({
+    id: record.id,
+    ts: record.ts,
+    updatedAt: now,
+    scope: record.scope,
+    partition: record.partition,
+    status: record.status,
+    sensitivity: record.sensitivity,
+    stack: record.stack,
+    evidence: record.evidence,
+    deidentified: true,
+    hits: record.hits,
+    applied: record.applied,
+    successes: record.successes,
+    failures: record.failures,
+    provenance: record.provenance,
+    ...(record.verifications === undefined ? {} : { verifications: record.verifications }),
+    ...(record.lastVerifiedAt === undefined ? {} : { lastVerifiedAt: record.lastVerifiedAt }),
+    ...(record.conflictsWith === undefined ? {} : { conflictsWith: record.conflictsWith }),
+    kind: draft.kind,
+    name: draft.name.trim(),
+    ...(draft.gist === undefined || draft.gist.trim().length === 0 ? {} : { gist: draft.gist.trim() }),
+    when: draft.when.trim(),
+    summary: draft.summary.trim(),
+    ...(draft.steps === undefined ? {} : { steps: [...draft.steps] }),
+    ...(draft.subject === undefined ? {} : { subject: draft.subject }),
+    ...(draft.location === undefined ? {} : { location: draft.location }),
+    ...(draft.reuse === undefined ? {} : { reuse: draft.reuse }),
+    ...(draft.appliesTo === undefined ? {} : { appliesTo: draft.appliesTo }),
+    ...(draft.invariants === undefined ? {} : { invariants: [...draft.invariants] }),
+    ...(draft.api === undefined ? {} : { api: [...draft.api] }),
+    ...(draft.example === undefined ? {} : { example: draft.example }),
+    pitfalls: [...draft.pitfalls],
+    verify: [...draft.verify],
+    ...(draft.domain === undefined ? {} : { domain: draft.domain }),
+    tags: [...new Set(draft.tags)].slice(0, MAX_TECHNIQUE_TAGS),
+  })
 
   /**
    * 组装一段注入块：**头部与尾部边界永不截断**，只压缩中间的条目正文。
@@ -1695,43 +1844,115 @@ export function apply(ctx: Context, config: Config): void {
     return removed === 0 ? `No technique matched "${id}".` : `Removed ${removed} technique(s).`
   }
 
+  /**
+   * 校验 `memory_save(supersedes)` 的目标：必须是一条**当前可检索到**、且与本层同作用域的语义事实。
+   *
+   * 为什么先校验再写：写进去才发现目标不存在，会留下「新事实已生效、旧的仍在注入」的
+   * 半吊子状态。宁可整条拒绝，也不做半件事。
+   *
+   * @param id - 目标事实 id。
+   * @param scope - 本次写入的作用域。
+   * @returns 拒绝说明；可以继续时返回 `undefined`。
+   */
+  const checkSupersedeTarget = async (id: string, scope: MemoryScope): Promise<string | undefined> => {
+    if (!id.startsWith('sm_')) {
+      return `Refused: "${id}" is not a semantic fact id — only facts and preferences can be superseded. Nothing was saved.`
+    }
+    await refresh(current?.cwd)
+    const target = corpusFor(current?.cwd).find(doc => doc.layer === 'semantic' && doc.id === id)
+    if (target === undefined) {
+      return `No memory matched "${id}" — nothing was saved. Run memory_search first to get the id of the fact you want to replace.`
+    }
+    if (target.meta?.scope !== scope) {
+      // 跨作用域「取代」会留下一条仍在注入的旧事实，因此直接拒绝并给出可行路径。
+      return `Refused: "${id}" lives in scope ${target.meta?.scope ?? 'unknown'} while new facts are written to ${scope}. `
+        + 'Delete it with memory_forget instead. Nothing was saved.'
+    }
+    return undefined
+  }
+
+  /**
+   * 按 id 删除一条失败记录，并返回人类可读的应答。
+   *
+   * 失败层的写入是「指纹合并」，所以误记（把一次偶发当反复犯）只能整条删掉 ——
+   * `failure_resolve` 只是标记解决，记录仍然参与「相似场景提前提醒」。
+   *
+   * @param id - 失败 id（`fa_` 前缀）。
+   * @param targets - 要查找的作用域。
+   * @returns 删除结果说明。
+   */
+  const forgetFailureById = async (id: string, targets: readonly MemoryScope[]): Promise<string> => {
+    let removed = 0
+    for (const target of targets) {
+      removed += await store.forgetFailure(
+        target,
+        target === 'project' ? projectCwd() : undefined,
+        settings.partition,
+        id,
+      )
+    }
+    await refresh()
+    return removed === 0 ? `No failure matched "${id}".` : `Removed ${removed} failure record(s).`
+  }
+
   /** 工具行为实现：与提示注入复用同一套存储与召回。 */
   const toolDeps = (): MemoryToolDeps => ({
     async search(query, limit, scope) {
       const cwd = current?.cwd
       await refresh(cwd)
-      // 与注入路径、技巧检索同一套 facet 机制。
-      // 待办（已知缺陷，未在本次改动范围内）：`scope` 目前只出现在表头文案里，
-      // 没有真正过滤 —— 语料是 project + global 合并的，而 `RecallDoc` 不携带作用域。
-      // 修它需要给 `RecallDoc.meta` 加 `scope` 并在召回处过滤，另配用例。
-      const hits = recallDocsFacets(query, corpusFor(cwd), { limit, extra: searchExtrasFor(current?.turns ?? [], query) })
+      // 与注入路径、技巧检索同一套 facet 机制。`scope` 是**真过滤**：
+      // 语料是项目域 + 全局域合并的，这里按桶打好的标记筛一遍，
+      // 否则「scope project」会连别的项目、乃至全局库的内容一起返回。
+      const corpus = corpusFor(cwd)
+      const scoped = scope === 'all' ? corpus : corpus.filter(doc => doc.meta?.scope === scope)
+      const hits = recallDocsFacets(query, scoped, { limit, extra: searchExtrasFor(current?.turns ?? [], query) })
       if (hits.length === 0) return `No memory matched "${query}" (scope ${scope}).`
       return [
         `${hits.length} memory item(s) for "${query}" (scope ${scope}):`,
         ...hits.map(hit => formatHit(hit)),
       ].join('\n')
     },
-    async save(text, kind) {
+    async save(text, kind, supersedes) {
       const scope = settings.scopeSemantic
       const cwd = scope === 'project' ? projectCwd() : undefined
       // 工具写入与自动提炼走同一条安全管线：只脱敏不去标识化的话，
       // 项目私有标识会经工具这条旁路进入（默认全局的）语义层。
       const clean = sanitizeForStore(text.trim(), current, cwd)
+      // 改口（DEF-31）：语义层的合并键是**归一化文本**，所以「换成另一句话」写出来的是新记录，
+      // 旧的那条会继续被注入 —— 而容量淘汰偏偏「先保命中多的」，过时的那条因为 hits 高更长寿。
+      // 显式 `supersedes` 才标记，不做语义猜测：猜错会把两条互补的事实说成互相取代。
+      if (supersedes !== undefined) {
+        const refusal = await checkSupersedeTarget(supersedes, scope)
+        if (refusal !== undefined) return refusal
+      }
       const records = await store.upsertSemantic([{ kind, text: clean }], {
         scope,
         partition: settings.partition,
         ...(cwd === undefined ? {} : { cwd }),
         sessionId: current?.sessionId ?? 'manual',
         tags: ['manual'],
+        ...(supersedes === undefined ? {} : { supersedes }),
       })
       await refresh(cwd)
       const stored = records.find(record => record.text === clean)
-      return `Saved to long-term memory (${scope}): "${clean}"${stored === undefined ? '' : ` [id ${stored.id}]`}`
+      const head = `Saved to long-term memory (${scope}): "${clean}"${stored === undefined ? '' : ` [id ${stored.id}]`}`
+      if (supersedes === undefined) return head
+      const target = records.find(record => record.id === supersedes)
+      if (target?.supersededBy === undefined) {
+        return `${head} — the text matched the memory it was meant to replace, so nothing was superseded.`
+      }
+      return `${head} — supersedes ${supersedes} (kept in the store, no longer injected).`
     },
     async forget(id, scope) {
       // DEF-05：`memory_search` 会返回技巧层的 `tq_` id，而本工具只遍历情景/语义层，
       // 于是「按 id 删除」对它必然答 `No memory matched` —— 契约说到的就得做到。
       if (id.startsWith('tq_')) return forgetTechniqueById(id)
+      // DEF-27：失败层同样没有删除路径 —— `failure_list` 把 `fa_` id 交给模型，
+      // 而 `memory_forget` 只遍历情景/语义层，误记的失败只能「标记已解决」，永远留在库里
+      // 并继续在相似场景被端出来。`store.forgetFailure()` 一直存在（还有单测），只是没人调用。
+      if (id.startsWith('fa_')) {
+        return forgetFailureById(id, scope === 'all' ? ['project', 'global'] : [scope])
+      }
       const targets: MemoryScope[] = scope === 'all' ? ['project', 'global'] : [scope]
       let removed = 0
       for (const target of targets) {
@@ -1754,6 +1975,8 @@ export function apply(ctx: Context, config: Config): void {
       // 否则别的项目那十几条整个不在报告里，读起来像库是空的。
       const episodicTotal = await store.countProjectEpisodic()
       const semantic = docs.filter(doc => doc.layer === 'semantic').length
+      // 被取代的事实不注入、但仍在库里，单说条数会让人以为它们还在生效。
+      const superseded = docs.filter(doc => doc.layer === 'semantic' && doc.meta?.superseded === true).length
       const techniques = docs
         .filter(doc => doc.layer === 'technique')
         .map(doc => techniqueById.get(doc.id))
@@ -1763,7 +1986,7 @@ export function apply(ctx: Context, config: Config): void {
         `Memory root: ${settings.dir}`,
         `Layer scopes: episodic=${settings.scopeEpisodic}, semantic=${settings.scopeSemantic}, technique=${settings.scopeTechnique}, failure=${settings.scopeFailure} (partition ${settings.partition})`,
         `Episodic summaries: ${episodic} (this project) · ${episodicTotal} (all projects)`,
-        `Semantic facts: ${semantic}`,
+        `Semantic facts: ${semantic}${superseded === 0 ? '' : ` (${superseded} superseded, not injected)`}`,
         `Techniques: ${verified} verified, ${techniques.length - verified} draft`,
         `Recurring failures: ${[...failureById.values()].filter(record => record.status !== 'deprecated').length} active, `
           + `${[...failureById.values()].filter(record => record.status === 'deprecated').length} resolved, `
@@ -1879,7 +2102,9 @@ export function apply(ctx: Context, config: Config): void {
     async search(query, limit, includeDrafts, verbose) {
       const cwd = current?.cwd
       await refresh(cwd)
-      const docs = corpusFor(cwd)
+      // 与注入路径同一份语料：`appliesTo` 判得出来且明确不适用时不给。
+      // `memory_search`（显式检索）不做这道闸门 —— 那是「这条为什么没出现」的逃生口。
+      const docs = gatedCorpus(cwd)
       const extras = searchExtrasFor(current?.turns ?? [], query)
       const facets = facetQueries(query, docs, extras)
       const hits = recallFacets(query, docs, {
@@ -1936,6 +2161,32 @@ export function apply(ctx: Context, config: Config): void {
     async save(input) {
       const scope = settings.scopeTechnique
       const cwd = scope === 'project' ? projectCwd() : undefined
+      // DEF-32：按 id 就地更新。此前只能新建（合并键是 name+when+domain），于是「改一句措辞」
+      // 要么精确重贴三键、要么 forget 再 save —— 后者会把计数与验收记录一起丢掉。
+      if (input.id !== undefined) {
+        await refresh(current?.cwd)
+        const resolved = resolveTechniqueId(input.id, [...techniqueById.values()])
+        if (!resolved.ok) {
+          return `No technique resolved for "${input.id}": ${resolved.reason}. Nothing was saved.`
+        }
+        const record = resolved.record
+        const draft = manualDraft(input, record)
+        if (draft.name.length === 0 || draft.when.length === 0) {
+          return 'Refused: name and when must not be empty. Nothing was saved.'
+        }
+        if (!storable(draft, record.scope)) {
+          return 'Refused: this technique is confidential and global storage is disabled (allowConfidentialGlobal).'
+        }
+        const updated = applyTechniqueContent(record, draft, Date.now())
+        const written = await store.updateTechniques(
+          [updated],
+          record.scope === 'project' ? projectCwd() : undefined,
+        )
+        await refresh(current?.cwd)
+        if (written === 0) return `Could not update technique "${input.id}".`
+        const fields = UPDATABLE_TECHNIQUE_FIELDS.filter(field => input[field] !== undefined)
+        return `Updated technique [id ${record.id}, status ${record.status}]: "${updated.name}" (fields: ${fields.join(', ')})`
+      }
       const draft = manualDraft(input)
       if (!storable(draft, scope)) {
         return 'Refused: this technique is confidential and global storage is disabled (allowConfidentialGlobal).'
@@ -2591,7 +2842,7 @@ function keepInsideWorkspace(files: readonly string[], cwd: string | undefined):
  * @returns 多行文本。
  */
 function formatHit(row: RecalledMemory): string {
-  const kind = recallLabel(row.layer, row.meta?.kind)
+  const kind = recallLabel(row.layer, row.meta?.kind, row.meta?.superseded)
   return `${row.id} (${kind}, score ${row.score.toFixed(2)}, ${new Date(row.ts).toISOString()})\n  ${sanitizeForPrompt(row.text)}`
 }
 

@@ -581,6 +581,8 @@ export class MemoryStore {
       sessionId: string
       tags: readonly string[]
       now?: number
+      /** 见 {@link upsertSemanticInner}：把这条 id 标记为已被本次写入取代。 */
+      supersedes?: string
     },
   ): Promise<SemanticRecord[]> {
     return this.exclusive(() => this.upsertSemanticInner(drafts, options))
@@ -920,6 +922,13 @@ export class MemoryStore {
       sessionId: string
       tags: readonly string[]
       now?: number
+      /**
+       * 把这条 id 的记录标记为「已被本次写入取代」。
+       *
+       * 与写入放在同一次加锁读-改-写里：分两次写时，第二次失败会留下
+       * 「新事实已生效、旧的那条仍未被标记」的不一致状态。
+       */
+      supersedes?: string
     },
   ): Promise<SemanticRecord[]> {
     const { scope, cwd, sessionId, tags } = options
@@ -966,6 +975,17 @@ export class MemoryStore {
       .sort((left, right) => right.hits - left.hits)
       .slice(0, MAX_SEMANTIC_PER_SCOPE)
       .sort((left, right) => left.ts - right.ts)
+    // 取代语义：把目标标记为「已被本次写入取代」，**不删记录**（历史可追溯）。
+    // 目标是本次写入自己（同 key 重新确认）时不动 —— 那是重申，不是改口。
+    const draftedKeys = new Set(drafts.map(draft => semanticKey(draft.text.trim())))
+    if (options.supersedes !== undefined) {
+      const target = next.find(record => record.id === options.supersedes)
+      const replacement = next.find(record => draftedKeys.has(record.key))
+      if (target !== undefined && replacement !== undefined && target.key !== replacement.key) {
+        target.supersededBy = replacement.id
+        target.supersededAt = now
+      }
+    }
     await this.writeAtomic(
       join(this.scopeDir(scope, cwd, partition), SEMANTIC_FILE),
       `${JSON.stringify(next)}\n`,

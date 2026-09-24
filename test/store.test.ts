@@ -113,6 +113,48 @@ test('语义层同 key 合并并累加命中次数', async () => {
   })
 })
 
+test('语义层取代语义：旧条被标记而不是被删，同 key 重申不动它（DEF-31）', async () => {
+  await withStore(async store => {
+    const before = await store.upsertSemantic(
+      [{ kind: 'preference', text: '用户偏好用 npm 安装依赖。' }],
+      { scope: 'global', sessionId: 's1', tags: [] },
+    )
+    const oldId = before[0]?.id
+    if (oldId === undefined) throw new Error('语义层应产出 id')
+
+    // 改口：新事实 + 显式取代旧条，一次写入完成。
+    const after = await store.upsertSemantic(
+      [{ kind: 'preference', text: '用户偏好用 pnpm 安装依赖。' }],
+      { scope: 'global', sessionId: 's2', tags: [], supersedes: oldId },
+    )
+    const old = after.find(record => record.id === oldId)
+    const fresh = after.find(record => record.text.includes('pnpm'))
+    if (fresh === undefined) throw new Error('应写入新事实')
+    assert.equal(after.length, 2, '旧条必须留在库里可追溯')
+    assert.equal(old?.supersededBy, fresh.id, '旧条应指向取代它的新条')
+    assert.ok((old?.supersededAt ?? 0) > 0, '应记录取代时间')
+    assert.equal(fresh.supersededBy, undefined, '新条自己不应被标记')
+
+    // 重申同一句话（归一化后同 key）：那是确认，不是取代 —— 不能把自己标成已取代。
+    const reaffirmed = await store.upsertSemantic(
+      [{ kind: 'preference', text: '用户偏好用 pnpm 安装依赖' }],
+      { scope: 'global', sessionId: 's3', tags: [], supersedes: fresh.id },
+    )
+    const same = reaffirmed.find(record => record.id === fresh.id)
+    assert.equal(same?.hits, 2, '同 key 应合并并累加命中')
+    assert.equal(same?.supersededBy, undefined, '重申不得把自己标记为已取代')
+    assert.equal(reaffirmed.length, 2)
+
+    // 目标不存在时什么都不做（调用方负责先校验，这里兜住竞态）。
+    const untouched = await store.upsertSemantic(
+      [{ kind: 'fact', text: '另一条无关事实。' }],
+      { scope: 'global', sessionId: 's4', tags: [], supersedes: 'sm_不存在' },
+    )
+    assert.equal(untouched.length, 3)
+    assert.equal(untouched.filter(record => record.supersededBy !== undefined).length, 1)
+  })
+})
+
 test('forget 可按 id 删除，也支持整域清空', async () => {
   await withStore(async store => {
     await store.saveEpisodic(episodic())

@@ -17,6 +17,7 @@ import { techniqueSymbols } from './technique.js'
 import { stacksCompatible } from './stack/index.js'
 import type {
   EpisodicRecord,
+  MemoryScope,
   RecallMeta,
   RecalledMemory,
   SemanticRecord,
@@ -109,11 +110,13 @@ export interface RecallDoc {
  * 把两层记忆转成待检索文档。
  * @param episodic - 情景层记录。
  * @param semantic - 语义层记录。
+ * @param scope - 这批记录来自哪个作用域（调用方按**读取的桶**给出）。
  * @returns 文档数组。
  */
 export function toDocs(
   episodic: readonly EpisodicRecord[],
   semantic: readonly SemanticRecord[],
+  scope?: MemoryScope,
 ): RecallDoc[] {
   return [
     ...episodic.map(record => ({
@@ -123,7 +126,7 @@ export function toDocs(
       text: episodicText(record),
       // 带出 sessionId 供**自动注入**判定「这是不是本会话自己的摘要」；
       // 显式检索（`memory_search`）不看这个字段，仍能搜到本会话的记录。
-      meta: { sessionId: record.sessionId },
+      meta: { sessionId: record.sessionId, ...(scope === undefined ? {} : { scope }) },
     })),
     // `kind` 必须带出去：标签要按它区分偏好/决定/约束，否则一律显示成「长期事实」，
     // 模型会把用户偏好当成客观事实（见 `recallLabel`）。
@@ -132,7 +135,12 @@ export function toDocs(
       id: record.id,
       ts: record.updatedAt,
       text: semanticText(record),
-      meta: { kind: record.kind },
+      meta: {
+        kind: record.kind,
+        // 已被新版本取代的事实仍然可检索，但自动注入要跳过它（见 `renderInjection`）。
+        ...(record.supersededBy === undefined ? {} : { superseded: true }),
+        ...(scope === undefined ? {} : { scope }),
+      },
     })),
   ]
 }
@@ -140,9 +148,10 @@ export function toDocs(
 /**
  * 把技巧记录转成待检索文档，并附带过滤/加权所需的元信息。
  * @param records - 技巧记录。
+ * @param scope - 这批记录来自哪个作用域（调用方按**读取的桶**给出）。
  * @returns 文档数组。
  */
-export function toTechniqueDocs(records: readonly TechniqueRecord[]): RecallDoc[] {
+export function toTechniqueDocs(records: readonly TechniqueRecord[], scope?: MemoryScope): RecallDoc[] {
   return records.map(record => ({
     layer: 'technique' as const,
     id: record.id,
@@ -159,6 +168,8 @@ export function toTechniqueDocs(records: readonly TechniqueRecord[]): RecallDoc[
       evidenceCount: record.evidence.length,
       tags: record.tags,
       ...(record.domain === undefined ? {} : { domain: record.domain }),
+      ...(record.appliesTo === undefined ? {} : { appliesTo: record.appliesTo }),
+      ...(scope === undefined ? {} : { scope }),
     },
   }))
 }

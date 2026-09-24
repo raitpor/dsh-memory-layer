@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { compareVersions, parseVersion, satisfiesVersion } from '../src/stack/version.js'
 import { detectStack, mergeStack } from '../src/stack/detectors.js'
 import type { FileView } from '../src/stack/detectors.js'
-import { stackSummary, stacksCompatible } from '../src/stack/index.js'
+import { appliesToAllows, stackSummary, stacksCompatible } from '../src/stack/index.js'
 import type { StackProfile } from '../src/types.js'
 
 /** 内存文件视图：用一张「路径 → 内容」表模拟工作区。 */
@@ -138,4 +138,39 @@ test('画像摘要可读', () => {
   assert.equal(stackSummary({ languages: ['java'], frameworks: ['spring-boot'] }), 'java/spring-boot')
   assert.equal(stackSummary({ ecosystem: 'minecraft', languages: ['java'], versions: { minecraft: '1.20.1' } }), 'java, minecraft@1.20.1')
   assert.equal(stackSummary(undefined), '')
+})
+
+// ---- appliesTo 闸门（DEF-30）------------------------------------------------
+// 此前 `appliesTo` 只写不读：它进了检索语料、也被 technique_get 渲染，但没有任何过滤读它，
+// 于是一条标着 `module=settlement` 的逻辑卡在改别的模块时照样注入。判定原则与画像一致：
+// 只拦「判得出来且明确不符」的，判不出来一律放行。
+
+test('appliesTo：module 用当前轮的文件证据判定', () => {
+  const files = ['src/alpha/order.ts', 'src/alpha/order.test.ts']
+  assert.equal(appliesToAllows('module=alpha', { files }), true)
+  assert.equal(appliesToAllows('module=settlement', { files }), false, '文件都在 alpha 下')
+  assert.equal(appliesToAllows('module=alpha,module=beta', { files }), false, '逗号是多值 AND，beta 对不上')
+  assert.equal(appliesToAllows('path=src/alpha', { files }), true)
+  // 没有文件证据时不判：宁可多给一条，也不因为「这轮没提那个模块」而静默扣掉知识。
+  assert.equal(appliesToAllows('module=settlement', { files: [] }), true)
+  assert.equal(appliesToAllows('module=settlement', {}), true)
+})
+
+test('appliesTo：能对上精确版本的键才比较，认不出的键不拦', () => {
+  const stack: StackProfile = { ecosystem: 'minecraft', languages: ['java'], versions: { minecraft: '1.21.1' } }
+  assert.equal(appliesToAllows('mc=1.21.1', { stack }), true, 'mc 是 minecraft 的别名')
+  assert.equal(appliesToAllows('mc=1.20.1', { stack }), false)
+  assert.equal(appliesToAllows('mc=~1.21', { stack }), true, '区间写法交给 satisfiesVersion')
+  assert.equal(appliesToAllows('mc=1.21.1', {}), true, '没有画像时判不出来 → 放行')
+  assert.equal(appliesToAllows('react=^18', { stack }), true, '画像里没有这个键 → 放行')
+  assert.equal(appliesToAllows('branch=main', { stack }), true, '认不出的键 → 放行，写错键不该让知识消失')
+})
+
+test('appliesTo：空值、散文与半截写法都不拦', () => {
+  assert.equal(appliesToAllows(undefined, {}), true)
+  assert.equal(appliesToAllows('   ', {}), true)
+  assert.equal(appliesToAllows('只在结算流程里适用', {}), true, '散文认不出 key=value')
+  assert.equal(appliesToAllows('module=settlement', { files: ['src/beta/x.ts'] }), false)
+  // 多值里只有一项判得出来：判得出来的那一项说了算，另一项被忽略。
+  assert.equal(appliesToAllows('module=beta,branch=main', { files: ['src/beta/x.ts'] }), true)
 })

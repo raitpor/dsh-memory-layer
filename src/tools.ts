@@ -31,9 +31,10 @@ export interface MemoryToolDeps {
    * 手动写入一条长期记忆。
    * @param text - 事实正文（调用方负责脱敏）。
    * @param kind - 事实类别。
+   * @param supersedes - 被这条新事实取代的旧事实 id；缺省表示只是新增/重申。
    * @returns 写入结果说明。
    */
-  save(text: string, kind: SemanticKind): Promise<string>
+  save(text: string, kind: SemanticKind, supersedes?: string): Promise<string>
   /**
    * 删除一条记忆。
    * @param id - 记录 id，或 `*` 表示清空整个作用域。
@@ -90,23 +91,24 @@ export function createMemoryTools(deps: MemoryToolDeps): ToolDefinition[] {
 
     defineTool({
       name: 'memory_save',
-      description: `Store one long-lived fact or user preference in cross-session memory. ${LAYER_NOTE} Use it the moment the user states a durable preference or a decision that should outlive this session; do not store task-local chatter. Never store credentials, tokens or passwords.`,
+      description: `Store one long-lived fact or user preference in cross-session memory. ${LAYER_NOTE} Use it the moment the user states a durable preference or a decision that should outlive this session; do not store task-local chatter. Never store credentials, tokens or passwords. When the user CHANGES their mind about something already stored, pass supersedes with the old fact's id (from memory_search): the new text is saved and the old one stops being injected while staying in the store for reference.`,
       parameters: {
         text: { type: 'string', required: true, description: 'One standalone sentence that still makes sense without this session.' },
         kind: { type: 'string', description: "Fact category: 'fact', 'preference', 'decision' or 'constraint' (default 'fact')." },
+        supersedes: { type: 'string', description: "Id of the stored fact this one replaces (from memory_search). Use it when the user changes their mind, so the outdated fact stops being injected." },
       },
       output: {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args) {
-        return deps.save(args.text, parseKind(args.kind))
+        return deps.save(args.text, parseKind(args.kind), args.supersedes)
       },
     }),
 
     defineTool({
       name: 'memory_forget',
-      description: `Delete stored memory by the id returned from memory_search. ${LAYER_NOTE} A single-id delete searches every scope, because ids are unique across scopes; pass scope only to narrow it. Passing "*" wipes the given scope and is irreversible, so it additionally requires confirm: true and defaults to the project scope.`,
+      description: `Delete stored memory by the id returned from memory_search. ${LAYER_NOTE} A single-id delete searches every scope, because ids are unique across scopes; pass scope only to narrow it. Ids from other layers are routed: \`tq_\` to the technique layer, \`fa_\` (from failure_list) to the failure layer — a mis-recorded failure can only be removed this way, since failure_resolve merely marks it solved. Passing "*" wipes the given scope and is irreversible, so it additionally requires confirm: true and defaults to the project scope; it clears the episodic and semantic layers only, never the technique or failure layers.`,
       parameters: {
         id: { type: 'string', required: true, description: 'Memory id from memory_search, or "*" to clear a whole scope.' },
         scope: { type: 'string', description: "Scope to delete from: 'project', 'global' or 'all'. Defaults to 'all' for a single id and 'project' for '*'." },
@@ -164,16 +166,23 @@ export interface TechniqueApplyInput {
 
 /** `technique_save` 的输入：调用方补齐技术栈与证据后落盘。 */
 export interface TechniqueSaveInput {
+  /**
+   * 已存在的技巧 id（或唯一前缀）。
+   *
+   * 给定时是**就地更新**：只覆盖显式传了的字段，计数、状态、验收记录与适用栈全部保留。
+   * 不给时是新建草稿（`name` / `when` / `summary` 三者必填）。
+   */
+  id?: string
   /** 知识形态。 */
-  kind: TechniqueKind
+  kind?: TechniqueKind
   /** 一句话技巧名。 */
-  name: string
+  name?: string
   /** 一句话可执行要点；缺省时从 `summary` 首句派生。 */
   gist?: string
   /** 触发条件。 */
-  when: string
+  when?: string
   /** 主体说明。 */
-  summary: string
+  summary?: string
   /** 有序步骤。 */
   steps?: string[]
   /** 不变量与顺序约束（业务规则 / 逻辑卡常用）。 */
@@ -334,16 +343,19 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
     defineTool({
       name: 'technique_save',
       description: [
-        'Store one reusable technique as an unverified draft.',
+        'Store one reusable technique as an unverified draft, or update one you already have.',
         'Use it for durable, reusable KNOWLEDGE (how to call an API, a business rule, a procedure, a pitfall),',
         'never for a task description or for code you simply want to keep.',
         'Do not paste full implementations: summary is the payload, example is at most a few illustrative lines.',
+        'Pass id (from technique_search / technique_get) to fix an existing entry in place: only the fields you',
+        'give are replaced, and its counters, status and verification records are kept.',
       ].join(' '),
       parameters: {
-        name: { type: 'string', required: true, description: 'One-line statement of the technique.' },
+        id: { type: 'string', description: 'Existing technique id or unique prefix (e.g. tq_f6233ebe) to update in place. When given, name/when/summary are optional and only the fields you pass are replaced.' },
+        name: { type: 'string', description: 'One-line statement of the technique. Required when creating.' },
         gist: { type: 'string', description: 'One-line actionable core (<=90 chars) shown in search results; derived from summary when omitted.' },
-        when: { type: 'string', required: true, description: 'Trigger: the symptom, intent or task type that should recall it.' },
-        summary: { type: 'string', required: true, description: 'The method itself, in 2-4 sentences.' },
+        when: { type: 'string', description: 'Trigger: the symptom, intent or task type that should recall it. Required when creating.' },
+        summary: { type: 'string', description: 'The method itself, in 2-4 sentences. Required when creating.' },
         kind: { type: 'string', description: "'api-usage', 'business-rule', 'procedure', 'pitfall', 'env-recipe' or 'code-logic' (default 'procedure')." },
         steps: { type: 'array', items: { type: 'string' }, description: 'Optional ordered steps, as prose. For kind=code-logic this is the logic order.' },
         invariants: { type: 'array', items: { type: 'string' }, description: 'Invariants and ordering constraints that must hold (essential for business-rule and code-logic).' },
@@ -364,12 +376,24 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args) {
+        const id = typeof args.id === 'string' && args.id.trim().length > 0 ? args.id.trim() : undefined
+        // 两种形态在**契约层**分流：新建要三件套齐全，更新要至少给一个可改字段。
+        // 缺字段时返回一句可照做的说明，而不是抛错让模型去猜（与 technique_apply 同口径）。
+        if (id === undefined) {
+          if (args.name === undefined || args.when === undefined || args.summary === undefined) {
+            return 'Provide name, when and summary to create a technique, or id plus the fields to update. Nothing was saved.'
+          }
+        } else if (!UPDATABLE_TECHNIQUE_FIELDS.some(field => args[field] !== undefined)) {
+          return `Provide at least one of ${UPDATABLE_TECHNIQUE_FIELDS.join(', ')} alongside id. Nothing was saved.`
+        }
+        const kind = parseOptionalTechniqueKind(args.kind)
         const input: TechniqueSaveInput = {
-          kind: parseTechniqueKind(args.kind),
-          name: args.name,
+          ...(id === undefined ? {} : { id }),
+          ...(kind === undefined ? {} : { kind }),
+          ...(args.name === undefined ? {} : { name: args.name }),
           ...(args.gist === undefined ? {} : { gist: args.gist }),
-          when: args.when,
-          summary: args.summary,
+          ...(args.when === undefined ? {} : { when: args.when }),
+          ...(args.summary === undefined ? {} : { summary: args.summary }),
           ...(args.steps === undefined ? {} : { steps: args.steps }),
           ...(args.invariants === undefined ? {} : { invariants: args.invariants }),
           ...(args.subject === undefined ? {} : { subject: args.subject }),
@@ -513,11 +537,22 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
 }
 
 /** 解析技巧形态，未知取值按 `procedure` 处理。 */
-function parseTechniqueKind(value: string | undefined): TechniqueKind {
+/**
+ * 解析**可选**的技巧类别：没给就是 `undefined`（按 id 更新时表示「保持原类别」）。
+ * @param value - 模型给出的取值。
+ * @returns 合法类别或 `undefined`。
+ */
+function parseOptionalTechniqueKind(value: string | undefined): TechniqueKind | undefined {
   return typeof value === 'string' && (TECHNIQUE_KINDS as readonly string[]).includes(value)
     ? value as TechniqueKind
-    : 'procedure'
+    : undefined
 }
+
+/** `technique_save` 按 id 更新时可以覆盖的内容字段（用于「至少给一个」的校验与回执）。 */
+export const UPDATABLE_TECHNIQUE_FIELDS = [
+  'kind', 'name', 'gist', 'when', 'summary', 'steps', 'invariants', 'subject', 'location',
+  'reuse', 'appliesTo', 'apiSymbols', 'example', 'exampleLanguage', 'pitfalls', 'verify', 'domain', 'tags',
+] as const
 
 /**
  * 解析 scope 参数。

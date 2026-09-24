@@ -124,3 +124,14 @@ test('情景文档带出 sessionId，供注入侧挡掉本会话自己的摘要'
   const sem = toDocs([], [{ id: 'sm_1', key: 'k', kind: 'fact', text: 't', hits: 1, sources: ['s1'], tags: [], ts: 1, updatedAt: 1, scope: 'global', partition: 'default' }])
   assert.equal(sem[0]?.meta?.sessionId, undefined)
 })
+
+test('toDocs 的作用域标记取自调用方给的桶，而不是记录里的 scope 字段', () => {
+  // 记录里写着 `global`，但调用方说这批来自项目桶（两个桶是两个目录，桶才是事实来源）：
+  // 标记必须听调用方的，否则 `memory_search(scope)` 会按一条冗余字段把结果放错作用域。
+  const episodicRecord = episodic({ id: 'ep_p', scope: 'global' })
+  const semanticRecord = { id: 'sm_g', key: 'k', kind: 'fact' as const, text: 't', hits: 1, sources: ['s1'], tags: [], ts: 1, updatedAt: 1, scope: 'project' as const, partition: 'default' }
+  assert.equal(toDocs([episodicRecord], [], 'project')[0]?.meta?.scope, 'project')
+  assert.equal(toDocs([], [semanticRecord], 'global')[0]?.meta?.scope, 'global')
+  // 不传作用域时保持原样（老调用方与注入路径不受影响）。
+  assert.equal(toDocs([episodicRecord], [])[0]?.meta?.scope, undefined)
+})

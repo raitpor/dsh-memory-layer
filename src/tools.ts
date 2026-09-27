@@ -497,6 +497,9 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
         'This is an explicit, budgeted operation — it scans many files, so run it when the user asks to learn',
         'from a code base, not on every task. Produced entries are unverified drafts.',
         'It stores summarised knowledge, never copies of the implementation.',
+        'Call-site census (how many times this repo calls X, spread over how many files) is returned as a report',
+        'but NOT stored as cards by default — that is repository observation, not reusable knowledge.',
+        'Set `mineStoreStructuralCards: true` if you want those structural cards stored as well.',
       ].join(' '),
       parameters: {
         path: { type: 'string', description: 'Repository path to mine. Defaults to the current working directory.' },

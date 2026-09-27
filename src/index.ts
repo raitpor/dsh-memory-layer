@@ -112,6 +112,7 @@ import type {
   ReflectionMetrics,
   TechniqueDraft,
   TechniqueRecord,
+  TechniqueStatus,
 } from './types.js'
 
 /** Cordis 插件显示名，同时用于诊断与 logger 名字。 */
@@ -247,6 +248,13 @@ export interface Config {
   /** 额外排除的 glob。 */
   mineExclude?: string[]
   /**
+   * 是否把「结构观察」（本仓库的调用面普查：N 处调用、M 个文件）也落成技巧卡。
+   *
+   * 默认 `false`：观察进挖掘回执，不进检索语料。实测这类卡在一个真实库里占过 **24.7%**，
+   * 且正文自认「具体前置条件与顺序需要结合实现确认」—— 存进去只会压低信噪比。
+   */
+  mineStoreStructuralCards?: boolean
+  /**
    * 导出 `SKILL.md` 的目标目录；缺省为 `<DSH_HOME>/skills`（通常 `~/.dsh/skills`）。
    *
    * 每条技巧落在 `<目录>/<skill 名>/SKILL.md`。
@@ -326,20 +334,30 @@ const SEMANTIC_KINDS: readonly string[] = ['fact', 'preference', 'decision', 'co
  * 所以这里只接受四个已知取值，其余一律回落 `fact` —— 白名单比「事后净化」更稳：
  * 标签本就不该出现词表以外的任何字符。
  *
+ * 技巧层还要带上**信任状态**：`memory_search` 不过滤草稿（只有自动注入过滤），因此同一次
+ * 检索里既可能返回 validated 也可能返回 draft；两者都印成 `technique` 会让模型把未验证的
+ * 知识当成已验证的用 —— 而它的采用回报正是**推动状态迁移的唯一信号**。状态只在工具输出里印
+ * （`status` 参数由 `formatHit` 传入），注入路径不传，避免每请求多花字符。
+ *
  * @param layer - 记录所属层。
  * @param kind - 语义记录的类别；其余层忽略。按不可信输入对待。
+ * @param options - 附加标注：`superseded`（语义）与 `status`（技巧）。
  * @returns 供模型阅读的标签。
  */
 export function recallLabel(
   layer: 'episodic' | 'semantic' | 'technique' | 'failure',
   kind?: unknown,
-  superseded?: boolean,
+  options: { superseded?: boolean; status?: TechniqueStatus } = {},
 ): string {
+  if (layer === 'technique') {
+    const status = options.status
+    return status === undefined ? LAYER_LABELS.technique : `${LAYER_LABELS.technique} (${status})`
+  }
   if (layer !== 'semantic') return LAYER_LABELS[layer]
   const safe = typeof kind === 'string' && SEMANTIC_KINDS.includes(kind) ? kind : 'fact'
   // 已被取代的事实只在**显式检索**里出现（注入已过滤）。标注是必须的：模型否则会把
   // 一句已经作废的偏好当成现行约定。
-  const suffix = superseded === true ? ' (superseded)' : ''
+  const suffix = options.superseded === true ? ' (superseded)' : ''
   return `${SEMANTIC_LABEL_PREFIX} ${safe}${suffix}`
 }
 
@@ -434,6 +452,7 @@ export const Config: z<Config> = z.object({
   mineTimeoutMs: z.natural().min(1000).max(600_000).default(120_000),
   mineInclude: z.array(z.string()).default([]),
   mineExclude: z.array(z.string()).default([]),
+  mineStoreStructuralCards: z.boolean().default(false),
   skillExportDir: z.string(),
   skillAllowedTools: z.array(z.string()).default([]),
 })
@@ -520,6 +539,7 @@ interface Settings {
   mineTimeoutMs: number
   mineInclude: string[]
   mineExclude: string[]
+  mineStoreStructuralCards: boolean
   skillExportDir: string
   skillAllowedTools: string[]
 }
@@ -1812,9 +1832,28 @@ export function apply(ctx: Context, config: Config): void {
     return current?.route
   }
 
-  /** 挖掘产出的来源标记：走过模型就算 `model`，否则 `rule`。 */
-  const outcomOrigin = (outcome: { stats: { modelCalls: number } }): TechniqueRecord['provenance'] =>
-    outcome.stats.modelCalls > 0 ? 'model' : 'rule'
+  /**
+   * 库中已有的主题标签，按使用频次倒序取前 N 个 —— 喂给挖掘提示以收敛 `domain` 写法。
+   *
+   * 为什么必须这么做：`techniqueKey(name, when, domain)` 把 domain 算进合并键，实测同一主题
+   * 在一个库里被写成 **28 种**不同标签（`minecraft-modding` / `Minecraft Forge modding / …`），
+   * 于是本该合并的近重复条目全部新建。给词表是成本最低的收敛手段。
+   *
+   * @param limit - 最多给出多少个标签。
+   * @returns 主题标签列表。
+   */
+  const knownDomainsForMining = (limit = 24): string[] => {
+    const counts = new Map<string, number>()
+    for (const record of techniqueById.values()) {
+      const domain = record.domain?.trim()
+      if (domain === undefined || domain.length === 0) continue
+      counts.set(domain, (counts.get(domain) ?? 0) + 1)
+    }
+    return [...counts.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, limit)
+      .map(([domain]) => domain)
+  }
 
   /** 判断挖掘出的草稿是否允许写入目标作用域（confidential 默认不进全局域）。 */
   const storableDraft = (draft: TechniqueDraft, scope: MemoryScope): boolean =>
@@ -2291,9 +2330,11 @@ export function apply(ctx: Context, config: Config): void {
           exampleMaxLines: settings.exampleMaxLines,
           exampleMaxChars: settings.exampleMaxChars,
           timeoutMs: settings.mineTimeoutMs,
+          storeStructuralCards: settings.mineStoreStructuralCards,
           ...(settings.mineInclude.length === 0 ? {} : { include: settings.mineInclude }),
           ...(settings.mineExclude.length === 0 ? {} : { exclude: settings.mineExclude }),
         },
+        knownDomains: knownDomainsForMining(),
         ...(callable === undefined ? {} : { call: callable }),
         model,
       })
@@ -2302,24 +2343,44 @@ export function apply(ctx: Context, config: Config): void {
       const scope = settings.scopeTechnique
       const cwd = scope === 'project' ? projectCwd() : undefined
       const storable = outcome.candidates.filter(candidate => storableDraft(candidate.draft, scope))
-      const stored = storable.length === 0
-        ? { created: 0, merged: 0 }
-        : await store.upsertTechniques(storable.map(candidate => candidate.draft), {
+      // 来源按**候选**打标，而不是「这一轮跑过模型就算 model」—— 否则规则路径产出的结构卡
+      // 会被标成模型知识（实测 116 张普查卡全部如此），来源标记本身就失真了。
+      let created = 0
+      let merged = 0
+      for (const origin of ['model', 'rule'] as const) {
+        const group = storable.filter(candidate => candidate.origin === origin)
+        if (group.length === 0) continue
+        const written = await store.upsertTechniques(group.map(candidate => candidate.draft), {
           scope,
           ...(cwd === undefined ? {} : { cwd }),
           partition: settings.partition,
           sessionId: current?.sessionId ?? 'mine',
-          provenance: outcomOrigin(outcome),
+          provenance: origin,
         })
+        created += written.created
+        merged += written.merged
+      }
       await refresh(cwd)
 
       const { stats } = outcome
+      // 结构观察进**报告**而不是进库：它是「这个仓库长什么样」，不是可复用的知识。
+      const topObservations = [...outcome.observations]
+        .sort((left, right) => right.occurrences - left.occurrences)
+        .slice(0, 5)
+        .map(item => `  ${item.symbol} ×${item.occurrences}（${item.files} 文件${item.roles.length === 0 ? '' : `，${item.roles.join('/')}`}）`)
       return [
         `Mined ${root} in ${stats.durationMs}ms:`,
         `- files: ${stats.scanned} scanned (${stats.skippedCached} cached, ${stats.skippedLarge} oversized), ${stats.visited} visited`,
         `- clusters: ${stats.clusters}, model calls: ${stats.modelCalls}${stats.timedOut ? ' (timed out, partial result kept)' : ''}`,
         `- candidates: ${outcome.candidates.length} passed, ${outcome.rejected.length} rejected by leak check`,
-        `- stored as drafts: ${stored.created} new, ${stored.merged} merged`,
+        `- stored as drafts: ${created} new, ${merged} merged`,
+        ...(outcome.observations.length === 0 || settings.mineStoreStructuralCards
+          ? []
+          : [
+            `- structural observations (reported only, NOT stored — call-site census is not reusable knowledge):`,
+            ...topObservations,
+            `  set mineStoreStructuralCards=true to store these as cards anyway`,
+          ]),
         ...outcome.rejected.slice(0, 5).map(item => `  rejected: ${item.name} — ${item.reason}`),
       ].join('\n')
     },
@@ -2647,6 +2708,7 @@ function resolveSettings(config: Config): Settings {
     mineTimeoutMs: config.mineTimeoutMs ?? 120_000,
     mineInclude: config.mineInclude ?? [],
     mineExclude: config.mineExclude ?? [],
+    mineStoreStructuralCards: config.mineStoreStructuralCards ?? false,
     skillExportDir: resolveSkillDir(config.skillExportDir),
     skillAllowedTools: config.skillAllowedTools ?? [],
   }
@@ -2842,7 +2904,10 @@ function keepInsideWorkspace(files: readonly string[], cwd: string | undefined):
  * @returns 多行文本。
  */
 function formatHit(row: RecalledMemory): string {
-  const kind = recallLabel(row.layer, row.meta?.kind, row.meta?.superseded)
+  const kind = recallLabel(row.layer, row.meta?.kind, {
+    ...(row.meta?.superseded === undefined ? {} : { superseded: row.meta.superseded }),
+    ...(row.meta?.status === undefined ? {} : { status: row.meta.status }),
+  })
   return `${row.id} (${kind}, score ${row.score.toFixed(2)}, ${new Date(row.ts).toISOString()})\n  ${sanitizeForPrompt(row.text)}`
 }
 

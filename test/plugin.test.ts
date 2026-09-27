@@ -2491,7 +2491,12 @@ test('technique_learn 从真实代码库挖掘并落盘为草稿，且不泄露�
       'export const ping = () => Transport.post({})',
     ].join('\n'), 'utf8')
 
-    const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+    // 本用例考察挖掘**落盘**链路（证据、来源、路径不泄露），因此显式打开结构卡开关：
+    // 默认已不把仓库普查当技巧存（见 `mineStoreStructuralCards`）。
+    const { fake, root, dispose } = await setup({
+      reflectOnSessionEnd: false,
+      mineStoreStructuralCards: true,
+    })
     try {
       fake.emit('session/created', fakeSession('s1', repo))
       await fake.flush()
@@ -2518,6 +2523,139 @@ test('technique_learn 从真实代码库挖掘并落盘为草稿，且不泄露�
       ))
       assert.match(second, /\(2 cached/u, `二次挖掘应命中全部未变文件：${second}`)
       assert.match(second, /clusters: 0/u, '全部命中缓存时不再产生候选，这正是增量挖掘的目的')
+    } finally {
+      await dispose()
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true })
+  }
+})
+
+test('结构卡的来源是 rule，不能被「这一轮跑过模型」整轮带成 model', async () => {
+  // 旧实现按「整轮是否发生模型调用」打标：只要跑过模型，规则路径产出的普查卡也会被记成
+  // `provenance: model`（实测 116 张全部如此）。来源标记决定「这条知识是谁给的」，不能失真。
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-mine-origin-'))
+  try {
+    await mkdir(join(repo, 'src'), { recursive: true })
+    const body = Array.from({ length: 8 }, (_, index) => `  client.send(payload${index})`).join('\n')
+    await writeFile(join(repo, 'src/app.ts'), `export function run() {\n${body}\n}\n`, 'utf8')
+
+    const counter = { calls: 0 }
+    const { fake, root, dispose } = await setup(
+      { reflectOnSessionEnd: false, provider: 'test', model: 'test', mineStoreStructuralCards: true },
+      true,
+      { llm: fakeLlm({ techniques: [] }, counter) },
+    )
+    try {
+      fake.emit('session/created', fakeSession('s1', repo))
+      await fake.flush()
+      const report = String(await toolOf(fake, 'technique_learn').execute(
+        { path: repo } as never, undefined as never,
+      ))
+      // 前提：这一轮**确实**跑过模型（否则这条用例测不到打标口径）。
+      assert.match(report, /model calls: [1-9]/u, `本轮应有模型调用：${report}`)
+      assert.match(report, /stored as drafts: [1-9]/u, `结构卡应落盘：${report}`)
+
+      const records = await new MemoryStore(root).readTechniques('global')
+      assert.ok(records.length > 0)
+      assert.ok(
+        records.every(record => record.provenance === 'rule'),
+        `结构卡的来源必须是 rule，实际：${records.map(record => record.provenance).join(',')}`,
+      )
+    } finally {
+      await dispose()
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true })
+  }
+})
+
+test('technique_learn 默认不把仓库普查当技巧存，但把它报给人看（SNR 修复）', async () => {
+  // 实测：规则路径对每个达标簇都产一张「N 处调用、M 个文件」的卡，在一个真实库里占到 24.7%，
+  // 且正文自认「需要结合实现确认」。默认行为改成「观察进回执、不进库」。
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-mine-snr-'))
+  try {
+    await mkdir(join(repo, 'src/app'), { recursive: true })
+    await mkdir(join(repo, 'src/client'), { recursive: true })
+    await writeFile(join(repo, 'src/app/handler.ts'), [
+      "import { client } from '../client/client'",
+      'export function handle(event: Event) {',
+      '  client.send(event.payload)',
+      '  client.send(event.payload, { retry: true })',
+      '  client.send(event.payload, { retry: true, urgent: true })',
+      '  AuditLog.record("handled")',
+      '  AuditLog.record("handled.again")',
+      '}',
+    ].join('\n'), 'utf8')
+    await writeFile(join(repo, 'src/client/client.ts'), [
+      'export const client = {',
+      '  send: (payload: unknown) => Transport.post(payload),',
+      '}',
+    ].join('\n'), 'utf8')
+
+    const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+    try {
+      fake.emit('session/created', fakeSession('s1', repo))
+      await fake.flush()
+
+      const report = String(await toolOf(fake, 'technique_learn').execute(
+        { path: repo } as never, undefined as never,
+      ))
+      assert.match(report, /candidates: 0 passed/u, `默认不应产出候选：${report}`)
+      assert.match(report, /stored as drafts: 0 new/u, `默认不应落盘：${report}`)
+      // 但观察必须在回执里 —— 信息没丢，只是不当知识。
+      assert.match(report, /structural observations \(reported only, NOT stored/u, `应报告结构观察：${report}`)
+      assert.match(report, /client\.send ×3/u, `观察里要有调用次数：${report}`)
+      assert.match(report, /mineStoreStructuralCards=true/u, '应告诉用户怎么恢复老行为')
+      assert.equal((await new MemoryStore(root).readTechniques('global')).length, 0, '库里不应有任何普查卡')
+    } finally {
+      await dispose()
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true })
+  }
+})
+
+test('挖掘时把库里已有的 domain 词表喂给模型（防止同一主题写成几十种标签）', async () => {
+  // domain 是合并键的一部分：写法碎片化会让本该合并的近重复条目全部新建（实测同一主题 28 种写法）。
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-mine-domain-'))
+  const prompts: string[] = []
+  try {
+    await mkdir(join(repo, 'src'), { recursive: true })
+    const body = Array.from({ length: 12 }, (_, index) => `  client.send(payload${index})`).join('\n')
+    await writeFile(join(repo, 'src/app.ts'), `export function run() {\n${body}\n}\n`, 'utf8')
+
+    const counter = { calls: 0 }
+    const llm = {
+      stream: async function* stream(options: { system?: string }) {
+        counter.calls += 1
+        prompts.push(String(options.system ?? ''))
+        const text = '{"techniques":[]}'
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+      },
+    }
+    // 挖掘要有模型路由才会走模型路径：与其它模型路径用例同口径，用 provider/model 配置给出路由。
+    const { fake, dispose } = await setup(
+      { reflectOnSessionEnd: false, provider: 'test', model: 'test' },
+      true,
+      { llm },
+    )
+    try {
+      fake.emit('session/created', fakeSession('s1', repo))
+      await fake.flush()
+      // 先在库里放一条带 domain 的技巧，它应当出现在挖掘提示的词表里。
+      await toolOf(fake, 'technique_save').execute({
+        name: '既有主题条目', when: '需要时', summary: '正文。', domain: 'minecraft-modding',
+      } as never, undefined as never)
+      await toolOf(fake, 'technique_learn').execute({ path: repo } as never, undefined as never)
+
+      assert.ok(prompts.length > 0, '应发生模型调用')
+      assert.ok(
+        prompts.some(prompt => prompt.includes('Known domain labels') && prompt.includes('minecraft-modding')),
+        `挖掘提示里应带已有 domain 词表：${prompts[0]?.slice(-200)}`,
+      )
     } finally {
       await dispose()
     }

@@ -369,6 +369,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `mineMaxFiles` / `mineMaxBytes` | `200` / `524288` | 单次挖掘的文件数上限与单文件字节上限 |
 | `mineMaxModelCalls` | `8` | 单次挖掘的模型调用次数上限 |
 | `mineMinOccurrences` | `2` | 结构候选成为技巧所需的最小出现次数 |
+| `mineStoreStructuralCards` | `false` | 是否把**结构观察**（本仓库的调用面普查：N 处调用、M 个文件）也落成技巧卡。默认只把观察写进挖掘回执，不入库——实测这类卡在一个真实库里占过 **24.7%**，且正文自认「需要结合实现确认」，属于仓库观察而非可复用知识 |
 | `mineTimeoutMs` | `120000` | 单次挖掘的总时长上限；超时保留已产出结果 |
 | `mineInclude` / `mineExclude` | `[]` | 额外包含 / 排除的 glob |
 | `skillExportDir` | `<DSH_HOME>/skills` | 导出 `SKILL.md` 的目标目录 |
@@ -576,7 +577,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（307 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（312 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 
@@ -634,6 +635,13 @@ npm test            # 构建 + node --test（307 个用例：存储 / 召回 / �
   由用户显式决定。
 - **挖掘是浅层结构分析**：不做语法树解析（否则要为每种语言引入解析器，与零依赖冲突），
   因此规则路径的产出偏「描述性」，真正的「为什么/什么时候」依赖模型路径。
+- **挖掘的信噪比取决于「什么算知识」这条线画在哪里**：规则路径只能看到结构（调用面、参数个数、
+  文件分布），因此它产出的「N 处调用、M 个文件」是**仓库观察**，不是可复用知识 —— 默认只报给人看，
+  不落成技巧卡（这也让「无模型时零产出」成为默认行为，需要老行为就显式打开
+  `mineStoreStructuralCards`）。真正决定入库质量的是模型路径的提示词：它被明确要求**禁止复述普查、
+  标题不得以 `<Placeholder>` 开头、`domain` 复用已有词表**（同主题写出 28 种标签会让合并键失效，
+  近重复条目因此全部新建）。即便如此，挖掘仍只是**草稿**来源：无人验收时它会持续积累低价值条目，
+  定期用 `technique_search(includeDrafts: true)` 抽查并按 id 清理是必要的维护动作。
 - **候选只在出现 ≥`mineMinOccurrences` 次时成形**：只调用一次的写法不会被提炼，
   这是刻意的噪声控制，代价是「孤例技巧」抓不到。
 - **`.gitignore` 只支持常用子集**：字符类、转义等复杂语法按字面处理；

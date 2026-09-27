@@ -433,6 +433,16 @@ export interface TechniqueRecord {
    * 也就不会推动状态迁移。老记录没有该字段，读取时按空数组处理。
    */
   verifications?: TechniqueVerification[]
+  /**
+   * 被**显式检索**（`technique_search` / `technique_get`）返回给模型的次数。
+   *
+   * 为什么单独记：`hits` 只在合并时 +1，检索不计数 —— 于是「这条草稿被看过但没有回报采用」
+   * 与「它从来没被看见」在数据上无法区分，而冷启动问题正是卡在后者。有它才能算出
+   * 「检索过但未采用」的真实比例（自动注入不计：那是每请求都会发生的事，记账会变成写风暴）。
+   */
+  retrieveCount?: number
+  /** 最近一次被显式检索的时间（Unix 毫秒）。 */
+  lastRetrievedAt?: number
   /** 产出途径。 */
   provenance: 'model' | 'rule' | 'human'
 }

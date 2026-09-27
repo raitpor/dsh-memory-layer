@@ -21,7 +21,11 @@ import {
   isIgnored,
   languageOf,
   mineRepository,
+  modelCandidates,
   parseIgnoreLines,
+  MINE_PROMPT_VERSION,
+  MINE_SYSTEM_PROMPT,
+  mineSystemPrompt,
   ruleCandidate,
   scanRepository,
   withCacheEntries,
@@ -217,9 +221,11 @@ test('P3-① 多语言仓库产出 ≥5 条带证据草稿', async () => {
     stack: JAVA_STACK,
     cache: emptyMineCache(),
     model: '',
+    // 本用例考察的是**结构候选的形状**（证据、占位符、无代码），而默认已不落这类卡，
+    // 所以显式打开开关 —— 这也正是这个开关保留的意义。
     options: {
       maxFiles: 100, maxBytes: 100_000, minOccurrences: 2, maxModelCalls: 0,
-      exampleMaxLines: 8, exampleMaxChars: 480, timeoutMs: 10_000,
+      exampleMaxLines: 8, exampleMaxChars: 480, timeoutMs: 10_000, storeStructuralCards: true,
     },
   })
   const apiCandidates = outcome.candidates.filter(candidate => candidate.draft.kind === 'api-usage')
@@ -233,20 +239,67 @@ test('P3-① 多语言仓库产出 ≥5 条带证据草稿', async () => {
   }
 })
 
-test('P3-④ 没有模型时规则路径仍产出候选', async () => {
-  const outcome = await mineRepository({
-    view: repoView(FIXTURE),
-    stack: JAVA_STACK,
-    cache: emptyMineCache(),
-    model: '',
-    options: {
-      maxFiles: 100, maxBytes: 100_000, minOccurrences: 2, maxModelCalls: 0,
-      exampleMaxLines: 8, exampleMaxChars: 480, timeoutMs: 10_000,
-    },
+test('P3-④ 普查卡默认不落盘：结构观察进报告，不污染检索语料', async () => {
+  const base = {
+    maxFiles: 100, maxBytes: 100_000, minOccurrences: 2, maxModelCalls: 0,
+    exampleMaxLines: 8, exampleMaxChars: 480, timeoutMs: 10_000,
+  }
+  const dflt = await mineRepository({
+    view: repoView(FIXTURE), stack: JAVA_STACK, cache: emptyMineCache(), model: '', options: base,
   })
-  assert.equal(outcome.stats.modelCalls, 0)
-  assert.ok(outcome.candidates.length > 0, '无模型时功能不得静默失效')
-  assert.ok(outcome.candidates.every(candidate => candidate.origin === 'rule'))
+  assert.equal(dflt.stats.modelCalls, 0)
+  // 默认：一张卡都不落，但**观察一条不少**（信息没丢，只是不当作知识入库）。
+  assert.equal(dflt.candidates.length, 0, '默认不得把仓库普查当技巧存下来')
+  assert.ok(dflt.observations.length > 0, '结构观察必须照常产出（供报告与人工判断）')
+  const top = [...dflt.observations].sort((l, r) => r.occurrences - l.occurrences)[0]
+  assert.ok((top?.occurrences ?? 0) >= 2, '观察里要有真实调用次数')
+  assert.ok((top?.files ?? 0) >= 1, '观察里要有文件数')
+
+  // 开关打开：老行为保留，且来源必须是 rule（而不是「这一轮没跑模型所以是 rule」）。
+  const kept = await mineRepository({
+    view: repoView(FIXTURE), stack: JAVA_STACK, cache: emptyMineCache(), model: '',
+    options: { ...base, storeStructuralCards: true },
+  })
+  assert.ok(kept.candidates.length > 0, '开关打开后应恢复结构候选')
+  assert.ok(
+    kept.candidates.every(candidate => candidate.origin === 'rule'),
+    '结构候选的来源必须是 rule',
+  )
+})
+
+test('提示词明确禁止「仓库普查当知识」，并要求复用已有 domain 词表', () => {
+  // 这一条是从真实库上量出来的：规则路径每个达标簇都产一张「N 处调用、M 个文件」的卡，
+  // 在一个真实库里占到 **24.7%**，且正文自认「需要结合实现确认」。仅去掉规则路径还不够 ——
+  // 模型路径同样会复述普查，所以必须在提示里禁止，并把已有主题词表喂进去。
+  assert.match(MINE_SYSTEM_PROMPT, /never write call counts, file counts/u)
+  assert.match(MINE_SYSTEM_PROMPT, /return \{"techniques":\[\]\} instead of a census card/u)
+  assert.match(MINE_SYSTEM_PROMPT, /must NOT start with a <Placeholder>/u)
+  assert.match(MINE_SYSTEM_PROMPT, /REUSE one from the known list below/u)
+
+  const prompt = mineSystemPrompt(['minecraft-modding', 'build-tooling'])
+  assert.match(prompt, /Known domain labels/u)
+  assert.match(prompt, /minecraft-modding \| build-tooling/u, '词表要原样给进去，模型才能照着复用')
+  assert.equal(mineSystemPrompt([]), MINE_SYSTEM_PROMPT, '没有词表时提示词保持原样')
+
+  // 提示版本换代会作废增量缓存 —— 否则重挖还会用旧提示，改进等于没生效。
+  assert.equal(MINE_PROMPT_VERSION, 'p3')
+})
+
+test('模型路径收到的系统提示里带着已有 domain 词表', async () => {
+  const seen: string[] = []
+  const call = async (system: string): Promise<string> => {
+    seen.push(system)
+    return '{"techniques":[]}'
+  }
+  const file: ScannedFile = {
+    path: 'src/app/handler.ts', role: 'service-layer', language: 'typescript',
+    content: FIXTURE['src/app/handler.ts'] as string,
+  }
+  const cluster = clusterSymbols([analyzeSource(file)], 2)[0]
+  assert.ok(cluster !== undefined)
+  await modelCandidates(cluster, JAVA_STACK, call, ['minecraft-modding'])
+  assert.equal(seen.length, 1)
+  assert.match(seen[0] ?? '', /minecraft-modding/u, '模型必须看到已有主题词表')
 })
 
 test('P3-② 产出是总结性知识：无完整实现，示例被压到硬上限并占位符化', async () => {
@@ -328,10 +381,9 @@ test('P3-③b 模型逐字抄录来源时该候选被拒绝入库', async () => 
   })
   assert.ok(outcome.rejected.length > 0, '逐字抄录的候选必须被拒绝')
   assert.match(outcome.rejected[0]?.reason ?? '', /逐字重合/u)
-  assert.ok(
-    outcome.candidates.every(candidate => candidate.origin === 'rule'),
-    '通过的只应是规则候选',
-  )
+  // 默认不落结构卡，所以逐字抄录被拒之后，本轮应当**一张都不剩** ——
+  // 原来这里写的是 `every(origin === 'rule')`，在空数组上是空过断言。
+  assert.equal(outcome.candidates.length, 0, '逐字抄录的候选被拒后不应有兜底卡混进来')
 })
 
 test('P3-⑤ 二次挖掘跳过未变文件，文件变化后重新处理', async () => {

@@ -496,6 +496,43 @@ function repoAlias(root: string): string {
 }
 
 /** 由一簇调用点生成规则候选：只陈述**结构事实**，不做语义臆测。 */
+/**
+ * 一次挖掘里「结构观察」的记录。
+ *
+ * 它与技巧卡的分工：**观察说的是这个仓库长什么样**（调用面、分布、参数个数），
+ * 是给这次挖掘的人看的报告；**技巧卡说的是可复用的知识**（什么时候用、为什么、什么会出错）。
+ * 把观察当技巧存进库，就是往检索语料里灌仓库普查 —— 实测占过全库 24.7%，
+ * 且每一条都在正文里自认「具体前置条件与顺序需要结合实现确认」。
+ */
+export interface StructuralObservation {
+  /** 规范化调用名。 */
+  symbol: string
+  /** 调用点总数。 */
+  occurrences: number
+  /** 涉及文件数。 */
+  files: number
+  /** 涉及角色（已排除 test）。 */
+  roles: string[]
+  /** 观察到的参数个数。 */
+  arities: number[]
+}
+
+/**
+ * 从一个簇里抽出结构观察（零成本，永远记录）。
+ *
+ * @param cluster - 调用簇。
+ * @returns 观察记录。
+ */
+export function structuralObservation(cluster: SymbolCluster): StructuralObservation {
+  return {
+    symbol: cluster.symbol,
+    occurrences: cluster.occurrences,
+    files: cluster.files.length,
+    roles: cluster.roles.filter(role => role !== 'test'),
+    arities: [...cluster.arities].sort((left, right) => left - right),
+  }
+}
+
 export function ruleCandidate(cluster: SymbolCluster, stack: StackProfile, root: string): MineCandidate {
   const roles = cluster.roles.filter(role => role !== 'test')
   const roleText = roles.length > 0 ? roles.join('/') : 'other'
@@ -535,7 +572,7 @@ export function ruleCandidate(cluster: SymbolCluster, stack: StackProfile, root:
   }
 }
 
-/** 挖掘用的模型提示：只产出**总结性知识**，禁止抄录实现。 */
+/** 挖掘用的模型提示：只产出**总结性知识**，禁止抄录实现，也禁止把仓库普查当知识。 */
 export const MINE_SYSTEM_PROMPT = [
   'You mine reusable engineering knowledge from a code base excerpt.',
   'Return ONE JSON object and nothing else, in this shape:',
@@ -543,6 +580,14 @@ export const MINE_SYSTEM_PROMPT = [
   + '"codeLogic":{"subject":string,"location":string,"when":string,"summary":string,"steps":string[],"invariants":string[],"reuse":string,"appliesTo":string,"tags":string[]}|null}',
   'Rules:',
   '- Emit at most 2 techniques for the given excerpt; prefer one high-quality entry over several vague ones.',
+  '- A card must be REUSABLE KNOWLEDGE: it has to answer "when do I reach for this, how is it done, what goes wrong".',
+  '  Observations about THIS repository are NOT knowledge: never write call counts, file counts, "used in N places",',
+  '  "this repo calls X", occurrence statistics, or "needs to be confirmed against the implementation".',
+  '  If the excerpt only supports such an observation, return {"techniques":[]} instead of a census card.',
+  '- The `name` must be descriptive and self-contained; it must NOT start with a <Placeholder> (placeholders belong',
+  '  in field values, never in the title) and must not be a bare symbol path.',
+  '- `domain` is a stable, reusable topic label. REUSE one from the known list below whenever it fits; only coin a',
+  '  new one when the excerpt really is a new topic. Never restate the same topic under a different name.',
   '- ALSO return `codeLogic` when the excerpt shows a code unit whose LOGIC can be described: `subject` is the',
   '  owning class/module, `steps` is the logic order (input -> decision -> state change -> output),',
   '  `invariants` are ordering/consistency rules that must hold, and `reuse` says how to hook into it when',
@@ -554,6 +599,21 @@ export const MINE_SYSTEM_PROMPT = [
   '- Only claim what the excerpt supports. If it is too thin to teach anything, return {"techniques":[]}.',
   '- Never include credentials, tokens, internal hostnames or customer data.',
 ].join('\n')
+
+/**
+ * 按已知主题词表拼出挖掘提示。
+ *
+ * 为什么要把**已有 domain 列表**喂给模型：`techniqueKey(name, when, domain)` 把 domain 算进合并键，
+ * 于是同一个主题被叫成 28 种写法（实测）时，本该合并的近重复条目会全部新建 —— 库里因此多出一批
+ * 「换个说法就重来一条」的记录。给词表让模型复用，是成本最低的收敛手段。
+ *
+ * @param knownDomains - 库中现有的主题标签（按使用频次倒序，调用方截断）。
+ * @returns 系统提示。
+ */
+export function mineSystemPrompt(knownDomains: readonly string[] = []): string {
+  if (knownDomains.length === 0) return MINE_SYSTEM_PROMPT
+  return `${MINE_SYSTEM_PROMPT}\nKnown domain labels (reuse these verbatim when they fit):\n${knownDomains.join(' | ')}`
+}
 
 // ---- 增量缓存 ---------------------------------------------------------------
 
@@ -579,7 +639,7 @@ export interface MineCache {
 export const MINE_CACHE_VERSION = 1
 
 /** 提示版本：模型提示词变化时必须递增，否则会跳过需要重挖的文件。 */
-export const MINE_PROMPT_VERSION = 'p2'
+export const MINE_PROMPT_VERSION = 'p3'
 
 /** 计算文件内容的哈希。 */
 export function contentHash(content: string): string {
@@ -729,6 +789,7 @@ export async function modelCandidates(
   cluster: SymbolCluster,
   stack: StackProfile,
   call: LlmTextCaller,
+  knownDomains: readonly string[] = [],
 ): Promise<MineCandidate[]> {
   const packet = {
     symbol: cluster.symbol,
@@ -737,7 +798,10 @@ export async function modelCandidates(
     arities: cluster.arities,
     excerpt: cluster.excerpt,
   }
-  const output = await call(MINE_SYSTEM_PROMPT, `Mine reusable techniques from this excerpt (JSON):\n${JSON.stringify(packet)}`)
+  const output = await call(
+    mineSystemPrompt(knownDomains),
+    `Mine reusable techniques from this excerpt (JSON):\n${JSON.stringify(packet)}`,
+  )
   const parsed = parseJsonObject(output)
   const drafts = normalizeTechniqueDrafts(parsed?.techniques, stack)
   const out: MineCandidate[] = []
@@ -794,11 +858,23 @@ export interface MineRequest {
     timeoutMs: number
     include?: readonly string[]
     exclude?: readonly string[]
+    /**
+     * 是否把**结构观察**也落成技巧卡。默认 `false`：观察进报告，不进检索语料。
+     *
+     * 关掉的理由是实测出来的：规则路径对每个达标簇都产一张「N 处调用、M 个文件」的卡，
+     * 这类卡在一个真实库里占过 **24.7%**，且没有任何可复用内容 —— 它们会把「信噪比」压垮。
+     * 仍保留开关，是为了「没有模型也要有结构化产出」这个老需求可以显式打开。
+     */
+    storeStructuralCards?: boolean
   }
   /** 模型调用函数；缺省时只走规则路径。 */
   call?: LlmTextCaller
   /** 缓存用的模型标识（无模型时为空串）。 */
   model: string
+  /**
+   * 库中已有的主题标签（按频次倒序）；喂给模型以收敛 domain 写法。
+   */
+  knownDomains?: readonly string[]
   /** 当前时间。 */
   now?: number
 }
@@ -807,6 +883,8 @@ export interface MineRequest {
 export interface MineOutcome {
   /** 通过全部闸门、可落盘的候选。 */
   candidates: MineCandidate[]
+  /** 结构观察：本仓库的调用面普查。给报告用，默认不落盘。 */
+  observations: StructuralObservation[]
   /** 被拒候选与原因（主要是泄漏校验）。 */
   rejected: { name: string; reason: string }[]
   /** 本次真正处理的文件（用于更新缓存）。 */
@@ -866,16 +944,20 @@ export async function mineRepository(request: MineRequest): Promise<MineOutcome>
   const clusters = clusterSymbols(facts, options.minOccurrences)
   const candidates: MineCandidate[] = []
   const rejected: { name: string; reason: string }[] = []
+  const observations: StructuralObservation[] = []
   let modelCalls = 0
   let timedOut = false
 
-  // 规则路径：零 token，永远先跑。
+  // 规则路径：零 token。**观察永远记录，但默认不落盘** —— 见 `storeStructuralCards` 的说明。
+  const storeStructural = options.storeStructuralCards === true
   for (const cluster of clusters) {
-    keepOrReject(ruleCandidate(cluster, request.stack, request.view.root))
+    observations.push(structuralObservation(cluster))
+    if (storeStructural) keepOrReject(ruleCandidate(cluster, request.stack, request.view.root))
   }
 
   // 模型路径：受调用次数与总时长双重约束。
   if (request.call !== undefined) {
+    const knownDomains = request.knownDomains ?? []
     for (const cluster of clusters) {
       if (modelCalls >= options.maxModelCalls) break
       if (Date.now() > deadline) {
@@ -885,17 +967,18 @@ export async function mineRepository(request: MineRequest): Promise<MineOutcome>
       if (!worthModeling(cluster)) continue
       try {
         modelCalls += 1
-        for (const candidate of await modelCandidates(cluster, request.stack, request.call)) {
+        for (const candidate of await modelCandidates(cluster, request.stack, request.call, knownDomains)) {
           keepOrReject(candidate)
         }
       } catch {
-        // 单簇模型调用失败不影响整体：规则候选已经在手上了。
+        // 单簇模型调用失败不影响整体：其它簇与结构观察都还在。
       }
     }
   }
 
   return {
     candidates,
+    observations,
     rejected,
     processed,
     stats: {

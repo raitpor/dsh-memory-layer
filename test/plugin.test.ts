@@ -887,6 +887,9 @@ test('会话内反思默认开启：含新信息时产出 draft 技巧', async (
     const report = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
     assert.match(report, /Techniques: 0 verified, 1 draft/u)
     assert.match(report, /Experience compounding: reflections=1/u)
+    // 「为什么学/为什么没学」必须能从外部回答：只报 reflections 时，闸门拦下的东西完全不可见。
+    // 这里不断言具体理由（收尾那次判定必然是「没有新轮次」），只保证理由本身被报出来。
+    assert.match(report, /Reflection gate: \d+ decision\(s\) this process, last = (reflect|skip) — \S/u)
     // 四层作用域都要报出来：漏掉 failure 会让「按层作用域」这句话只对了一半。
     assert.match(
       report,
@@ -1069,6 +1072,58 @@ test('退避期间、窗口全被库覆盖时不反思（成本控制仍然成�
     fake.emit('session/disposed', fakeSession('s2', '/work/demo'))
     await fake.flush()
     assert.equal(counter.calls, 1, '退避期间、无新领域时不应再花钱')
+  } finally {
+    await dispose()
+  }
+})
+
+test('扩展名不构成「库已覆盖」：库里出现过 `ts` 时新的 .ts 文件仍算新领域', async () => {
+  // 实测缺陷（0.2.6 首版）：`hasNewGround` 拿**整个文件名**取词元，而 `ADVISORY_NOISE`
+  // 不含扩展名 —— 只要库里任意一条技巧提到过 `foo.ts`，**任何**新的 `.ts` 文件都被判成
+  // 「库已覆盖」，于是「新领域放行」这条退避解药对最常见的源码文件整体失效
+  // （真库 357 条里确实存在词元 `ts`，实测 `src/newmodule.ts` 命中）。
+  //
+  // 判据要能判别：`reflectNoveltyThreshold: 1.1` 让新颖度闸门永远关着，于是这次的反思
+  // **只能**由「新领域」放行 —— 退回旧实现（扩展名也算证据）时调用次数会停在 1。
+  const counter = { calls: 0 }
+  const emptyPayload = { title: 't', summary: 's', techniques: [] }
+  const { fake, dispose } = await setup(
+    {
+      provider: 'test',
+      model: 'test',
+      reflectMinTurns: 1,
+      reflectBackoffAfterEmpty: 1,
+      reflectNoveltyThreshold: 1.1,
+    },
+    true,
+    { llm: fakeLlm(emptyPayload, counter) },
+  )
+  try {
+    // 库里的 `ts` 词元来自一条**完全合理**的技巧正文（它讲的就是某个 .ts 文件）。
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    fake.emit('session/event', seed, event('turn/start', { turn: 1 }))
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: '导出顺序',
+      when: '编辑工具模块时',
+      summary: '编辑 src/toolbox.ts 时要先导出类型再导出实现。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    await toolOf(fake, 'technique_apply').execute(
+      { id: /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0], outcome: 'success', evidence: GOOD_EVIDENCE } as never,
+      undefined as never,
+    )
+    // 第一片地面：库未覆盖 → 反思（空产出立刻进入退避，但两片地面互不覆盖）。
+    await runSession(fake, fakeSession('s1', '/work/demo'), '改一下 src/marker-alpha.ts。', ['src/marker-alpha.ts'])
+    fake.emit('session/disposed', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    assert.equal(counter.calls, 1, '首片新地面应反思')
+    // 第二片地面：新文件的主键（`newmodule`）库里没有 → 必须仍被当成新领域放行。
+    await runSession(fake, fakeSession('s2', '/work/demo'), '改一下 src/newmodule.ts。', ['src/newmodule.ts'])
+    fake.emit('session/disposed', fakeSession('s2', '/work/demo'))
+    await fake.flush()
+    assert.equal(counter.calls, 2, '扩展名不是证据：新的 .ts 文件仍应算新领域')
   } finally {
     await dispose()
   }

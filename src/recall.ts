@@ -385,6 +385,11 @@ function judgeTerms(terms: readonly string[], stopwords: ReadonlySet<string>): {
 const ADVISORY_NOISE: ReadonlySet<string> = new Set([
   'java', 'gradle', 'jar', 'src', 'main', 'test', 'tests', 'command', 'content', 'file', 'files',
   'path', 'api', 'doc', 'docs', 'json', 'xml', 'yaml', 'mod', 'build', 'class', 'code', 'data',
+  // 扩展名同样不是知识证据。实测：`src/newmodule.ts` 仅因库里某条技巧出现过词元 `ts`
+  // 就被判成「库已覆盖」，于是 0.2.6 的「新领域」放行判据对最常见的源码文件整体失效。
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'rb', 'go', 'rs', 'kt', 'kts', 'cs', 'php',
+  'cpp', 'cc', 'hpp', 'sh', 'ps1', 'bat', 'cmd', 'sql', 'css', 'scss', 'html', 'htm', 'vue',
+  'toml', 'ini', 'cfg', 'conf', 'lock', 'txt', 'md', 'yml', 'map', 'png', 'svg', 'jpg',
 ])
 
 /** 门槛同款通用词（这里再用于顾问：`make`/`turn`/`per` 这类英文填充词不是实体名）。 */

@@ -27,13 +27,29 @@
   拍脑袋：真库实测「最近 2 小时模型显式保存的 13 条真新知识」对全库最大包含度 **0.412**，
   而库内近重复 top10 在 0.53–0.63，所以 0.6 留了 0.19 余量。`memory_stats` 新增
   `Restatement filter:` 行报出拦截条数（否则「反思跑了但没落盘」会被误读成「反思没学到东西」）。
+- **扩展名不再算「库已覆盖」**（本版「新领域」实现的自证缺陷）：`hasNewGround` 原来拿
+  **整个文件名**取词元，而顾问的噪声表不含扩展名 —— 于是只要库里任意一条技巧提到过 `foo.ts`
+  （真库 357 条里确实存在词元 `ts`），**任何**新的 `.ts` 文件都被判成「库已覆盖」，
+  「新领域」这条退避解药对最常见的源码文件整体失效。现在改用**主键**（去掉扩展名）取词元，
+  并把这批扩展名一并收进噪声表。两处互为双保险，所以只退一处用例仍会通过 ——
+  `.verify/revert-check.mjs` 因此新增**跨文件回退**（`edits`）能力，R5 用例同时退回两处来
+  证明判别力。
+- **`memory_stats` 新增 `Reflection gate:` 行**：报出进程内最近一次反思判定的**理由**
+  （`new ground` / `novelty 0.02` / `only 1 new turn(s)` / `no learning signal`）。
+  原来只有 `reflections=17` 这样的计数，「为什么这次没学」无从回答：是没东西可学，还是判据
+  写坏了？与 `Injection gate:` 同理 —— 被拦下的东西不留痕迹，就必须显式报出来。
 
 ### 说明
 
 - 本次改动只动**自动反思/提炼**路径，不影响 `technique_learn`（代码挖掘）与显式
   `technique_save`；两者产出的草稿照旧入库。
+- README 的反思章节原样留着更早的措辞（「此后只有用户纠偏能换来一次反思」），与同页的
+  「退避只是频率限制」自相矛盾 —— 已改成「新领域与用户纠偏都能放行」。
 - 度量脚本：`.verify/measure/learning-audit.mjs`（按 provenance 审计自动学习产出）、
-  `.verify/measure/containment-dist.mjs`（复述阈值的实测依据）。
+  `.verify/measure/containment-dist.mjs`（复述阈值的实测依据）、`.verify/measure/reflect-live.mjs`
+  （对着真库的**真实退避状态** `reflections=17, backoff=true` 验证「新领域放行 / 重复地面不付费」
+  两个方向；它先自证夹具在真库里 0 命中 —— 上一轮排查正是被一个无效夹具
+  （`fresh-territory-*.ts`：`fresh` 命中库内技巧、路径又会被去标识化）误导成「闸门没生效」）。
 
 ## 0.2.5 — 门槛只认「有信息量的用户原话」
 

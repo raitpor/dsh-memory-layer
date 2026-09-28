@@ -1475,7 +1475,9 @@ export function apply(ctx: Context, config: Config): void {
       // （既有用例「纯重复会话不新建记录且模型调用为 0」正是这个反例）。
       if (spentGround.has(file)) return false
       const base = file.split(/[\\/]/u).at(-1) ?? file
-      const terms = [...new Set(tokenize(base))]
+      // 用**主键**（去掉扩展名）取词元：扩展名不是知识证据，否则 `newmodule.ts` 会被库里
+      // 任意含 `ts` 的技巧判成「已覆盖」（`ADVISORY_NOISE` 也已收录扩展名，此处是双保险）。
+      const terms = [...new Set(tokenize(base.replace(/\.[A-Za-z0-9]{1,8}$/u, '')))]
       if (terms.length === 0) return false
       return advisoryMatches(docs, terms, { limit: 1 }).length === 0
     })
@@ -1537,6 +1539,15 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * 反思闸门最近一次判定（进程内）：回答「这一轮为什么没学」。
+   *
+   * 三条闸门（新增轮次 / 学习信号 / 退避与新领域 / 词面新颖度）任一拦下都会让模型调用为 0，
+   * 而 `memory_stats` 原有的 `reflections=17` 只能说明「没学」，说不清是「没东西可学」还是
+   * 「判据写坏了」。与 `gateTally` 同理：拦下的东西不留痕迹，就必须显式报出来。
+   */
+  const reflectTally: { decisions: number; last: string } = { decisions: 0, last: 'no decision yet' }
+
+  /**
    * 按闸门决定是否反思，并把结果计入「经验复利」指标。
    *
    * 两个调用点共用同一条路径：**每轮末的摊销触发**（`turn/end`，长驻会话的主力）
@@ -1549,6 +1560,15 @@ export function apply(ctx: Context, config: Config): void {
     const transcript = snapshotTranscript(state)
     const decision = reflectDecision(state, transcript)
     const route = decision.reflect ? routeFor(state) : undefined
+    // 判定的**理由**必须能被外面看见：`memory_stats` 只报 reflections/skipped/backoff 时，
+    // 「为什么这次没学」无从回答（是真没新东西？还是闸门卡住了？），而这正是自动学习
+    // 上线后最常被问的问题。这里记进程内最近一次判定，不落盘。
+    reflectTally.decisions += 1
+    reflectTally.last = !decision.reflect
+      ? `skip — ${decision.reason}`
+      : route === undefined
+        ? `reflect (${decision.reason}) but no model route available`
+        : `reflect — ${decision.reason}`
     if (route === undefined) {
       // 没有可用模型路由：只走规则路径（仍然落盘情景摘要，但不产出技巧）。
       // 每轮末那个调用点已经写过一次规则摘要，用 `ruleFallback: false` 免去重复落盘。
@@ -2526,6 +2546,8 @@ export function apply(ctx: Context, config: Config): void {
         `Active session turns (transient): ${current?.turns.length ?? 0}`,
 
         `Experience compounding: reflections=${metrics.reflections}, skipped=${metrics.skipped}, new=${metrics.newTechniques}, duplicates=${metrics.duplicateTechniques}, backoff=${metrics.backoff}`,
+        // 「为什么这次没学」：判定的理由不报出来，三条闸门拦下的东西完全不可见。
+        `Reflection gate: ${reflectTally.decisions} decision(s) this process, last = ${reflectTally.last}`,
         // 复述过滤是在花完模型调用**之后**才起作用的，所以必须报出来：否则「反思跑了但没落盘」
         // 会被误读成「反思没学到东西」。
         `Restatement filter: ${restatementDrops.length} candidate(s) dropped this process`

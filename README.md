@@ -81,12 +81,14 @@
 **空产出是常见且正确的结果**，并禁止复述本会话从库里读到的条目。
 
 只有真正付出模型调用才推进水位；被闸门拦下或当时没有模型路由的轮次会留到下次继续参与判定，
-不会被永久跳过。连续 `reflectBackoffAfterEmpty` 次反思无新产出后自动退避，此后**只有用户纠偏**
-（`不对` / `错了` / `我说过` / `stop doing` …）能换来一次反思 —— 这是刻意留的唯一出口：
-`backoff` 只在「某次反思真的有新产出」时才清零，若退避期间一律不反思，它就永远等不到清零的
-那次反思。`memory_stats` 会输出
+不会被永久跳过。连续 `reflectBackoffAfterEmpty` 次反思无新产出后进入退避，此后**新领域**与
+**用户纠偏**（`不对` / `错了` / `我说过` / `stop doing` …）仍能换来一次反思 —— 退避是频率限制，
+不是开关：`backoff` 只在「某次反思真的有新产出」时才清零，若退避期间一律不反思，它就永远等不到
+清零的那次反思。`memory_stats` 会输出
 `Experience compounding: reflections=… skipped=… new=… duplicates=… backoff=…`，让「前期投入、
-后期节省」可验证。设 `reflectNoveltyThreshold: 0` 可关闭新颖度闸门（用户纠偏本来就绕过它）。
+后期节省」可验证；紧随其后的 `Reflection gate: N decision(s) this process, last = <理由>` 报出
+**最近一次判定的理由**（`new ground` / `novelty 0.02` / `only 1 new turn(s)` / `no learning signal`），
+否则「为什么这次没学」只能靠猜。设 `reflectNoveltyThreshold: 0` 可关闭新颖度闸门（用户纠偏本来就绕过它）。
 
 提炼有两条路径，产出同一形状：
 
@@ -651,7 +653,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（356 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（357 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 

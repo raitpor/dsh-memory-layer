@@ -17,7 +17,8 @@ import { basename, dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { apply } from '../src/index.js'
-import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from '../src/injection.js'
+import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS, advisoryText } from '../src/injection.js'
+import { isInjectedContext } from '../src/distill.js'
 import type { Config } from '../src/index.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
 import { createCodec } from '../src/crypto.js'
@@ -46,6 +47,16 @@ interface FakeContext {
   tools: ToolDefinition[]
   /** 已登记的单调守卫（`ctx.tools.guard`）。 */
   guards: Array<(exec: { name: string; arguments: unknown }) => string | undefined>
+  /**
+   * 手动驱动 `tools/post-execute` 瀑布（与 `preExecute` 对称）。
+   *
+   * 真实的 `ToolRuntime` 会在工具跑完后触发它；替身没有运行时，所以由用例直接驱动 ——
+   * 这样能测到「顾问被附加到结果上」这件事，而不必去搭一个真的工具运行时。
+   */
+  postExecute(exec: { name: string; arguments: unknown }, result: { isError?: boolean }): Promise<{
+    kind: string
+    additionalContexts?: Array<{ content?: Array<{ text?: string }> }>
+  }>
   /**
    * 模拟 `tools/pre-execute` 瀑布：按登记顺序调用监听器，每个都能决定结果。
    * @param exec - 调用名与已解析参数。
@@ -111,6 +122,17 @@ function fakeContext(services: Record<string, unknown> = {}): FakeContext {
     prompts,
     tools,
     guards,
+    async postExecute(exec, result) {
+      const chain = listeners.get('tools/post-execute') ?? []
+      let index = 0
+      const next = async (): Promise<{ kind: string; additionalContexts?: unknown[] }> => {
+        const listener = chain[index]
+        index += 1
+        if (listener === undefined) return { kind: 'accept' }
+        return await listener(exec, result, next) as { kind: string; additionalContexts?: unknown[] }
+      }
+      return next() as Promise<{ kind: string; additionalContexts?: Array<{ content?: Array<{ text?: string }> }> }>
+    },
     async preExecute(exec) {
       const chain = listeners.get('tools/pre-execute') ?? []
       let index = 0
@@ -565,9 +587,14 @@ test('global 作用域跨项目共享（与 project 隔离相对照）', async (
   const { fake, dispose } = await setup({ layerScopes: { episodic: 'global' } })
   try {
     await runSession(fake, fakeSession('sA', '/work/project-a'), '全局记住：团队使用 pnpm。', [])
-    fake.emit('session/created', fakeSession('sB', '/work/project-b'))
+    const sB = fakeSession('sB', '/work/project-b')
+    fake.emit('session/created', sB)
     // 切到新项目目录后，其召回桶是异步加载的；等加载完成再断言跨项目共享。
     await fake.flush()
+    // 注入按**本轮用户原话**判定，所以要真的给一轮输入（空查询不再按置信度注入）。
+    fake.emit('session/event', sB, event('turn/start', { turn: 1 }))
+    // 查询要与记忆有**非通用词**重叠才可能命中（本例：`团队` + 标识符 `pnpm`）。
+    fake.emit('session/event', sB, userMessage('团队规定用 pnpm 还是 npm？'))
     assert.match(injection(fake), /pnpm/u, 'global 作用域本应跨项目共享')
   } finally {
     await dispose()
@@ -1442,16 +1469,22 @@ test('技巧按技术栈过滤：Java 项目写入，TS 项目不注入、另一
     )), /validated/u)
 
     // 切到 TS 项目：技术栈不匹配 → 不注入（宁可少给，也不给错的）。
-    fake.emit('session/created', fakeSession('sT', tsProject))
+    const tsSession = fakeSession('sT', tsProject)
+    fake.emit('session/created', tsSession)
     await fake.flush()
+    fake.emit('session/event', tsSession, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', tsSession, userMessage('集成 OrdersClient 并调用 authorize'))
     assert.ok(
       !sectionText(fake, 'memory-layer:techniques').includes('authorize before create'),
       '语言不符的技巧不得注入',
     )
 
     // 切到另一个 Java 项目：全局域知识应可复用。
-    fake.emit('session/created', fakeSession('sB', javaB))
+    const javaSession = fakeSession('sB', javaB)
+    fake.emit('session/created', javaSession)
     await fake.flush()
+    fake.emit('session/event', javaSession, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', javaSession, userMessage('集成 OrdersClient 并调用 authorize'))
     assert.match(
       sectionText(fake, 'memory-layer:techniques'),
       /authorize before create/u,
@@ -3623,7 +3656,9 @@ test('R4：库非空时注入「先检索再用」指引，且含三个动作', 
     fake.emit('session/event', session, event('turn/start', { turn: 1 }))
     fake.emit('session/event', session, userMessage('把这个函数重命名成更清晰的名字'))
     const text = sectionText(fake, 'memory-layer:guidance')
-    assert.match(text, /Before starting a task, search/u, '要先说要先检索')
+    // 两套正文都要满足同一组语义：未检索过用的是「本会话还没查过库 + 库的规模与覆盖」那版，
+    // 检索过之后回落成通用策略版 —— 措辞不同，动作要求相同。
+    assert.match(text, /Before starting a task[\s\S]{0,120}search it|Before starting a task, search/u, '要先说要先检索')
     assert.match(text, /technique_search/u, '要给出检索入口')
     assert.match(text, /memory_search/u, '事实类检索也要提')
     assert.match(text, /technique_apply/u, '采用要上报')
@@ -3850,6 +3885,382 @@ test('常驻规则：已被取代的偏好不再注入', async () => {
     const block = await injectWithUnrelatedTurn(fake, [])
     assert.match(block, /pnpm/u)
     assert.doesNotMatch(block, /偏好用 npm/u, '被取代的旧偏好不得继续以常驻规则身份出现')
+  } finally {
+    await dispose()
+  }
+})
+
+// ---- 0.2.5：门槛只认用户原话 + 门槛可观测 -----------------------------------
+
+/** 写入一条已验证的 PlantUML 技巧（带 plantuml 标签，便于领域判定）。 */
+async function seedPlantUmlTechnique(fake: FakeContext): Promise<void> {
+  const seed = fakeSession('seed-puml', '/work/demo')
+  fake.emit('session/created', seed)
+  await fake.flush()
+  fake.emit('session/event', seed, event('turn/start', { turn: 1 }))
+  fake.emit('session/event', seed, userMessage('记住 PlantUML 的渲染要点'))
+  const saved = String(await toolOf(fake, 'technique_save').execute({
+    name: '读写 CJK 图时显式指定 -charset UTF-8',
+    when: '中文标签渲染成问号时',
+    summary: '批量渲染 .puml 时输出乱码，就是编码没对齐。',
+    domain: 'plantuml',
+  } as never, undefined as never))
+  const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+  if (id === undefined) throw new Error(`技巧保存应答里没有 id：${saved}`)
+  await toolOf(fake, 'technique_apply').execute(
+    { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never,
+    undefined as never,
+  )
+}
+
+test('门槛只认用户原话：当轮写过的 .puml 路径不得把 PlantUML 技巧拉进注入', async () => {
+  // 实测漏洞：`facetQueries` 把 extra（当轮文件路径）按 `/` 切成独立子查询，子查询 ≤2 个词
+  // 时门槛放宽到 1 —— 于是 `docs/architecture.puml` 只靠 `puml` 就能放行整套 PlantUML 技巧。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    await seedPlantUmlTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('开始移植'))
+    // 本轮写了图文件：路径会成为补充检索键，但**不能成为相关性的证据**。
+    fake.emit('session/event', session, event('tool/call', {
+      turn: 1, step: 1, callId: 'c1', name: 'write',
+      arguments: JSON.stringify({ file_path: 'docs/architecture.puml' }),
+    }))
+    fake.emit('session/event', session, userMessage('输出文档应是中文文档'))
+    await fake.flush()
+    assert.doesNotMatch(
+      sectionText(fake, 'memory-layer:techniques'),
+      /charset|CJK/u,
+      '当轮路径里的 puml 不得替用户表达意图',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('门槛可观测：memory_stats 报出门槛拦下/放行的条数与最近一次判定', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    await seedPlantUmlTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    // 这条查询与技巧共享「输出」「中文」两个通用词（所以它进得来打分），
+    // 但按新判据不能算相关 —— 正是要用计数看见的那种「拦下」。
+    fake.emit('session/event', session, userMessage('输出文档应是中文文档'))
+    await fake.flush()
+    // 计数只在**真的渲染过注入**时更新：stats 自己不触发渲染，所以先取一次技巧段。
+    sectionText(fake, 'memory-layer:techniques')
+    const report = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+    assert.match(report, /Injection gate: \d+ dropped \/ \d+ kept since start/u, `应报门槛累计：${report}`)
+    assert.match(report, /last request [1-9]\d* dropped/u, '这次轮次应至少拦下一条')
+  } finally {
+    await dispose()
+  }
+})
+
+test('空查询不注入：会话刚建立、还没捕获到用户输入时两块都为空', async () => {
+  // 实测（gt6 会话重启后的第一轮）：插件还没拿到本轮用户文本 → 查询为空 → 旧行为按
+  // 「最近/最自信」注入，真库上恰好是那三条 UML 技巧，于是「重启了还在注入」。
+  // 注入路径必须**不注入**：空查询没有可核对的意图，按置信度取前 N 条与相关性无关。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    await seedPlantUmlTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    assert.equal(sectionText(fake, 'memory-layer:techniques'), '', '空查询不得注入技巧')
+    assert.equal(sectionText(fake, 'memory-layer:recall'), '', '空查询不得注入记忆')
+    // 有了真实输入后，相关的那条照旧注入（确认不是把整条通道关掉）。
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('puml 里的中文渲染成问号了'))
+    assert.match(sectionText(fake, 'memory-layer:techniques'), /charset|CJK/u)
+  } finally {
+    await dispose()
+  }
+})
+
+
+// ---- A：动作点顾问（tools/post-execute）-------------------------------------
+//
+// 实测动机：MC 移植会话里模型 147 次工具调用一次没查库，只在用户点名时才查。
+// 顾问把提示落在**动作发生的那一刻**，因此必须严格：只认强证据、按会话去重、有上限。
+
+/** 从 post-execute 决定里取出顾问文本（没有则空串）。 */
+function advisoryOf(decision: { additionalContexts?: Array<{ content?: Array<{ text?: string }> }> }): string {
+  return decision.additionalContexts?.map(item => item.content?.[0]?.text ?? '').join('\n') ?? ''
+}
+
+test('动作点顾问：对文件/符号动手且库里有强证据命中时附一行', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    // 技巧正文里出现 `Enchantment` —— 与动作里的文件名 `GTEnchantment.java` 强证据命中。
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: '1.21 起 Enchantment 是 final record',
+      when: '把附魔迁移到 1.21.1 时',
+      summary: 'Enchantment 改为数据包注册表，静态数据存 ResourceKey。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    const action = {
+      name: 'edit',
+      arguments: JSON.stringify({
+        file_path: 'src/main/java/gregtech/api/enchantment/GTEnchantment.java',
+        old_string: 'class GTEnchantment {}',
+      }),
+    }
+    const decision = await fake.postExecute(action, { isError: false })
+    const text = advisoryOf(decision)
+    assert.match(text, /Knowledge library advisory/u, `应附顾问：${JSON.stringify(decision)}`)
+    assert.match(text, /technique_get to read it/u, '要给出下一步动作')
+    assert.match(text, /matched enchantment/u, '要说清命中依据（文件名切词后的命中）')
+    assert.doesNotMatch(text, /class GTEnchantment/u, '代码正文不得进入顾问')
+    // 同一条不再重复提（否则会训练模型忽略它）。
+    const again = await fake.postExecute(action, { isError: false })
+    assert.equal(advisoryOf(again), '', '同一条知识只提一次')
+  } finally {
+    await dispose()
+  }
+})
+
+test('动作点顾问：失败结果、无路径无标识符、目录名/扩展名噪声都不提', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'Java 类命名约定',
+      when: '写 Java 类时',
+      summary: '类名用大驼峰。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    // 失败的工具结果不挂顾问：那时模型要处理的是错误。
+    const failed = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/main/java/App.java' }) },
+      { isError: true },
+    )
+    assert.equal(advisoryOf(failed), '')
+    // 只有目录名/扩展名（`src`/`main`/`java`）不构成证据：实测它们会让任意 Java 文件都推知识。
+    const noiseOnly = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/main/java/App.java' }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(noiseOnly), '', '目录名与扩展名是噪声，不得当证据')
+    // 没有文件路径也没有标识符（如纯 bash）→ 不提。
+    const unrelated = await fake.postExecute(
+      { name: 'bash', arguments: JSON.stringify({ command: 'ls -la' }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(unrelated), '')
+  } finally {
+    await dispose()
+  }
+})
+
+test('动作点顾问：每轮最多一条，跨轮摊开（预算可配）', async () => {
+  // 实测暴露的问题：两条顾问在同一轮各带 2 个 id，把当时的每会话上限（3）一轮耗尽，
+  // 之后 10+ 轮完全沉默 —— 而那些轮里明明有大量强证据命中。所以：每轮最多一条 + 预算可配。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    distillOnTurnEnd: false,
+    techniqueAdvisoryMax: 3,
+  })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    for (let index = 1; index <= 4; index += 1) {
+      const saved = String(await toolOf(fake, 'technique_save').execute({
+        name: `Frobnicator 顾问样本 ${index}`,
+        when: `第 ${index} 种情形`,
+        summary: `Frobnicator 相关要点 ${index}。`,
+        kind: 'procedure',
+      } as never, undefined as never))
+      const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+      await toolOf(fake, 'technique_apply').execute(
+        { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+      )
+    }
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    const action = { name: 'edit', arguments: JSON.stringify({ file_path: 'src/FrobnicatorThing.java' }) }
+    // 同一轮里连发三次：只能出一条（节流）。
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    let sameTurn = 0
+    for (let index = 0; index < 3; index += 1) {
+      if (advisoryOf(await fake.postExecute(action, { isError: false })).length > 0) sameTurn += 1
+    }
+    assert.equal(sameTurn, 1, `同一轮最多一条，实际 ${sameTurn}`)
+    // 跨轮：把预算（3）用完后不再推，且总数不超过预算。
+    let total = sameTurn
+    for (let turn = 2; turn <= 8; turn += 1) {
+      fake.emit('session/event', session, event('turn/start', { turn }))
+      if (advisoryOf(await fake.postExecute(action, { isError: false })).length > 0) total += 1
+    }
+    assert.ok(total > 1, '跨轮应继续推（这是修掉「一轮耗尽」的判别点）')
+    assert.ok(total <= 3, `预算 3 时总数不得超过 3，实际 ${total}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('顾问文本被识别为注入上下文（不得变成用户原话被重新捕获）', async () => {
+  // 顾问走 additionalContexts 投递，来源是 plugin、且块首是 ADVISORY_MARKER ——
+  // 两道都要成立：否则这段文本会被捕获成「用户说的话」，正是我们要防的自我放大。
+  assert.equal(isInjectedContext(advisoryText(['· something'])) , true)
+})
+
+
+test('未检索提醒：本会话查过库之后立刻消失，且覆盖范围来自库的实际内容', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    await seedPlantUmlTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('开始移植'))
+    const before = sectionText(fake, 'memory-layer:guidance')
+    assert.match(before, /has not consulted the library yet/u, '未检索时要提醒')
+    assert.match(before, /verified \+ \d+ draft/u, '要说清库的规模')
+    assert.match(before, /across /u, '要给出库的覆盖范围')
+    // 查一次（哪怕没有命中）之后就不再提醒：提示语要解决的是「没想到去查」。
+    await toolOf(fake, 'technique_search').execute({ query: '无关查询', limit: 3 } as never, undefined as never)
+    const after = sectionText(fake, 'memory-layer:guidance')
+    assert.doesNotMatch(after, /has not consulted/u, '查过之后必须闭嘴')
+    assert.match(after, /Before starting a task/u, '回落成常规指引')
+  } finally {
+    await dispose()
+  }
+})
+
+test('动作点顾问：散文里的普通英文词不算证据（实测误报）', async () => {
+  // 实测误报：`description: "Make the advisory budget configurable…"` 里的 configurable/budget
+  // 推出了两条毫不相干的技巧。散文里的英文小写词在双语库里太泛化 —— 只取中文词与标识符。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'Budget configurable clamping helper',
+      when: 'when budget is configurable',
+      summary: 'A bounded clamping helper for a configurable budget.',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    const decision = await fake.postExecute(
+      { name: 'bash', arguments: JSON.stringify({ command: 'ls', description: 'Make the advisory budget configurable' }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(decision), '', '散文里的英文小写词不得推出技巧')
+    // 同一句里带上标识符则应当命中（确认不是把整条通道关掉）。
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    const withIdentifier = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/BudgetClampingHelper.java' }) },
+      { isError: false },
+    )
+    assert.match(advisoryOf(withIdentifier), /Knowledge library advisory/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('动作点顾问：句首大写的普通英文词不算标识符（实测误报）', async () => {
+  // 实测误报：`description: "Fresh per-turn technique-call analysis…"` 里的 `Fresh` 被当成
+  // CamelCase 标识符，推出一条讲 ETag 下载的技巧（它只是句首大写）。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'ETag-conditional download of generated artifacts',
+      when: 'when a generated artifact may be fresh',
+      summary: 'Use ETag to avoid downloading a fresh artifact again.',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    const sentence = await fake.postExecute(
+      { name: 'bash', arguments: JSON.stringify({ command: 'ls', description: 'Fresh per-turn technique-call analysis' }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(sentence), '', '句首大写不算标识符')
+    // 真正的 PascalCase 仍然算（确认规则没有收紧到失效）。
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    const pascal = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ symbol: 'GeneratedArtifactCache' }) },
+      { isError: false },
+    )
+    assert.match(advisoryOf(pascal), /Knowledge library advisory/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('未检索提醒：technique_get 也算「查过库」（实测子智能体会话只 get 不 search）', async () => {
+  // 实测：移植工作跑在子智能体会话里，模型只 `technique_get`、从不 `technique_search`，
+  // 于是提醒在整轮里重复了 5–12 次（每轮白付约 300 字符）。关闭开关必须覆盖 get/apply/learn。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    await seedPlantUmlTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    assert.match(sectionText(fake, 'memory-layer:guidance'), /has not consulted/u, '开始时应提醒')
+    // 只 get，不 search。
+    const found = String(await toolOf(fake, 'technique_search').execute({ query: 'charset', limit: 1 } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(found)?.[0] ?? 'tq_missing'
+    // 先让提醒重新进入「未查过」状态不可能（不可逆），因此这里改为验证 get 路径本身：
+    // 新建一个会话，直接 get（不 search）后提醒必须消失。
+    const second = fakeSession('s2', '/work/demo')
+    fake.emit('session/created', second)
+    await fake.flush()
+    fake.emit('session/event', second, event('turn/start', { turn: 1 }))
+    assert.match(sectionText(fake, 'memory-layer:guidance'), /has not consulted/u)
+    await toolOf(fake, 'technique_get').execute({ ids: [id] } as never, undefined as never)
+    assert.doesNotMatch(
+      sectionText(fake, 'memory-layer:guidance'),
+      /has not consulted/u,
+      'get 之后提醒必须消失',
+    )
   } finally {
     await dispose()
   }

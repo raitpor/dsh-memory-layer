@@ -33,6 +33,7 @@ import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ToolRuntime } from '@deepseek-ai/dsh-tools'
+import type { UserMessage } from '@deepseek-ai/dsh-session'
 import { KEY_ENV, KEY_FILE_NAME, createCodec, resolveKey } from './crypto.js'
 import type { StoreCodec } from './crypto.js'
 import {
@@ -45,7 +46,8 @@ import {
   techniqueText,
 } from './store.js'
 import { facetQueries, isStandingRule, recallDocsFacets, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
-import type { RelevanceGate, TechniqueScorer } from './recall.js'
+import type { GateDecision, RelevanceGate, TechniqueScorer } from './recall.js'
+import { advisoryMatches } from './recall.js'
 import { SqliteTechniqueIndex, loadSqlite } from './sqlite-index.js'
 import type { RecallDoc } from './recall.js'
 import { distill, isInjectedContext } from './distill.js'
@@ -98,10 +100,12 @@ import {
   GUIDANCE_BLOCK,
   GUIDANCE_LINES,
   GUIDANCE_MAX_CHARS,
+  unconsultedGuidanceLines,
   GUIDANCE_MEMORY_ONLY_LINES,
   RECALL_BLOCK,
   TECHNIQUE_BLOCK,
   compactEntryText,
+  advisoryText,
 } from './injection.js'
 import type { InjectionBlock } from './injection.js'
 import { renderSkill, verifySkill } from './skill.js'
@@ -217,6 +221,43 @@ export interface Config {
    * （真库只有个位数），所以按最新优先直取，不判相关性。
    */
   injectStandingRules?: number
+  /**
+   * 是否启用**动作点顾问**：模型对某文件/符号动手时，若库里有强证据匹配、且本会话还没看过的
+   * 技巧，就在工具回执之后附一行 `· <技巧名> [id] — technique_get to read it.`。默认 `true`。
+   *
+   * 为什么要有它：实测（MC 移植会话）模型在 147 次工具调用里一次都没查库，只在用户明确要求时
+   * 才查 —— 系统提示里的通用策略压不过任务压力。顾问把提示落在**动作发生的那一刻**，按会话
+   * 去重（同一条只提一次）且有硬上限，成本有界。
+   */
+  techniqueAdvisory?: boolean
+  /**
+   * 顾问是否也看**草稿**（未经验证的技巧）。默认 `true`。
+   *
+   * 默认开的理由：真实库里绝大多数知识还是草稿（实测 25 已验证 / 329 草稿），只看已验证
+   * 等于在最需要顾问的场景（移植、陌生框架）里不发声。草稿在顾问里**只出现标题与 id**、
+   * 并标 `(draft, unverified)`，正文要模型显式 `technique_get` —— 不越过
+   * 「未验证知识不自动注入正文」的边界。关掉它即回到只推已验证条目。
+   */
+  techniqueAdvisoryDrafts?: boolean
+  /**
+   * 单个会话最多推几条顾问（同一条仍然只推一次）。默认 `12`。
+   *
+   * 为什么不是更小：实测每会话 3 条时，两条顾问在同一**轮**就耗尽了预算，之后 10+ 轮完全
+   * 沉默，而那些轮里有大量强证据命中（10/16、12/17…个动作）。同一 id 仍只推一次，且**每轮
+   * 最多一条**（`advisoryLastTurn`），所以放开预算是安全的。
+   */
+  techniqueAdvisoryMax?: number
+  /**
+   * 追加到内置**通用词表**的词：命中这些词不算「相关」，因此不能单独触发注入。默认 `[]`。
+   *
+   * 内置表已覆盖对话套话（继续/开始/可以）、交付元话题（技巧/文档/输出/中文/库里）与通用
+   * 工程词（配置/函数/文件/路径/代码/测试）。实测：不相关轮次靠「输出+中文」「技巧+库里」
+   * 「发现+技巧」这类通用词组合就能把 UML 技巧拉进上下文（真库复现）。
+   *
+   * **加一个词 = 放弃靠它触发注入**：因此不要加本领域词（如「模组」「插件」「注入」），
+   * 那会把这个库自己的领域压制掉。表只作用于门槛，不进分词器，不影响排序。
+   */
+  injectStopwords?: string[]
   /**
    * 注入侧的绝对 BM25 分数下限（`0` = 关闭，默认关闭）。
    *
@@ -489,6 +530,10 @@ export const Config: z<Config> = z.object({
   techniquePromptOrder: z.number().default(260),
   injectMinMatched: z.natural().min(0).max(20).default(2),
   injectStandingRules: z.natural().min(0).max(20).default(4),
+  injectStopwords: z.array(z.string()).default([]),
+  techniqueAdvisory: z.boolean().default(true),
+  techniqueAdvisoryDrafts: z.boolean().default(true),
+  techniqueAdvisoryMax: z.natural().min(0).max(100).default(12),
   injectMinScore: z.number().min(0).max(1000).default(0),
   guidancePromptOrder: z.number().default(265),
   guidance: z.boolean().default(true),
@@ -587,6 +632,9 @@ interface Settings {
   injectionGate: RelevanceGate
   guidancePromptOrder: number
   guidance: boolean
+  techniqueAdvisory: boolean
+  techniqueAdvisoryDrafts: boolean
+  techniqueAdvisoryMax: number
   exampleMaxLines: number
   exampleMaxChars: number
   allowConfidentialGlobal: boolean
@@ -1455,6 +1503,106 @@ export function apply(ctx: Context, config: Config): void {
    * @param query - 召回查询词（通常是当前会话最近的用户输入）。
    * @returns 注入文本；无可注入内容时为空串。
    */
+  /**
+   * 注入门槛的进程内计数：回答「门槛到底在不在干活」。
+   *
+   * 为什么需要它：门槛拦下的东西是**看不见的**（不注入 = 上下文里没有痕迹），出了
+   * 「不相关技巧仍被注入」这类问题时只能靠会话记录考古。这里把每次判定的 keep/drop
+   * 计数与丢弃原因打一行 debug，并在 `memory_stats` 里报累计值。不落盘：它回答的是
+   * 「本次运行」，与跨会话的经验复利是两类指标。
+   */
+  const gateTally = { kept: 0, dropped: 0, lastKept: 0, lastDropped: 0 }
+
+  /**
+   * 上报一次注入渲染的门槛判定结果。
+   *
+   * @param section - 注入段名（`recall` / `techniques`）。
+   * @param query - 本轮判定用的用户原话。
+   * @param decisions - 本次渲染的全部候选判定。
+   */
+  const reportGate = (section: string, query: string, decisions: readonly GateDecision[]): void => {
+    if (decisions.length === 0) return
+    const kept = decisions.filter(item => item.kept).length
+    const dropped = decisions.filter(item => !item.kept)
+    gateTally.kept += kept
+    gateTally.dropped += dropped.length
+    gateTally.lastKept = kept
+    gateTally.lastDropped = dropped.length
+    const detail = dropped.slice(0, 5)
+      .map(item => `${item.id.slice(0, 11)}(matched=${item.matched},strong=${item.strong},generic=${item.generic})`)
+      .join(' ')
+    logger.debug(
+      `memory: gate[${section}] query="${query.slice(0, 50)}" kept=${kept} dropped=${dropped.length}`
+      + (detail.length === 0 ? '' : ` dropped≈${detail}`),
+    )
+  }
+
+  /**
+   * 每个会话已经「推过」的技巧 id。
+   *
+   * 顾问出现在动作点，必须去重：同一条知识只提一次（上限见 {@link ADVISORY_MAX_PER_SESSION}）。
+   */
+  const advisorySeen = new Map<string, Set<string>>()
+
+  /**
+   * 每个会话最后一次投递顾问的**轮号**（每轮最多一条）。
+   *
+   * 为什么按轮节流：实测（gt6 移植会话）两条顾问在同一轮里各带 2 个 id，把当时的每会话
+   * 上限（3）一轮耗尽，之后 10+ 轮完全沉默 —— 而同一份记录显示那些轮里有 10/16、12/17、
+   * 8/14、3/12 个动作明明有强证据命中。把预算摊到多轮比在一轮里连推两条有用得多：
+   * 模型是跨轮推进任务的。
+   */
+  const advisoryLastTurn = new Map<string, number>()
+
+  /** 动作点顾问：从工具调用里抽文件路径与调用名，只认强证据命中。 */
+  const advisoryFor = (exec: { name: string; arguments: unknown }): string | undefined => {
+    if (!settings.techniques || !settings.techniqueAdvisory) return undefined
+    const sessionId = current?.sessionId
+    if (sessionId === undefined) return undefined
+    const seen = advisorySeen.get(sessionId) ?? new Set<string>()
+    if (seen.size >= settings.techniqueAdvisoryMax) return undefined
+    const liveTurn = current?.turns.at(-1)?.turn
+    if (liveTurn !== undefined && advisoryLastTurn.get(sessionId) === liveTurn) return undefined
+    // `ToolExecution.arguments` 是 `unknown`（不同工具形态不同）：统一收敛成 JSON 文本。
+    const raw = typeof exec.arguments === 'string' ? exec.arguments : JSON.stringify(exec.arguments ?? {})
+    const terms = advisoryTerms(raw)
+    // 动作点是「文件 / 调用名」驱动的：没有这两样就推不出精确匹配。
+    if (terms.length === 0) return undefined
+    const corpus = gatedCorpus(current?.cwd)
+      // 默认连草稿一起看：真实的库里绝大多数知识还是草稿（实测 25 已验证 / 329 草稿），
+      // 只看已验证等于在最需要顾问的场景（移植、新框架）里不发声。草稿**只给标题与 id**、
+      // 如实标注未验证，正文仍要模型显式 `technique_get` —— 这是「不自动注入未验证知识」
+      // 的边界内能给的最大帮助。
+      .filter(doc => doc.layer !== 'technique' || settings.techniqueAdvisoryDrafts || doc.meta?.status !== 'draft')
+    const hits = advisoryMatches(corpus, terms, { limit: 2, seen })
+    if (hits.length === 0) return undefined
+    for (const hit of hits) seen.add(hit.id)
+    advisorySeen.set(sessionId, seen)
+    if (liveTurn !== undefined) advisoryLastTurn.set(sessionId, liveTurn)
+    logger.debug(`memory: advisory on ${exec.name} → ${hits.map(hit => hit.id.slice(0, 11)).join(', ')}`)
+    return advisoryText(hits.map(hit =>
+      `· ${hit.label} [${hit.id.slice(0, 11)}]${hit.draft ? ' (draft, unverified)' : ''} matched `
+      + `${hit.strong.join(', ')} — technique_get to read it.`,
+    ))
+  }
+
+  /**
+   * 把顾问正文包成宿主认识的 `UserMessage`。
+   *
+   * 来源必须是 `plugin`：宿主据此把它当注入上下文，**本插件的捕获端也按结构识别**
+   * （`isInjectedUserMessage` 见 `source.kind === 'plugin'` 就整条丢弃）。用 `user` 来源
+   * 会让这段文本变成「用户原话」，正是我们要防的自我放大。
+   *
+   * @param text - 顾问正文（以 `ADVISORY_MARKER` 起头）。
+   * @returns 可直接放进 `additionalContexts` 的消息。
+   */
+  const advisoryMessage = (text: string): UserMessage => ({
+    id: `ms_${randomUUID()}` as UserMessage['id'],
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: 'dsh-memory-layer' },
+  })
+
   const renderInjection = (query: string): string => {
     // DEF-12：召回语料里含 `toTechniqueDocs(...)`，而 `recall()` **不看状态** —— 草稿技巧
     // 会带着 `(technique)` 标签从这条通道进入上下文，与「草稿不参与自动注入」的承诺冲突，
@@ -1496,11 +1644,14 @@ export function apply(ctx: Context, config: Config): void {
     const queryDocs = docs.filter(doc => !standingIds.has(doc.id))
     // 与技巧层同一套 facet 机制：情景/语义层同样会「一句话讲了好几件事」，
     // 而且**当前轮碰过的文件**是比措辞更可靠的键（"为什么这个测试挂了"里没有文件名）。
+    const recallDecisions: GateDecision[] = []
     const hits = recallDocsFacets(query, queryDocs, {
       limit: settings.recallLimit,
       extra: searchExtrasFor(current?.turns ?? [], query),
       gate: settings.injectionGate,
+      onDecision: decision => recallDecisions.push(decision),
     })
+    reportGate('recall', query, recallDecisions)
     const merged = [
       ...standing.map(doc => ({
         layer: doc.layer,
@@ -1554,6 +1705,7 @@ export function apply(ctx: Context, config: Config): void {
     if (!settings.techniques) return []
     if (techniqueHitCache?.query === query) return techniqueHitCache.hits
     const docs = gatedCorpus(current?.cwd)
+    const decisions: GateDecision[] = []
     const hits = docs.length === 0 ? [] : recallFacets(query, docs, {
       limit: settings.techniqueLimit,
       ...(current?.stack === undefined ? {} : { stack: current.stack }),
@@ -1562,7 +1714,9 @@ export function apply(ctx: Context, config: Config): void {
       extra: searchExtrasFor(current?.turns ?? [], query),
       scorer: indexScorer(false),
       gate: settings.injectionGate,
+      onDecision: decision => decisions.push(decision),
     })
+    reportGate('techniques', query, decisions)
     techniqueHitCache = { query, hits }
     return hits
   }
@@ -1607,6 +1761,45 @@ export function apply(ctx: Context, config: Config): void {
    *
    * @returns 注入文本；不该注入时为空串。
    */
+  /**
+   * 本会话是否已经查过知识库（`technique_search` / `memory_search` 都算）。
+   *
+   * 只用于**关掉**那条「本会话还没查过库」的提醒：一旦查过就不再重复说 —— 提示语因此是
+   * 有界且自我消除的成本，而不是每轮都付的常驻文本。空的搜索结果也算「查过」：
+   * 提示语要解决的是「没想到去查」，不是「查了没结果」。
+   */
+  const consultedSessions = new Set<string>()
+
+  /**
+   * 汇总库的覆盖：条数 + 主题（领域优先，退到首个标签）。
+   *
+   * 刻意**不按当前技术栈过滤主题**：有 MC 技巧的任务与有 PlantUML 技巧的任务都该知道
+   * 「库里确实有东西」。写死某个技术栈会让别的任务收不到这条信号（实测 MC 移植会话里
+   * 模型 147 次工具调用一次没查库，而提示语只说了一句通用策略）。
+   *
+   * @param docs - 当前会话可见的语料。
+   * @returns 已验证/草稿条数与主题标签（按条数降序，最多 6 个）。
+   */
+  const libraryCoverage = (docs: readonly RecallDoc[]): { verified: number; drafts: number; topics: string[] } => {
+    const counts = new Map<string, number>()
+    let verified = 0
+    let drafts = 0
+    for (const doc of docs) {
+      if (doc.layer !== 'technique') continue
+      if (doc.meta?.status === 'validated' || doc.meta?.status === 'canonical') verified += 1
+      else if (doc.meta?.status === 'draft') drafts += 1
+      // 领域与标签经常同一件事两种写法（`PlantUML` vs `plantuml`）：按小写归并，
+      // 否则覆盖摘要会印出两条重复项。
+      const topic = (doc.meta?.domain ?? doc.meta?.tags?.[0])?.toLowerCase()
+      if (topic !== undefined && topic.length > 0) counts.set(topic, (counts.get(topic) ?? 0) + 1)
+    }
+    const topics = [...counts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .slice(0, 6)
+      .map(([topic, count]) => `${topic} (${count})`)
+    return { verified, drafts, topics }
+  }
+
   const renderGuidance = (): string => {
     if (!settings.guidance || !settings.registerTools) return ''
     const docs = corpusFor(current?.cwd)
@@ -1614,6 +1807,12 @@ export function apply(ctx: Context, config: Config): void {
     // 草稿也算「查得到」：`technique_search(includeDrafts)` 正是要模型主动去翻未验证的知识。
     const hasTechniques = settings.techniques && docs.some(doc => doc.layer === 'technique')
     if (!hasMemories && !hasTechniques) return ''
+    const sessionId = current?.sessionId
+    if (settings.techniques && sessionId !== undefined && !consultedSessions.has(sessionId)) {
+      const coverage = libraryCoverage(gatedCorpus(current?.cwd))
+      const lines = unconsultedGuidanceLines(coverage.verified, coverage.drafts, coverage.topics)
+      return renderBlock(GUIDANCE_BLOCK, [], lines, GUIDANCE_MAX_CHARS)
+    }
     const lines = settings.techniques ? GUIDANCE_LINES : GUIDANCE_MEMORY_ONLY_LINES
     return renderBlock(GUIDANCE_BLOCK, [], lines, GUIDANCE_MAX_CHARS)
   }
@@ -1993,6 +2192,10 @@ export function apply(ctx: Context, config: Config): void {
    * @param ids - 本次返回给模型的技巧 id。
    */
   const noteTechniqueRetrieval = async (ids: readonly string[]): Promise<void> => {
+    // 「查过库」不等于「搜过库」：`technique_get`（按 id 直接读）与 `memory_search` 命中的技巧
+    // 同样是主动咨询。实测子智能体会话只 get 不 search，提醒于是重复了 5–12 次/轮 —— 每轮
+    // 白白多付约 300 字符。这里统一关闭提醒，比在四个调用点各写一遍可靠。
+    if (current !== undefined) consultedSessions.add(current.sessionId)
     const now = Date.now()
     const patched: TechniqueRecord[] = []
     for (const id of new Set(ids)) {
@@ -2089,6 +2292,7 @@ export function apply(ctx: Context, config: Config): void {
   /** 工具行为实现：与提示注入复用同一套存储与召回。 */
   const toolDeps = (): MemoryToolDeps => ({
     async search(query, limit, scope) {
+      if (current !== undefined) consultedSessions.add(current.sessionId)
       const cwd = current?.cwd
       await refresh(cwd)
       // 与注入路径、技巧检索同一套 facet 机制。`scope` 是**真过滤**：
@@ -2193,6 +2397,10 @@ export function apply(ctx: Context, config: Config): void {
           return `Technique adoption: ${adopted}/${total} adopted (${rate}%), ${retrieved} retrieved at least once, `
             + `${coldDrafts} draft(s) never retrieved`
         })(),
+        // 门槛拦下多少条是**看不见的**（不注入就没有痕迹），因此单独报一行：排查
+        // 「不相关技巧仍被注入」时，先看这里是不是 0 —— 0 说明门槛根本没在干活。
+        `Injection gate: ${gateTally.dropped} dropped / ${gateTally.kept} kept since start `
+          + `(last request ${gateTally.lastDropped} dropped / ${gateTally.lastKept} kept)`,
         `Recurring failures: ${[...failureById.values()].filter(record => record.status !== 'deprecated').length} active, `
           + `${[...failureById.values()].filter(record => record.status === 'deprecated').length} resolved, `
           + `${[...failureById.values()].reduce((sum, record) => sum + record.prevented, 0)} prevented`,
@@ -2305,6 +2513,7 @@ export function apply(ctx: Context, config: Config): void {
   /** 技巧工具行为实现。 */
   const techniqueDeps = (): TechniqueToolDeps => ({
     async search(query, limit, includeDrafts, verbose) {
+      if (current !== undefined) consultedSessions.add(current.sessionId)
       const cwd = current?.cwd
       await refresh(cwd)
       // 与注入路径同一份语料：`appliesTo` 判得出来且明确不适用时不给。
@@ -2442,6 +2651,7 @@ export function apply(ctx: Context, config: Config): void {
      * @returns 命中时的新记录，或一句可直接回给模型的拒绝说明。
      */
     async apply(id, outcome, evidence) {
+      if (current !== undefined) consultedSessions.add(current.sessionId)
       const prepared = await prepareAdoption(id, outcome, evidence)
       if (typeof prepared === 'string') return prepared
       const ok = await store.updateTechniques([prepared.record], prepared.record.scope === 'project' ? projectCwd() : undefined)
@@ -2503,6 +2713,7 @@ export function apply(ctx: Context, config: Config): void {
       ].join('\n')
     },
     async learn(path, useModel) {
+      if (current !== undefined) consultedSessions.add(current.sessionId)
       const root = path === undefined || path.trim().length === 0 ? projectCwd() : resolve(path.trim())
       const route = mineRoute()
       const model = route === undefined ? '' : route.model
@@ -2727,6 +2938,9 @@ export function apply(ctx: Context, config: Config): void {
         })
         .finally(() => {
           failuresBySession.delete(id)
+          advisorySeen.delete(id)
+          advisoryLastTurn.delete(id)
+          consultedSessions.delete(id)
           if (state.turns.length > 0) logger.debug(`memory: session ${id} distilled`)
         }),
     )
@@ -2797,6 +3011,31 @@ export function apply(ctx: Context, config: Config): void {
         }), 'memory-layer:failure-guard')
       } else if (settings.failures && settings.failureBlockAfter > 0) {
         logger.warn('memory: tools.guard is absent; hard blocking of repeated failures is disabled')
+      }
+
+      // A：动作点顾问。走 `tools/post-execute` 的 `additionalContexts` —— **不阻断、不改写**
+      // 工具结果（`content` 是替换语义，用它会覆盖工具回执），只给下一条请求附一段上下文。
+      // 按会话去重 + 硬上限，因此成本有界；命中的是符号/领域这类强证据，不是模糊词。
+      if (settings.techniqueAdvisory) {
+        toolCtx.effect(() => toolCtx.on('tools/post-execute', async (exec, result, next) => {
+          const decision = await next()
+          try {
+            if (decision.kind !== 'accept' || result.isError === true) return decision
+            const note = advisoryFor(exec)
+            if (note === undefined) return decision
+            return {
+              ...decision,
+              additionalContexts: [
+                ...(decision.additionalContexts ?? []),
+                advisoryMessage(note),
+              ],
+            }
+          } catch (error) {
+            // 顾问是增益功能：任何失败都不得影响工具调用本身。
+            logger.debug(`memory: advisory skipped (${describe(error)})`)
+            return decision
+          }
+        }), 'memory-layer:technique-advisory')
       }
 
       const definitions = [
@@ -2902,9 +3141,16 @@ function resolveSettings(config: Config): Settings {
     injectionGate: {
       minMatched: config.injectMinMatched ?? 2,
       minScore: config.injectMinScore ?? 0,
+      stopwords: config.injectStopwords ?? [],
+      // 注入永远不按「最近/最自信」注入：空查询没有可核对的意图。实测这正是「重启后
+      // 第一轮又冒出三条 UML 技巧」的机制（那时插件还没捕获到本轮用户文本）。
+      emptyQuery: 'deny',
     },
     guidancePromptOrder: config.guidancePromptOrder ?? 265,
     guidance: config.guidance ?? true,
+    techniqueAdvisory: config.techniqueAdvisory ?? true,
+    techniqueAdvisoryDrafts: config.techniqueAdvisoryDrafts ?? true,
+    techniqueAdvisoryMax: config.techniqueAdvisoryMax ?? 12,
     exampleMaxLines: config.exampleMaxLines ?? 8,
     exampleMaxChars: config.exampleMaxChars ?? 480,
     allowConfidentialGlobal: config.allowConfidentialGlobal ?? false,
@@ -3067,6 +3313,85 @@ function messageText(message: { content?: unknown }): string {
 function isInjectedUserMessage(data: { source?: { kind?: unknown }; content?: unknown }): boolean {
   if (data.source?.kind === 'plugin') return true
   return isInjectedContext(messageText(data))
+}
+
+/**
+ * 把标识符切成小写词：`GTItemDataComponents` → `gt item data components`。
+ *
+ * 顾问要拿它和技巧正文对词，所以必须切：整串 `GTItemDataComponents` 永远不会出现在正文里，
+ * 但 `components` / `data` 会。切完再由 `ADVISORY_NOISE` 剔掉泛化词（`java`/`src`/`data`…）。
+ *
+ * @param text - 原始文本（文件名或标识符）。
+ * @returns 小写词列表（长度 ≥4 的词，或任意中文词）。
+ */
+function camelWords(text: string): string[] {
+  return text
+    .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
+    .split(/[^A-Za-z0-9\u4e00-\u9fa5]+/u)
+    .map(word => word.toLowerCase())
+    .filter(word => word.length >= 4 || /[\u4e00-\u9fa5]/u.test(word))
+}
+
+/**
+ * 从**散文**（`description` / `reason` / `query` 这类字段）里只取**命名实体**：中文词与
+ * 标识符（含点号 / 小驼峰 / ≥2 个大写的 PascalCase / 全大写缩写）。
+ *
+ * 为什么不取普通英文词：实测 `description: "Make the advisory budget configurable…"` 里的
+ * `configurable` / `budget` 直接推出了两条毫不相干的技巧 —— 散文里的英文小写词在双语库里
+ * 太泛化，不构成「这条知识讲的就是你现在改的东西」。中文词与 `DataComponents` 这种标识符
+ * 才有指向性。**句首大写的普通词也不算**：实测 `"Fresh per-turn analysis"` 里的 `Fresh`
+ * 曾被当成标识符，推出了一条讲 ETag 下载的技巧。
+ *
+ * @param text - 散文文本。
+ * @returns 小写词列表。
+ */
+function proseTerms(text: string): string[] {
+  const out: string[] = []
+  const pattern = /[\u4e00-\u9fa5]{2,}|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*|[A-Z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*|[A-Z][A-Z0-9_]{2,}/gu
+  for (const match of text.matchAll(pattern)) out.push(...camelWords(match[0]))
+  return out
+}
+
+/** 代码正文：整段代码/脚本，不能当顾问证据（否则文件里每个词都算相关）。 */
+const ADVISORY_BODY_KEYS: ReadonlySet<string> = new Set(['content', 'command', 'old_string', 'new_string', 'patch', 'text', 'body'])
+
+/** 散文键：只从中取命名实体（见 {@link proseTerms}）。 */
+const ADVISORY_PROSE_KEYS: ReadonlySet<string> = new Set(['description', 'reason', 'summary', 'query', 'goal', 'note'])
+
+/**
+ * 汇总一次工具调用的**顾问证据词**：文件名（去目录/扩展名、驼峰切词）+ 参数里的标识符，
+ * 散文键只取命名实体，代码正文整段跳过。
+ *
+ * @param raw - 工具参数的原始 JSON。
+ * @returns 小写证据词列表。
+ */
+function advisoryTerms(raw: string): string[] {
+  const terms = new Set<string>(camelWords(
+    filesFromArguments(raw).map(path => path.split(/[\\/]/u).at(-1) ?? path).join(' '),
+  ))
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return [...terms]
+  }
+  const walk = (value: unknown, key: string | undefined): void => {
+    if (typeof value === 'string') {
+      if (key === undefined || ADVISORY_BODY_KEYS.has(key)) return
+      const words = ADVISORY_PROSE_KEYS.has(key) ? proseTerms(value) : camelWords(value)
+      for (const word of words) terms.add(word)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, key)
+      return
+    }
+    if (typeof value === 'object' && value !== null) {
+      for (const [childKey, child] of Object.entries(value)) walk(child, childKey)
+    }
+  }
+  walk(parsed, undefined)
+  return [...terms]
 }
 
 /**

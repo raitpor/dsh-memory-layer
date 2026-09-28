@@ -13,7 +13,7 @@
  * @module dsh-memory-layer/distill
  */
 
-import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from './injection.js'
+import { ADVISORY_MARKER, HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from './injection.js'
 import { redactMemory } from './redact.js'
 import { MAX_SUMMARY_CHARS } from './store.js'
 import { TECHNIQUE_KINDS } from './types.js'
@@ -426,6 +426,10 @@ const FILE_RE = /(?:^|[\s“"'([])((?:[\w.@-]+\/)*[\w.@-]+\.(?:ts|tsx|js|jsx|mjs
 const INJECTED_CONTEXT_MARKERS: readonly string[] = [
   ...HOST_CONTEXT_MARKERS,
   ...INJECTION_BLOCKS.map(block => block.header[0] as string),
+  // 技巧顾问（`tools/post-execute` 的 additionalContexts）不占 system prompt 的段位，
+  // 因此不在 INJECTION_BLOCKS 里；但它同样是**本插件注入的上下文**，必须一起挡掉，
+  // 否则顾问文本会被当成用户原话捕获（正是我们要防的那类自我放大）。
+  ADVISORY_MARKER,
 ]
 
 /**

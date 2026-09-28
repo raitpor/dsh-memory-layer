@@ -119,6 +119,36 @@ export const GUIDANCE_LINES: readonly string[] = [
   'Unreported use counts as NOT adopted.',
 ]
 
+/**
+ * 本会话尚未检索过知识库时的指引正文。
+ *
+ * 与 {@link GUIDANCE_LINES} 的区别是**点出库的规模与覆盖**：实测（MC 移植会话）模型在 147 次
+ * 工具调用里一次都没查库，因为系统提示里那句通用策略没有给出「这里确实有东西」的具体信号。
+ * 覆盖范围按**库的实际内容**汇总，不写死某个技术栈 —— 有 MC 技巧的任务和有 PlantUML 技巧的
+ * 任务都该被提醒，写死 java/neoforge 会让别的任务收不到这条提示。
+ *
+ * 首次检索后自动消失（见 `renderGuidance`），所以它是一笔**有界且自我消除**的成本。
+ *
+ * @param verified - 已验证（validated + canonical）条数。
+ * @param drafts - 草稿条数。
+ * @param topics - 库覆盖的主题（领域/标签，按条数降序，已截断）。
+ * @returns 指引正文。
+ */
+export function unconsultedGuidanceLines(
+  verified: number,
+  drafts: number,
+  topics: readonly string[],
+): readonly string[] {
+  const coverage = topics.length === 0 ? '' : ` across ${topics.slice(0, 4).join(', ')}`
+  return [
+    `This session has not consulted the library yet: ${verified} verified + ${drafts} draft(s)${coverage}.`,
+    'Before starting a task — especially on an unfamiliar framework, version or toolchain — search it',
+    '(`technique_search`, add includeDrafts for drafts; `memory_search` for facts). If an entry applies,',
+    'follow it and report with `technique_apply` (id, outcome, evidence); report "failure" if it was wrong.',
+    'Unreported use counts as NOT adopted.',
+  ]
+}
+
 /** 技巧层关闭时的指引正文：只提真实存在的工具。 */
 export const GUIDANCE_MEMORY_ONLY_LINES: readonly string[] = [
   'Before starting a task, search long-term memory for prior facts and preferences (`memory_search`).',
@@ -133,6 +163,26 @@ export const GUIDANCE_MEMORY_ONLY_LINES: readonly string[] = [
  * 在代码里有硬约束。
  */
 export const GUIDANCE_MAX_CHARS = 700
+
+/**
+ * 技巧顾问的块首标记。
+ *
+ * 顾问走 `tools/post-execute` 的 `additionalContexts`（不阻断、不改写工具结果），
+ * 不像前三块那样占用 system prompt 的段位 —— 所以它**不在** {@link INJECTION_BLOCKS} 里
+ * （那份列表同时是段名与顺序的单一事实来源，黑盒用例会拿它与运行时交叉验证）。
+ * 但它必须进 `isInjectedContext` 的识别表：注入的文本不能被当成用户原话再捕获一次。
+ */
+export const ADVISORY_MARKER = 'Knowledge library advisory (dsh-memory-layer):'
+
+/**
+ * 把顾问正文拼成一条可直接投递的上下文文本。
+ *
+ * @param lines - 正文行（不含标记）。
+ * @returns 以 {@link ADVISORY_MARKER} 起头的文本。
+ */
+export function advisoryText(lines: readonly string[]): string {
+  return [ADVISORY_MARKER, ...lines].join('\n')
+}
 
 /** 本插件会注入的全部块；`isInjectedContext` 用它们识别注入内容。 */
 export const INJECTION_BLOCKS: readonly InjectionBlock[] = [

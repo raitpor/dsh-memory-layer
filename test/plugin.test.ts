@@ -1113,7 +1113,14 @@ test('召回与检索按层打标签：技巧不得被标成 episodic', async ()
       { query: 'authorize', scope: 'all' } as never, undefined as never,
     ))
     assert.match(found, new RegExp(seeded[0]!.id, 'u'), `检索应命中该技巧：${found}`)
-    assert.match(found, /\(technique,/u, `检索结果应标 technique：${found}`)
+    // 标签必须带**信任状态**：`memory_search` 不过滤草稿（只有自动注入过滤），同一次检索里
+    // 可能混着 validated 与 draft；都印成 `technique` 会让模型把未验证知识当已验证的用（U1b）。
+    assert.match(
+      found,
+      /\(technique \((draft|validated|canonical)\),/u,
+      `检索结果应标 technique 及其状态：${found}`,
+    )
+    assert.match(found, /\(technique \(validated\),/u, `这四条已回报过成功，应标 validated：${found}`)
   } finally {
     await dispose()
   }
@@ -2530,6 +2537,123 @@ test('technique_learn 从真实代码库挖掘并落盘为草稿，且不泄露�
     await rm(repo, { recursive: true, force: true })
   }
 })
+
+test('U1b/M1/M2：草稿在显式检索里带状态标签，检索被记账，采用率进 stats', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    await toolOf(fake, 'technique_save').execute({
+      name: '草稿条目示例', when: '需要时', summary: '这是一条还没被采用过的草稿。',
+    } as never, undefined as never)
+
+    // U1b：memory_search 返回草稿时必须**标出状态** —— 它不过滤草稿，与已验证条目混在一起时，
+    // 都印 `technique` 会让模型把未验证知识当已验证的用。
+    const found = String(await toolOf(fake, 'memory_search').execute(
+      { query: '草稿条目示例', scope: 'all' } as never, undefined as never,
+    ))
+    assert.match(found, /\(technique \(draft\),/u, `草稿必须带 draft 标签：${found}`)
+
+    // M1：显式检索记账（memory_search 命中 + technique_search 再各计一次）。
+    await toolOf(fake, 'technique_search').execute({ query: '草稿条目示例', includeDrafts: true } as never, undefined as never)
+    const record = (await new MemoryStore(root).readTechniques('global')).find(r => r.name === '草稿条目示例')
+    assert.equal(record?.retrieveCount, 2, `两次显式检索应计两次：${record?.retrieveCount}`)
+    assert.ok((record?.lastRetrievedAt ?? 0) > 0, '应记录最近一次检索时间')
+
+    // M2：采用率与冷启动必须能被看见。
+    const stats = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+    assert.match(
+      stats,
+      /Technique adoption: 0\/1 adopted \(0\.0%\), 1 retrieved at least once, 0 draft\(s\) never retrieved/u,
+      `stats 应报出采用率与冷启动：${stats}`,
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('U1a：默认检索到不了的知识，会告诉模型「有草稿」并给出开关', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    await toolOf(fake, 'technique_save').execute({
+      name: '只有草稿覆盖的主题', when: '遇到该主题时', summary: '正文。',
+    } as never, undefined as never)
+
+    // 旧行为是静默返回「没有匹配」——模型连「该加 includeDrafts」都不知道，草稿于是永远等不到采用。
+    const dflt = String(await toolOf(fake, 'technique_search').execute(
+      { query: '只有草稿覆盖的主题' } as never, undefined as never,
+    ))
+    assert.match(dflt, /No verified technique matched/u, `默认应答应区分「没有已验证的」：${dflt}`)
+    assert.match(dflt, /includeDrafts: true/u, `必须告诉模型开关：${dflt}`)
+
+    const withDrafts = String(await toolOf(fake, 'technique_search').execute(
+      { query: '只有草稿覆盖的主题', includeDrafts: true } as never, undefined as never,
+    ))
+    assert.match(withDrafts, /只有草稿覆盖的主题/u, `给了开关就能看到：${withDrafts}`)
+
+    // 有已验证命中时也要提示「另有草稿被隐藏」。
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: '同一主题的已验证条目', when: '遇到该主题时', summary: '正文。',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
+    const mixed = String(await toolOf(fake, 'technique_search').execute(
+      { query: '该主题' } as never, undefined as never,
+    ))
+    assert.match(mixed, /\(\+\d+ draft\(s\) hidden — includeDrafts: true\)/u, `有隐藏草稿时应提示：${mixed}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('U1c/U4：挖掘回执给出新建草稿的 id，technique_get 给出回报入口', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'dsh-mine-adopt-'))
+  try {
+    await mkdir(join(repo, 'src'), { recursive: true })
+    const body = Array.from({ length: 6 }, (_, index) => `  client.send(payload${index})`).join('\n')
+    await writeFile(join(repo, 'src/app.ts'), `export function run() {\n${body}\n}\n`, 'utf8')
+
+    const { fake, dispose } = await setup({ reflectOnSessionEnd: false, mineStoreStructuralCards: true })
+    try {
+      fake.emit('session/created', fakeSession('s1', repo))
+      await fake.flush()
+      const report = String(await toolOf(fake, 'technique_learn').execute({ path: repo } as never, undefined as never))
+      // U1c：只说「N new」等于把刚学到的知识锁进抽屉 —— 回执必须给把手。
+      assert.match(report, /new drafts you can use right now/u, `回执应列出新草稿：${report}`)
+      const id = /tq_[0-9a-f]{8}/u.exec(report)?.[0]
+      assert.ok(id !== undefined, `回执里应有短 id：${report}`)
+      assert.match(report, /report it via technique_apply/u, `回执应告诉模型怎么回报：${report}`)
+
+      // U4：展开正文的回执里要有回报入口（模型读完正文正是最可能采用的时刻）。
+      const detail = String(await toolOf(fake, 'technique_get').execute({ id } as never, undefined as never))
+      assert.match(detail, /technique_apply\(id, outcome, evidence\)/u, `get 回执应有回报入口：${detail}`)
+      // 解析失败的 id 不该附这句（没有可回报的东西）。
+      const miss = String(await toolOf(fake, 'technique_get').execute({ id: 'tq_nope' } as never, undefined as never))
+      assert.doesNotMatch(miss, /technique_apply\(id, outcome, evidence\)/u, `解析失败时不该提回报：${miss}`)
+    } finally {
+      await dispose()
+    }
+  } finally {
+    await rm(repo, { recursive: true, force: true })
+  }
+})
+
+test('M1 口径：自动注入不计入检索遥测（它每请求都会发生，记账会是写风暴）', async () => {
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    // 这一轮会发生注入（技巧段），但模型没有主动查过任何东西。
+    await runSession(fake, fakeSession('s-inject', '/work/demo'), '集成 OrdersClient 并调用 authorize')
+    const record = (await new MemoryStore(root).readTechniques('global')).find(r => r.id === id)
+    assert.equal(record?.retrieveCount ?? 0, 0, '注入不是模型主动检索')
+    assert.equal(record?.lastRetrievedAt, undefined, '注入不得写时间戳')
+  } finally {
+    await dispose()
+  }
+})
+
 
 test('结构卡的来源是 rule，不能被「这一轮跑过模型」整轮带成 model', async () => {
   // 旧实现按「整轮是否发生模型调用」打标：只要跑过模型，规则路径产出的普查卡也会被记成

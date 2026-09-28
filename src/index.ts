@@ -1860,6 +1860,33 @@ export function apply(ctx: Context, config: Config): void {
     scope === 'project' || settings.allowConfidentialGlobal || (draft.sensitivity ?? 'internal') !== 'confidential'
 
   /**
+   * 记一次「被模型显式检索」（`technique_search` / `technique_get`）。
+   *
+   * 只记显式检索：**自动注入不计数** —— 它每请求都会发生，逐请求记账会变成写风暴；而我们要回答的
+   * 问题恰恰是「模型有没有主动去查」。写失败只记 debug，绝不让记账把检索本身搞挂。
+   *
+   * @param ids - 本次返回给模型的技巧 id。
+   */
+  const noteTechniqueRetrieval = async (ids: readonly string[]): Promise<void> => {
+    const now = Date.now()
+    const patched: TechniqueRecord[] = []
+    for (const id of new Set(ids)) {
+      const record = techniqueById.get(id)
+      if (record === undefined) continue
+      patched.push({ ...record, retrieveCount: (record.retrieveCount ?? 0) + 1, lastRetrievedAt: now })
+    }
+    if (patched.length === 0) return
+    try {
+      const cwd = patched.some(record => record.scope === 'project') ? projectCwd() : undefined
+      await store.updateTechniques(patched, cwd)
+      // 本地索引同步：同一轮里再记账时不能读到旧计数。
+      for (const record of patched) techniqueById.set(record.id, record)
+    } catch (error) {
+      logger.debug(`memory: could not record technique retrieval: ${describe(error)}`)
+    }
+  }
+
+  /**
    * 按 id 删除一条技巧，并返回人类可读的应答。
    *
    * `memory_forget`（拿到 `memory_search` 的 id）与 `technique_forget` 共用它，
@@ -1945,6 +1972,9 @@ export function apply(ctx: Context, config: Config): void {
       const corpus = corpusFor(cwd)
       const scoped = scope === 'all' ? corpus : corpus.filter(doc => doc.meta?.scope === scope)
       const hits = recallDocsFacets(query, scoped, { limit, extra: searchExtrasFor(current?.turns ?? [], query) })
+      // 技巧也会从这里返回（`memory_search` 不过滤草稿），所以同样计入检索遥测：
+      // 遥测问的是「模型有没有主动查过它」，与经由哪个工具无关。
+      await noteTechniqueRetrieval(hits.filter(hit => hit.layer === 'technique').map(hit => hit.id))
       if (hits.length === 0) return `No memory matched "${query}" (scope ${scope}).`
       return [
         `${hits.length} memory item(s) for "${query}" (scope ${scope}):`,
@@ -2027,6 +2057,17 @@ export function apply(ctx: Context, config: Config): void {
         `Episodic summaries: ${episodic} (this project) · ${episodicTotal} (all projects)`,
         `Semantic facts: ${semantic}${superseded === 0 ? '' : ` (${superseded} superseded, not injected)`}`,
         `Techniques: ${verified} verified, ${techniques.length - verified} draft`,
+        // M2：采用率与「检索过但未采用」——冷启动问题必须能被看见，否则任何"让模型更主动"的
+        // 改动都无法判断是否有效。没有 retrieveCount 的历史记录按「从未被显式检索」计。
+        (() => {
+          const total = techniques.length
+          const adopted = techniques.filter(record => record.successes > 0).length
+          const retrieved = techniques.filter(record => (record.retrieveCount ?? 0) > 0).length
+          const coldDrafts = techniques.filter(record => record.status === 'draft' && (record.retrieveCount ?? 0) === 0).length
+          const rate = total === 0 ? '0' : (100 * adopted / total).toFixed(1)
+          return `Technique adoption: ${adopted}/${total} adopted (${rate}%), ${retrieved} retrieved at least once, `
+            + `${coldDrafts} draft(s) never retrieved`
+        })(),
         `Recurring failures: ${[...failureById.values()].filter(record => record.status !== 'deprecated').length} active, `
           + `${[...failureById.values()].filter(record => record.status === 'deprecated').length} resolved, `
           + `${[...failureById.values()].reduce((sum, record) => sum + record.prevented, 0)} prevented`,
@@ -2146,18 +2187,32 @@ export function apply(ctx: Context, config: Config): void {
       const docs = gatedCorpus(cwd)
       const extras = searchExtrasFor(current?.turns ?? [], query)
       const facets = facetQueries(query, docs, extras)
-      const hits = recallFacets(query, docs, {
+      const recallOptions = {
         limit,
         ...(current?.stack === undefined ? {} : { stack: current.stack }),
         partition: settings.partition,
-        includeDrafts,
         symbols: symbolsInText(query),
         extra: extras,
+      }
+      const hits = recallFacets(query, docs, {
+        ...recallOptions,
+        includeDrafts,
         scorer: indexScorer(includeDrafts),
       })
+      // U1a：默认过滤掉草稿时**承认它们存在**。此前是静默吞掉 —— 模型既看不到草稿，
+      // 也就不知道「该加 includeDrafts」，草稿于是永远等不到采用（冷启动死循环的第一环）。
+      // 这里只给**数量与开关**，不给正文，仍然守住「未验证知识不自动进上下文」的原则。
+      const hiddenDrafts = includeDrafts
+        ? []
+        : recallFacets(query, docs, { ...recallOptions, limit: 5, includeDrafts: true, scorer: indexScorer(true) })
+          .filter(hit => techniqueById.get(hit.id)?.status === 'draft')
       if (hits.length === 0) {
-        return `No technique matched "${query}" for the current stack.`
+        return hiddenDrafts.length === 0
+          ? `No technique matched "${query}" for the current stack.`
+          : `No verified technique matched "${query}" for the current stack, but ${hiddenDrafts.length} draft(s) do — `
+            + 'call again with includeDrafts: true to read them (drafts are unverified: check before relying on them).'
       }
+      await noteTechniqueRetrieval(hits.map(hit => hit.id))
       // 把 facet 写进表头：一次调用覆盖了哪几个主题是**可核对**的，而不是黑箱。
       const facetNote = facets.length > 1 ? ` (facets: ${facets.slice(1, 5).join(' | ')})` : ''
       // 候选分两档付钱：前几条给可执行要点，其余只给「还存在」的指针。
@@ -2172,8 +2227,11 @@ export function apply(ctx: Context, config: Config): void {
       }
       const detailed = hits.slice(0, DETAILED_HITS)
       const tail = hits.slice(DETAILED_HITS)
+      const draftNote = hiddenDrafts.length === 0
+        ? ''
+        : ` (+${hiddenDrafts.length} draft(s) hidden — includeDrafts: true)`
       const lines = [
-        `${hits.length} technique(s) for "${query}"${includeDrafts ? ' (including drafts)' : ''}${facetNote}:`,
+        `${hits.length} technique(s) for "${query}"${includeDrafts ? ' (including drafts)' : ''}${facetNote}${draftNote}:`,
         ...detailed.map((hit, index) => render(hit, index, true)),
       ]
       if (tail.length > 0) {
@@ -2188,14 +2246,21 @@ export function apply(ctx: Context, config: Config): void {
       await refresh(current?.cwd)
       const records = [...techniqueById.values()]
       const blocks: string[] = []
+      const resolvedIds: string[] = []
       for (const needle of ids) {
         const resolved = resolveTechniqueId(needle, records)
+        if (resolved.ok) resolvedIds.push(resolved.record.id)
         blocks.push(resolved.ok
           ? formatTechniqueDetail(resolved.record)
           : `No technique resolved for "${needle}": ${resolved.reason}.`)
       }
-      // 一次展开多条时用分隔线划清边界：正文之间没有围栏会让下一条的字段看起来属于上一条。
-      return blocks.join('\n\n---\n\n')
+      await noteTechniqueRetrieval(resolvedIds)
+      // U4：回报入口贴到**使用现场**。此前这句只在注入块里，而模型读完正文正是最可能真正采用、
+      // 也最容易顺手回报的时刻 —— 回执里没有入口，采用率就靠模型自己想起来。
+      const body = blocks.join('\n\n---\n\n')
+      if (resolvedIds.length === 0) return body
+      return `${body}\n\nIf you actually apply one of these, report it with `
+        + '`technique_apply(id, outcome, evidence)` — anything you do not report counts as NOT adopted.'
     },
     async save(input) {
       const scope = settings.scopeTechnique
@@ -2345,6 +2410,10 @@ export function apply(ctx: Context, config: Config): void {
       const storable = outcome.candidates.filter(candidate => storableDraft(candidate.draft, scope))
       // 来源按**候选**打标，而不是「这一轮跑过模型就算 model」—— 否则规则路径产出的结构卡
       // 会被标成模型知识（实测 116 张普查卡全部如此），来源标记本身就失真了。
+      // U1c：记住落盘前已有的 id，落盘后就能说出**这一轮新建了哪几条**（带回执的 id，
+      // 模型当场就能 technique_get / technique_apply —— 知识刚从手上的代码里提出，
+      // 此刻可用性先验最高；只说「N new」等于把刚学到的东西锁进抽屉）。
+      const knownBefore = new Set(techniqueById.keys())
       let created = 0
       let merged = 0
       for (const origin of ['model', 'rule'] as const) {
@@ -2363,6 +2432,16 @@ export function apply(ctx: Context, config: Config): void {
       await refresh(cwd)
 
       const { stats } = outcome
+      const freshDrafts = [...techniqueById.values()]
+        .filter(record => !knownBefore.has(record.id))
+        .slice(0, 3)
+      const freshLines = freshDrafts.length === 0
+        ? []
+        : [
+          '- new drafts you can use right now (id — name):',
+          ...freshDrafts.map(record => `  ${record.id.slice(0, 11)} — ${record.name.slice(0, 70)}`),
+          '  expand with technique_get; if you apply one, report it via technique_apply(id, outcome, evidence)',
+        ]
       // 结构观察进**报告**而不是进库：它是「这个仓库长什么样」，不是可复用的知识。
       const topObservations = [...outcome.observations]
         .sort((left, right) => right.occurrences - left.occurrences)
@@ -2374,6 +2453,7 @@ export function apply(ctx: Context, config: Config): void {
         `- clusters: ${stats.clusters}, model calls: ${stats.modelCalls}${stats.timedOut ? ' (timed out, partial result kept)' : ''}`,
         `- candidates: ${outcome.candidates.length} passed, ${outcome.rejected.length} rejected by leak check`,
         `- stored as drafts: ${created} new, ${merged} merged`,
+        ...freshLines,
         ...(outcome.observations.length === 0 || settings.mineStoreStructuralCards
           ? []
           : [

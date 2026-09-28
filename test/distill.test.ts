@@ -6,7 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { distill, distillWithModel, distillWithRules, isInjectedContext } from '../src/distill.js'
+import { DISTILL_SYSTEM_PROMPT, distill, distillWithModel, distillWithRules, isInjectedContext } from '../src/distill.js'
 import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from '../src/injection.js'
 import type { Transcript } from '../src/distill.js'
 import type { LiveTurn } from '../src/types.js'
@@ -210,4 +210,16 @@ test('模型提炼的调用面：symbol 必填，signature/notes 可选，超量
   assert.equal(api[0]?.notes, 'call it first')
   assert.equal(api[1]?.signature, undefined, '未给出就不写该字段')
   assert.equal(api[2]?.notes, undefined, '空串同样不写')
+})
+
+test('提炼提示词只收「本次工作新确立」的技巧，并允许空产出', () => {
+  // B：候选判据。原措辞只说 `reusable KNOWLEDGE`，于是反思会复述模型先验里已有的东西
+  // （库因此以近重复条目膨胀），也不会主动放弃产出。四条要求分别是：只收本次新确立的、
+  // 门槛是「称职工程师不会预先知道」、必须给出发现锚点、空产出是正常结果。
+  const prompt = DISTILL_SYSTEM_PROMPT
+  assert.match(prompt, /ONLY what THIS session newly established/u)
+  assert.match(prompt, /a competent engineer would not already know/u)
+  assert.match(prompt, /No anchor, no entry/u)
+  assert.match(prompt, /EMPTY array is a common and correct outcome/u)
+  assert.match(prompt, /Never restate a technique that was merely retrieved/u)
 })

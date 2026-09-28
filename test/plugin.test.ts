@@ -987,9 +987,11 @@ test('摊销式反思：每积累 reflectMinTurns 个新轮次就反思一次，
   }
 })
 
-test('退避不是死锁：退避期间的普通信号不反思，用户纠偏能放行一次', async () => {
+test('退避是频率限制：窗口里有库未覆盖的文件时仍会反思（不再永久关闭学习）', async () => {
+  // 实测缺陷：退避一旦置位就永久关闭反思（清零要求「有一次反思产出新东西」，而退避期间
+  // 反思根本不会跑）——容器里 reflections 卡在 17、model 产出停在 11:04，同期模型自己
+  // technique_save 了 13 条。现在退避只在「连续空产出 **且这一窗口没有新领域**」时跳过。
   const counter = { calls: 0 }
-  // 模型每次都回「没有新技巧」，于是每次反思都记一次「无新产出」。
   const emptyPayload = { title: 't', summary: 's', techniques: [] }
   const { fake, dispose } = await setup(
     {
@@ -1009,17 +1011,64 @@ test('退避不是死锁：退避期间的普通信号不反思，用户纠偏�
     await fake.flush()
     assert.equal(counter.calls, 1, '首次有学习信号应反思')
 
-    // 退避期间：新会话、照样有用工具，但成本闸门应当拦住。
-    await runSession(fake, fakeSession('s2', '/work/demo'), '再改一下 src/b.ts。', ['src/b.ts'])
+    // 退避期间遇到**库没有覆盖的文件**（新领域）：这正是最该沉淀的时刻，必须放行。
+    await runSession(fake, fakeSession('s2', '/work/demo'), '改一下 src/unknown-territory.ts。', ['src/unknown-territory.ts'])
     fake.emit('session/disposed', fakeSession('s2', '/work/demo'))
     await fake.flush()
-    assert.equal(counter.calls, 1, '退避期间普通信号不应再花钱')
+    assert.equal(counter.calls, 2, '退避期间的新领域仍应反思')
 
-    // 用户纠偏是最高价值信号：它必须能穿透退避，否则退避永远等不到清零的那次反思。
+    // 用户纠偏是最高价值信号：它同样穿透退避。
     await runSession(fake, fakeSession('s3', '/work/demo'), '不对，应该先注册 BlockItem。', ['src/c.ts'])
     fake.emit('session/disposed', fakeSession('s3', '/work/demo'))
     await fake.flush()
-    assert.equal(counter.calls, 2, '用户纠偏应绕过退避')
+    assert.equal(counter.calls, 3, '用户纠偏应绕过退避')
+  } finally {
+    await dispose()
+  }
+})
+
+test('退避期间、窗口全被库覆盖时不反思（成本控制仍然成立）', async () => {
+  // 退避的意义是「同一片已知领域里反复反思没有产出，就别再花钱」——这条语义必须保住，
+  // 否则 A 的修改会把成本闸门一起拆掉。
+  const counter = { calls: 0 }
+  const emptyPayload = { title: 't', summary: 's', techniques: [] }
+  const { fake, dispose } = await setup(
+    {
+      provider: 'test',
+      model: 'test',
+      reflectMinTurns: 1,
+      reflectBackoffAfterEmpty: 1,
+      reflectNoveltyThreshold: 0,
+    },
+    true,
+    { llm: fakeLlm(emptyPayload, counter) },
+  )
+  try {
+    // 先让库里有一条**覆盖 `covered.ts`** 的技巧：正文里出现它的词元，于是这个文件不算新领域。
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    fake.emit('session/event', seed, event('turn/start', { turn: 1 }))
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'covered.ts 的改动要点',
+      when: '编辑 covered.ts 时',
+      summary: 'covered.ts 里有两处注册顺序要求。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    // 第一次反思空产出 → 退避。
+    await runSession(fake, fakeSession('s1', '/work/demo'), '改一下 src/covered.ts。', ['src/covered.ts'])
+    fake.emit('session/disposed', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    assert.equal(counter.calls, 1, '首次应反思')
+    // 退避期间同一片已知领域 → 不再花钱。
+    await runSession(fake, fakeSession('s2', '/work/demo'), '再改一下 src/covered.ts。', ['src/covered.ts'])
+    fake.emit('session/disposed', fakeSession('s2', '/work/demo'))
+    await fake.flush()
+    assert.equal(counter.calls, 1, '退避期间、无新领域时不应再花钱')
   } finally {
     await dispose()
   }
@@ -4261,6 +4310,97 @@ test('未检索提醒：technique_get 也算「查过库」（实测子智能体
       /has not consulted/u,
       'get 之后提醒必须消失',
     )
+  } finally {
+    await dispose()
+  }
+})
+
+test('C：反射把「本会话刚读过的条目」再写一遍时被落盘前拦下，真新知识照常落盘', async () => {
+  // 模型读过某条技巧的正文后，反思里很容易把它换个措辞再交一遍 —— 那是库在自言自语，
+  // 不是学习。过滤器用**包含度**判定（阈值 0.5：读过的条目更该拦），并且只拦复述。
+  const counter = { calls: 0 }
+  const restated = {
+    kind: 'procedure',
+    name: 'authorize before create',
+    when: 'integrating the orders client',
+    summary: 'Call authorize before create.',
+  }
+  const fresh = {
+    kind: 'procedure',
+    name: '新领域的一条独立结论',
+    when: '遇到此前没见过的错误签名 XZ-42 时',
+    summary: '先看 XZ-42 的完整栈，再决定改哪一层。',
+  }
+  const { fake, root, dispose } = await setup(
+    { provider: 'test', model: 'test', reflectMinTurns: 1, reflectNoveltyThreshold: 0 },
+    true,
+    { llm: fakeLlm({ title: 't', summary: 's', techniques: [restated, fresh] }, counter) },
+  )
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    // 1) 本会话**读过**这条技巧（这是过滤器的关键输入）。
+    await toolOf(fake, 'technique_get').execute({ ids: [id] } as never, undefined as never)
+    fake.emit('session/event', session, userMessage('继续改 src/unknown-thing.ts。'))
+    fake.emit('session/event', session, event('tool/call', {
+      turn: 1,
+      step: 1,
+      callId: 'c1',
+      name: 'edit_file',
+      arguments: JSON.stringify({ file_path: 'src/unknown-thing.ts' }),
+    }))
+    fake.emit('session/event', session, event('turn/end', { turn: 1, reason: 'completed' }))
+    await fake.flush()
+    const created = (await new MemoryStore(root).readTechniques('global'))
+      .map(record => record.name)
+    assert.ok(created.includes('新领域的一条独立结论'), `真新知识应落盘：${created.join(' | ')}`)
+    assert.equal(
+      created.filter(name => name === 'authorize before create').length,
+      1,
+      '复述不得再产生一条近重复条目',
+    )
+    const report = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+    assert.match(report, /Restatement filter: [1-9]\d* candidate/u, `stats 应报出拦截：${report}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('C：真新知识不会被复述过滤误杀（阈值有实测余量：真新 ≤0.412 < 0.6）', async () => {
+  const counter = { calls: 0 }
+  const payload = {
+    title: 't',
+    summary: 's',
+    techniques: [
+      {
+        kind: 'procedure',
+        name: '把长尾错误按文件切成互不重叠的包并行处理',
+        when: '首轮编译错误还有上千条、但已经不再是同形错误时',
+        summary: '按文件聚类后分给并行子代理，编译权集中在协调者手里，避免各自跑一遍全量构建。',
+        verify: ['每个包只改自己的文件，协调者统一编译'],
+      },
+      {
+        kind: 'pitfall',
+        name: '同一个常量类里的同形字段可能有不同静态类型',
+        when: '按类批量替换字段访问时',
+        summary: '必须逐字段查声明类型，按类批量处理会产出能编译但语义错位的代码。',
+      },
+    ],
+  }
+  const { fake, root, dispose } = await setup(
+    { provider: 'test', model: 'test', reflectMinTurns: 1, reflectNoveltyThreshold: 0 },
+    true,
+    { llm: fakeLlm(payload, counter) },
+  )
+  try {
+    await runSession(fake, fakeSession('s1', '/work/demo'), '继续处理长尾错误。', ['src/legacy/deep/Unknown.java'])
+    fake.emit('session/disposed', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const names = (await new MemoryStore(root).readTechniques('global')).map(record => record.name)
+    assert.equal(names.length, 2, `两条真新知识都应落盘：${names.join(' | ')}`)
   } finally {
     await dispose()
   }

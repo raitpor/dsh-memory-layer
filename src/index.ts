@@ -75,6 +75,7 @@ import {
   techniqueInjectionLine,
   techniqueSearchLine,
   techniqueTailLine,
+  maxContainment,
 } from './technique.js'
 import {
   DEFAULT_GUARD_TOOLS,
@@ -480,6 +481,36 @@ export const STANDING_RULE_NOTICE: readonly string[] = [
   'Entries marked `long-term preference` / `long-term constraint` below are STANDING RULES:',
   'they apply to every task regardless of topic, and a newer user instruction overrides them.',
 ]
+
+/** 落盘前判「库内复述」的包含度门槛（真库实测：真新知识 ≤0.412，近重复 ≥0.53）。 */
+const LIBRARY_RESTATEMENT_RATIO = 0.6
+
+/** 落盘前判「复述本会话刚读过的条目」的包含度门槛；比库内复述更该拦，所以更低。 */
+const SESSION_RESTATEMENT_RATIO = 0.5
+
+/**
+ * 把一条技巧草稿压成用于复述比对的正文。
+ *
+ * 与存储用的 `techniqueText` 保持同源字段（名称/触发/正文/步骤/不变量/坑/判据），
+ * 因为这些正是「这条技巧讲的是什么」的全部信息。
+ *
+ * @param draft - 技巧草稿。
+ * @returns 用于比对的文本。
+ */
+function draftText(draft: TechniqueDraft): string {
+  return [
+    draft.name,
+    draft.when,
+    draft.summary,
+    ...(draft.steps ?? []),
+    ...(draft.invariants ?? []),
+    ...(draft.pitfalls ?? []),
+    ...(draft.verify ?? []),
+    draft.reuse ?? '',
+    draft.subject ?? '',
+    draft.location ?? '',
+  ].filter(part => part.length > 0).join('\n')
+}
 
 /** 失败预警注入 section 名。 */
 export const FAILURE_SECTION_NAME = FAILURE_BLOCK.section
@@ -1365,9 +1396,32 @@ export function apply(ctx: Context, config: Config): void {
 
     let created = 0
     let merged = 0
-    const drafts = settings.techniques
+    // C：落盘前的**免费**过滤（不花模型钱）。模型很容易把「本会话刚检索到的库内条目」或
+    // 「同一领域既有结论」换个措辞再交一遍 —— 那不是学习，是自我循环，会让库以近重复条目
+    // 膨胀、把注入预算耗在互相复述上。阈值不是拍脑袋：真库实测「最近 2 小时模型显式保存的
+    // 13 条真新知识」对全库的最大包含度是 **0.412**，而库内近重复的 top10 在 0.53–0.63，
+    // 因此库内复述取 0.6（留 0.19 余量）、「本会话刚读过」取 0.5（更该拦）。
+    const candidates = settings.techniques
       ? memory.techniques.filter(draft => storable(draft, settings.scopeTechnique))
       : []
+    const libraryTexts = [...techniqueById.values()].map(record => techniqueText(record))
+    const sessionTexts = [...(retrievedBySession.get(state.sessionId) ?? [])]
+      .map(id => techniqueById.get(id))
+      .filter((record): record is TechniqueRecord => record !== undefined)
+      .map(record => techniqueText(record))
+    const drafts: TechniqueDraft[] = []
+    for (const draft of candidates) {
+      const text = draftText(draft)
+      if (maxContainment(text, sessionTexts, tokenize) >= SESSION_RESTATEMENT_RATIO) {
+        restatementDrops.push(`${draft.name}（本会话已读过）`)
+        continue
+      }
+      if (maxContainment(text, libraryTexts, tokenize) >= LIBRARY_RESTATEMENT_RATIO) {
+        restatementDrops.push(draft.name)
+        continue
+      }
+      drafts.push(draft)
+    }
     if (drafts.length > 0) {
       const techniqueScope = settings.scopeTechnique
       const techniqueCwd = techniqueScope === 'project' ? state.cwd : undefined
@@ -1396,6 +1450,40 @@ export function apply(ctx: Context, config: Config): void {
    */
   const turnsSinceReflection = (state: LiveSession): LiveTurn[] =>
     state.turns.slice(state.reflectedTurns ?? 0)
+
+  /**
+   * 窗口里有没有**新领域**：出现了「库里没有任何技巧覆盖的文件」。
+   *
+   * 这是退避的解药，也是「值得学习」的正判据：真实工作里最值得沉淀的时刻，是碰到
+   * 库还不认识的东西（新模块、没见过的 API、陌生工具链）。实测（GT6 移植）：库覆盖了该
+   * 领域之后，词面新颖度闸门把反思长期关在门外 —— `reflections` 卡在 17、`model` 产出停在
+   * 11:04，而同期模型自己 `technique_save` 了 13 条。退避因此必须是**频率限制**而不是开关。
+   *
+   * 判据用「文件主键有没有被任何技巧的正文/符号命中」而不是词面重叠：前者与库的覆盖度直接
+   * 相关，后者会被「同一领域里的常见词」压低到阈值以下。
+   *
+   * @param fresh - 自上次反思以来新增的轮次。
+   * @returns 是否存在未被任何技巧覆盖的文件。
+   */
+  const hasNewGround = (fresh: readonly LiveTurn[]): boolean => {
+    const files = [...new Set(fresh.flatMap(turn => turn.files))]
+    if (files.length === 0) return false
+    const docs = [...techniqueById.values()].map(record => toTechniqueDocs([record])[0]).filter(doc => doc !== undefined)
+    return files.some(file => {
+      // 「新领域」不等于「库还没覆盖」：**已经为它花过一次反思却一无所获**的地面不算新 ——
+      // 否则遇到「库永远学不会的领域」时，每次窗口都算新领域，退避形同虚设、成本失控
+      // （既有用例「纯重复会话不新建记录且模型调用为 0」正是这个反例）。
+      if (spentGround.has(file)) return false
+      const base = file.split(/[\\/]/u).at(-1) ?? file
+      const terms = [...new Set(tokenize(base))]
+      if (terms.length === 0) return false
+      return advisoryMatches(docs, terms, { limit: 1 }).length === 0
+    })
+  }
+
+  /** 已经花过一次反思却无所获的文件（进程内）：用于把「新领域」限成「**尚未**花过钱的地面」。
+   * 进程内即可 —— 重启后重试一次是合理代价，而它换来的是「不会在同一片地面反复付费」。 */
+  const spentGround = new Set<string>()
 
   /**
    * 决定这次是否**花钱**调用模型做反思。
@@ -1427,7 +1515,13 @@ export function apply(ctx: Context, config: Config): void {
     if (hasCorrectionSignal(fresh)) {
       return { reflect: true, reason: `${fresh.length} new turn(s), user correction` }
     }
-    if (metrics.backoff) return { reflect: false, reason: 'backoff after empty reflections' }
+    // 退避是**频率限制**而不是永久开关：只在「连续空产出 **且这一窗口没有新领域**」时跳过。
+    // 旧实现一旦退避就再也不会反思（清零要求「有一次反思产出新东西」），于是自动学习被
+    // 永久关闭 —— 实测 reflections 卡在 17、model 产出停在 11:04，而同期模型自己存了 13 条。
+    const newGround = hasNewGround(fresh)
+    if (metrics.backoff && !newGround) {
+      return { reflect: false, reason: 'backoff (no new ground in this window)' }
+    }
     // 比较必须「同口径」：既有技巧是**去标识化后**存储的，转录也要先过同一道占位符化，
     // 否则项目私有标识符每次都算「新词」，闸门永远关不上。
     const identifiers = identifiersFromPaths(fresh.flatMap(turn => turn.files))
@@ -1436,6 +1530,8 @@ export function apply(ctx: Context, config: Config): void {
       query,
       [...techniqueById.values()].map(record => techniqueText(record)),
     )
+    // 有新领域时不看词面新颖度：库覆盖了该领域之后，这个数必然被压低（正是它把学习关掉的）。
+    if (newGround) return { reflect: true, reason: `${fresh.length} new turn(s), new ground` }
     if (novelty < settings.reflectNoveltyThreshold) return { reflect: false, reason: `novelty ${novelty.toFixed(2)}` }
     return { reflect: true, reason: `${fresh.length} new turn(s), novelty ${novelty.toFixed(2)}` }
   }
@@ -1467,6 +1563,7 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
     // 反思是一次有界调用：转录按配置截断后再送审。
+    const windowTurns = turnsSinceReflection(state)
     const capped = capTranscript(transcript, settings.reflectMaxTranscriptChars)
     // 只有真正付出模型调用才推进水位。被闸门拦下或没有路由时不推进，
     // 这些轮次留待下次继续参与判定，不会被永久跳过。
@@ -1483,6 +1580,11 @@ export function apply(ctx: Context, config: Config): void {
       metrics.emptyStreak += 1
       metrics.backoff = metrics.emptyStreak >= settings.reflectBackoffAfterEmpty
     }
+    // 这一窗口的文件记成「已花过钱的地面」——**无论产出与否**。两个理由：
+    // 1. 库里的正文经去标识化（`src/BlockRegistry.java` → 占位符），文件真名通常不在库里，
+    //    所以「库未覆盖」会把已覆盖的文件也判成新领域；靠这次记账兜住成本。
+    // 2. 退避期间的语义是「一片地面只试一次」：新文件给一次机会，重复窗口不再付费。
+    for (const turn of windowTurns) for (const file of turn.files) spentGround.add(file)
     logger.debug(
       `memory: reflected on ${state.sessionId} (${decision.reason}): +${outcome.created} new, ${outcome.merged} merged`,
     )
@@ -1543,6 +1645,12 @@ export function apply(ctx: Context, config: Config): void {
    * 顾问出现在动作点，必须去重：同一条知识只提一次（上限见 {@link ADVISORY_MAX_PER_SESSION}）。
    */
   const advisorySeen = new Map<string, Set<string>>()
+
+  /** 本会话**读过**（search/get/memory_search 命中）的技巧 id：用于拦「复述刚读到的条目」。 */
+  const retrievedBySession = new Map<string, Set<string>>()
+
+  /** 落盘前被判为复述而丢弃的候选（进程内计数，供 `memory_stats` 观测过滤是否在干活）。 */
+  const restatementDrops: string[] = []
 
   /**
    * 每个会话最后一次投递顾问的**轮号**（每轮最多一条）。
@@ -2195,7 +2303,13 @@ export function apply(ctx: Context, config: Config): void {
     // 「查过库」不等于「搜过库」：`technique_get`（按 id 直接读）与 `memory_search` 命中的技巧
     // 同样是主动咨询。实测子智能体会话只 get 不 search，提醒于是重复了 5–12 次/轮 —— 每轮
     // 白白多付约 300 字符。这里统一关闭提醒，比在四个调用点各写一遍可靠。
-    if (current !== undefined) consultedSessions.add(current.sessionId)
+    if (current !== undefined) {
+      consultedSessions.add(current.sessionId)
+      // 记下「本会话读过哪些技巧」：落盘前用它拦掉「把刚读到的条目再写一遍」（见 C）。
+      const seen = retrievedBySession.get(current.sessionId) ?? new Set<string>()
+      for (const id of ids) seen.add(id)
+      retrievedBySession.set(current.sessionId, seen)
+    }
     const now = Date.now()
     const patched: TechniqueRecord[] = []
     for (const id of new Set(ids)) {
@@ -2412,6 +2526,10 @@ export function apply(ctx: Context, config: Config): void {
         `Active session turns (transient): ${current?.turns.length ?? 0}`,
 
         `Experience compounding: reflections=${metrics.reflections}, skipped=${metrics.skipped}, new=${metrics.newTechniques}, duplicates=${metrics.duplicateTechniques}, backoff=${metrics.backoff}`,
+        // 复述过滤是在花完模型调用**之后**才起作用的，所以必须报出来：否则「反思跑了但没落盘」
+        // 会被误读成「反思没学到东西」。
+        `Restatement filter: ${restatementDrops.length} candidate(s) dropped this process`
+          + (restatementDrops.length === 0 ? '' : ` — e.g. ${restatementDrops.slice(-3).join(' | ')}`),
       ].join('\n')
     },
   })
@@ -2940,6 +3058,7 @@ export function apply(ctx: Context, config: Config): void {
           failuresBySession.delete(id)
           advisorySeen.delete(id)
           advisoryLastTurn.delete(id)
+          retrievedBySession.delete(id)
           consultedSessions.delete(id)
           if (state.turns.length > 0) logger.debug(`memory: session ${id} distilled`)
         }),

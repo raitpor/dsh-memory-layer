@@ -170,6 +170,38 @@ function firstSentence(summary: string): string {
  * @param record - 技巧记录。
  * @returns 置信度。
  */
+/**
+ * 候选正文对既有技巧的**最大包含度**：候选里有多大比例的 token 已经出现在某条既有技巧里。
+ *
+ * 用途是落盘前的**免费**过滤：模型很容易把「本会话刚检索到的库内条目」或「同一领域的既有
+ * 结论」换个措辞再交一遍，那不是学习，而是自我循环 —— 它会让库以近重复条目膨胀，并把
+ * 注入预算耗在互相复述上。用包含度而不是 Jaccard：候选通常比既有条目短，Jaccard 会被长度
+ * 差异摊平（一条 20 词的新写法对 200 词的既有条目，Jaccard 只有 0.1，包含度才有意义）。
+ *
+ * @param text - 候选正文（已 tokenize 前的原文）。
+ * @param others - 既有技巧正文（逐条）。
+ * @param tokenize - 分词函数（由调用方注入，避免本模块依赖召回层）。
+ * @returns 0–1 的最大包含度；候选为空或既有语料为空时返回 0。
+ */
+export function maxContainment(
+  text: string,
+  others: readonly string[],
+  tokenize: (input: string) => readonly string[],
+): number {
+  const tokens = new Set(tokenize(text))
+  if (tokens.size === 0) return 0
+  let best = 0
+  for (const other of others) {
+    const existing = new Set(tokenize(other))
+    if (existing.size === 0) continue
+    let shared = 0
+    for (const token of tokens) if (existing.has(token)) shared += 1
+    const ratio = shared / tokens.size
+    if (ratio > best) best = ratio
+  }
+  return best
+}
+
 export function confidenceOf(record: TechniqueRecord): number {
   return (record.successes + 1) / (record.successes + record.failures + 2)
 }

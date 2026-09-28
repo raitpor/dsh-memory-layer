@@ -183,6 +183,65 @@ interface ScoreOptions {
 }
 
 /**
+ * 这条记忆是不是**常驻规则**（长期偏好 / 约束）。
+ *
+ * 偏好与约束描述的是「用户/项目一贯要怎样」，它们对**任何**任务都成立，因此相关性判据
+ * 在这里没有意义：一条「不要自动提交」的约束不会因为本轮聊的是正则表达式就失效。
+ * `fact` / `decision` 不同 —— 它们是关于某件事的陈述，只在相关时才值得占用上下文。
+ */
+export function isStandingRule(doc: RecallDoc): boolean {
+  if (doc.layer !== 'semantic') return false
+  const kind = doc.meta?.kind
+  return kind === 'preference' || kind === 'constraint'
+}
+
+/**
+ * 相关性门槛：**命中查询词数**与**绝对分数**两条下限（记忆层与技巧层共用）。
+ *
+ * 为什么要「命中词数」而不是只看分数：BM25 的分数取决于 IDF，而 IDF 取决于**库的规模** ——
+ * 同一条命中在 354 条的库里是 2.7，在 2 条的库里只有 0.5，在 5000 条的库里是 12。
+ * 绝对分数门槛因此天然不可移植：定得动真库就会把新装的小库整段杀掉。
+ * 「命中几个不同的查询词」没有这个毛病 —— 不相关轮次的特征是「只见一个常见词」。
+ */
+export interface RelevanceGate {
+  /**
+   * 命中的**不同查询词**数下限；查询词本身不超过 2 个时自动降为 1。
+   *
+   * 为什么对短查询放宽：`PlantUML 中文` 这种两词查询只命中一个词可能正是正确答案，
+   * 按 2 硬卡会误杀；而真库实测的不相关轮次都是「四五个词里只中一个」。
+   */
+  minMatched?: number
+  /** 绝对 BM25 分数下限（`0`/省略表示关闭）。只适合库规模稳定的大库，作为补充旋钮。 */
+  minScore?: number
+}
+
+/**
+ * 判断一条打分结果是否过相关性门槛。
+ *
+ * @param entry - 打分结果（分数 + 命中词数）。
+ * @param queryTerms - 查询里**不同** token 的个数。
+ * @param gate - 门槛设置。
+ * @returns 是否保留。
+ */
+function passesGate(
+  entry: { score: number; matched: number },
+  queryTerms: number,
+  gate: RelevanceGate | undefined,
+): boolean {
+  if (gate === undefined) return true
+  // 空查询无从判定相关性（没有词可比），沿用旧行为而不是凭空筛掉 —— 真实请求里查询
+  // 就是用户消息，空查询只出现在「会话刚建立、还没有任何输入」的渲染时机。
+  if (queryTerms === 0) return true
+  const minScore = gate.minScore ?? 0
+  if (minScore > 0 && entry.score < minScore) return false
+  const minMatched = gate.minMatched ?? 0
+  if (minMatched <= 0) return true
+  // 短查询放宽到 1：查询本身只有一两个词时，「只中一个」不构成不相关的证据。
+  const required = queryTerms <= 2 ? 1 : Math.min(minMatched, queryTerms)
+  return entry.matched >= required
+}
+
+/**
  * BM25 内核：对文档集合打分。
  *
  * 查询为空时退化为「按时间倒序」，得分一律为 0（由调用方决定如何加权）；
@@ -197,12 +256,12 @@ function scoreDocs(
   query: string,
   docs: readonly RecallDoc[],
   options: ScoreOptions,
-): { doc: RecallDoc; score: number }[] {
+): { doc: RecallDoc; score: number; matched: number }[] {
   const queryTokens = tokenize(query)
   if (queryTokens.length === 0) {
     return [...docs]
       .sort((left, right) => right.ts - left.ts)
-      .map(doc => ({ doc, score: 0 }))
+      .map(doc => ({ doc, score: 0, matched: 0 }))
   }
 
   const docTokens = docs.map(doc => tokenize(doc.text))
@@ -219,7 +278,7 @@ function scoreDocs(
   }
 
   const total = docs.length
-  const scored: { doc: RecallDoc; score: number }[] = []
+  const scored: { doc: RecallDoc; score: number; matched: number }[] = []
   for (const [index, doc] of docs.entries()) {
     const tokens = docTokens[index] as string[]
     const length = lengths[index] as number
@@ -228,9 +287,11 @@ function scoreDocs(
     for (const token of tokens) frequencies.set(token, (frequencies.get(token) ?? 0) + 1)
 
     let score = 0
+    let matched = 0
     for (const token of queryUnique) {
       const frequency = frequencies.get(token)
       if (frequency === undefined) continue
+      matched += 1
       const df = documentFrequency.get(token) ?? 0
       const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5))
       const denominator = frequency + BM25_K1 * (1 - BM25_B + BM25_B * (length / avgLength))
@@ -238,7 +299,7 @@ function scoreDocs(
     }
     if (score <= 0) continue
     score *= 1 + options.recencyWeight * recencyFactor(options.now - doc.ts)
-    scored.push({ doc, score })
+    scored.push({ doc, score, matched })
   }
 
   return scored.sort((left, right) => right.score - left.score || right.doc.ts - left.doc.ts)
@@ -258,7 +319,7 @@ function scoreDocs(
 export function recall(
   query: string,
   docs: readonly RecallDoc[],
-  options: { limit?: number; now?: number; recencyWeight?: number } = {},
+  options: { limit?: number; now?: number; recencyWeight?: number; gate?: RelevanceGate } = {},
 ): RecalledMemory[] {
   const limit = options.limit ?? 5
   if (limit <= 0 || docs.length === 0) return []
@@ -266,7 +327,16 @@ export function recall(
     now: options.now ?? Date.now(),
     recencyWeight: options.recencyWeight ?? 0.15,
   })
+  const queryTerms = new Set(tokenize(query)).size
   return scored
+    // 门槛对各层一视同仁：记忆与技巧都只该在**相关**时占用注入预算。
+    // 不相关的那一层不是「稍微有用」，而是纯噪声 —— 上一轮实测里，一个不相关的轮次
+    // 仍然注入了 903 字符的记忆条目，而它对本轮任务没有任何信息量。
+    //
+    // 这里**没有**「常驻规则例外」：常驻规则（偏好/约束）不靠检索进入上下文，而是由
+    // 注入路径单独直取（见 `renderInjection`）。两处都放行会让 `injectStandingRules`
+    // 的条数上限与关闭开关失效 —— 它们会从检索这条路照样进来。
+    .filter(entry => passesGate(entry, queryTerms, options.gate))
     .map(entry => ({
       layer: entry.doc.layer,
       id: entry.doc.id,
@@ -295,6 +365,15 @@ export interface TechniqueRecallOptions {
   includeDrafts?: boolean
   /** 当前上下文中出现的调用名，命中则显著加权。 */
   symbols?: readonly string[]
+  /**
+   * 相关性门槛（命中查询词数 + 绝对分数）。**只管技巧层**。
+   *
+   * 记忆层与技巧层共用同一条门槛：两层的「噪声」是同一个病 —— BM25 只要共享一个常见词
+   * 就给分，于是不相关的轮次照样把条目塞进上下文。差别只在档位：技巧层的相关命中分数高、
+   * 噪声约 2 分；记忆条目本来就是历史摘要，绝对分整体更低，所以判据用的是**命中词数**
+   * 而不是分数（尺度无关），见 {@link RelevanceGate}。
+   */
+  gate?: RelevanceGate
 }
 
 /**
@@ -338,8 +417,11 @@ export function recallTechniques(
   })
   const emptyQuery = tokenize(query).length === 0
   const lowerQuery = query.toLowerCase()
+  const queryTerms = new Set(tokenize(query)).size
 
   return scored
+    // 门槛在加权**之前**判定：`matched` 是原始命中词数，不该被置信度/符号加成放大。
+    .filter(entry => passesGate(entry, queryTerms, options.gate))
     .map(entry => {
       const meta = entry.doc.meta
       const successes = meta?.successes ?? 0
@@ -536,18 +618,26 @@ export function mergeInterleaved(hitLists: readonly (readonly RecalledMemory[])[
  *
  * @param query - 查询文本。
  * @param docs - 语料。
- * @param options - 通用召回选项，外加结构化补充词 `extra`。
+ * @param options - 通用召回选项，外加结构化补充词 `extra` 与技巧层门槛 `gate`。
  * @returns 合并后的召回结果。
  */
 export function recallDocsFacets(
   query: string,
   docs: readonly RecallDoc[],
-  options: { limit?: number; now?: number; recencyWeight?: number; extra?: readonly string[] } = {},
+  options: {
+    limit?: number
+    now?: number
+    recencyWeight?: number
+    extra?: readonly string[]
+    gate?: RelevanceGate
+  } = {},
 ): RecalledMemory[] {
   const limit = options.limit ?? 5
   if (limit <= 0 || docs.length === 0) return []
   const queries = facetQueries(query, docs, options.extra ?? [])
   // 每个子查询多取一些：交错合并要按轮次取到较深的位次。
+  // 门槛在 `recall` 内逐子查询判定：`matched` 是「命中几个查询词」，与子查询一一对应，
+  // 拉到合并之后再判定就得重新对词，反而容易算错。
   const perQuery = queries.map(sub => recall(sub, docs, { ...options, limit: Math.max(limit, 10) }))
   return mergeInterleaved(perQuery, limit)
 }

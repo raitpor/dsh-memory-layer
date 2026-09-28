@@ -91,8 +91,56 @@ export const FAILURE_BLOCK: InjectionBlock = {
   footer: '--- END UNTRUSTED FAILURE MEMORY ---',
 }
 
+/**
+ * 「工作前先检索」的常驻指引块。
+ *
+ * 与前三块**语义相反**：那三块注入的是**不可信数据**，这一块注入的是本插件的**策略要求**，
+ * 因此没有 BEGIN/END 数据围栏，内容也不得被当成外部输入。它存在的理由是一个实测落差：
+ * 知识库再全，模型不主动检索就等于不存在 —— 真实使用中会主动 `technique_search` 的会话
+ * 极少，而技巧层的全部价值都要经过「模型先想到去查」这一步。
+ *
+ * 为什么必须是独立 section、而不是并进技巧块的头部：技巧块在「没有任何可注入技巧」时
+ * 整块不出现，而「开始一项工作时先看看有没有现成经验」恰恰在最不熟悉的任务上最该说 ——
+ * 那种任务往往一条可注入技巧都没有。所以它由**库非空**而不是**本轮有命中**驱动。
+ *
+ * 长度是硬约束：它每轮都出现，按字符付费，所以只保留三个动作（先查 / 照做并上报 / 判错也上报）。
+ */
+export const GUIDANCE_BLOCK: InjectionBlock = {
+  section: 'memory-layer:guidance',
+  header: ['How to use the local knowledge library (dsh-memory-layer):'],
+  footer: '--- END KNOWLEDGE-LIBRARY GUIDANCE ---',
+}
+
+/** 指引块正文：三句话，对应「先查 / 照做并上报 / 判错也上报」。 */
+export const GUIDANCE_LINES: readonly string[] = [
+  'Before starting a task, search the library for prior experience (`technique_search` for how-to,',
+  '`memory_search` for facts and preferences). If an entry applies, follow it and report the outcome',
+  'with `technique_apply` (id, outcome, evidence) — report "failure" if it turned out to be wrong.',
+  'Unreported use counts as NOT adopted.',
+]
+
+/** 技巧层关闭时的指引正文：只提真实存在的工具。 */
+export const GUIDANCE_MEMORY_ONLY_LINES: readonly string[] = [
+  'Before starting a task, search long-term memory for prior facts and preferences (`memory_search`).',
+  'If an entry applies, follow it — and correct the store when you find it outdated or wrong.',
+]
+
+/**
+ * 指引块的字符上限。
+ *
+ * 它不是调节旋钮而是护栏：指引是固定文本（约 340 字符），这个值留了一倍余量，
+ * 使 `renderBlock` 在正常情况下永不截断它，同时保证「常驻文本不会失控变长」这件事
+ * 在代码里有硬约束。
+ */
+export const GUIDANCE_MAX_CHARS = 700
+
 /** 本插件会注入的全部块；`isInjectedContext` 用它们识别注入内容。 */
-export const INJECTION_BLOCKS: readonly InjectionBlock[] = [RECALL_BLOCK, TECHNIQUE_BLOCK, FAILURE_BLOCK]
+export const INJECTION_BLOCKS: readonly InjectionBlock[] = [
+  RECALL_BLOCK,
+  TECHNIQUE_BLOCK,
+  FAILURE_BLOCK,
+  GUIDANCE_BLOCK,
+]
 
 /**
  * **宿主**注入的上下文块标记。

@@ -37,6 +37,7 @@ package "注册到 systemPrompt 的 section" as SEC {
   interface "memory-layer:recall" as IREC
   interface "memory-layer:techniques" as ITECH
   interface "memory-layer:failures" as IFAIL
+  interface "memory-layer:guidance" as IGUIDE
 }
 
 database "记忆库\n$DSH_HOME/memory-layer" as DB

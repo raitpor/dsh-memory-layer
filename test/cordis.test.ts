@@ -59,7 +59,7 @@ test('真实 Context 能加载插件并完成 system prompt 接线', async () =>
     mount(ctx, { dir: root })
     await settle()
 
-    assert.equal(captured.length, 3, '插件应已 ACTIVE 并注册 recall / technique / failures 三个 prompt 上下文')
+    assert.equal(captured.length, 4, '插件应已 ACTIVE 并注册 recall / technique / failures / guidance 四个 prompt 上下文')
     const entry = captured[0] as { name?: string; order?: number } | undefined
     assert.equal(entry?.name, 'memory-layer:recall')
     assert.equal(entry?.order, 250, '未提供的字段应由 Config schema 补默认值')
@@ -69,6 +69,9 @@ test('真实 Context 能加载插件并完成 system prompt 接线', async () =>
     const failure = captured[2] as { name?: string; order?: number } | undefined
     assert.equal(failure?.name, 'memory-layer:failures')
     assert.equal(failure?.order, 255, '失败预警 section 在 recall 与 techniques 之间')
+    const guidance = captured[3] as { name?: string; order?: number } | undefined
+    assert.equal(guidance?.name, 'memory-layer:guidance')
+    assert.equal(guidance?.order, 265, '「先检索」指引排在最后，离决策点最近')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -107,7 +110,7 @@ test('systemPrompt / tools 晚于 sessions 上线时，能力仍会被接线（�
     })
     await settle()
 
-    assert.equal(sections.length, 3, '晚到的 systemPrompt 仍应装上三个 section')
+    assert.equal(sections.length, 4, '晚到的 systemPrompt 仍应装上四个 section')
     assert.equal(registered.length, 14, '晚到的 tools 仍应装上全部 14 个工具')
     for (const expected of ['memory_search', 'memory_save', 'memory_forget', 'memory_stats']) {
       assert.ok(registered.includes(expected), `${expected} 应已注册`)
@@ -169,7 +172,7 @@ test('插件自带 cordis.patch.yml 的 null 空值不会让宿主启动失败',
     })
     await settle()
 
-    assert.equal(captured.length, 3, 'null 应被视同未设置，插件仍需完成 prompt 接线')
+    assert.equal(captured.length, 4, 'null 应被视同未设置，插件仍需完成 prompt 接线')
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome

@@ -44,8 +44,8 @@ import {
   emptyMetrics,
   techniqueText,
 } from './store.js'
-import { facetQueries, recallDocsFacets, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
-import type { TechniqueScorer } from './recall.js'
+import { facetQueries, isStandingRule, recallDocsFacets, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
+import type { RelevanceGate, TechniqueScorer } from './recall.js'
 import { SqliteTechniqueIndex, loadSqlite } from './sqlite-index.js'
 import type { RecallDoc } from './recall.js'
 import { distill, isInjectedContext } from './distill.js'
@@ -93,7 +93,16 @@ import {
   shouldWarn,
 } from './failures.js'
 import type { EscalationThresholds, FailureObservation } from './failures.js'
-import { FAILURE_BLOCK, RECALL_BLOCK, TECHNIQUE_BLOCK, compactEntryText } from './injection.js'
+import {
+  FAILURE_BLOCK,
+  GUIDANCE_BLOCK,
+  GUIDANCE_LINES,
+  GUIDANCE_MAX_CHARS,
+  GUIDANCE_MEMORY_ONLY_LINES,
+  RECALL_BLOCK,
+  TECHNIQUE_BLOCK,
+  compactEntryText,
+} from './injection.js'
 import type { InjectionBlock } from './injection.js'
 import { renderSkill, verifySkill } from './skill.js'
 import { UPDATABLE_TECHNIQUE_FIELDS, createFailureTools, createMemoryTools, createTechniqueTools } from './tools.js'
@@ -186,6 +195,39 @@ export interface Config {
   techniqueChars?: number
   /** 技巧注入 section 的排序值。 */
   techniquePromptOrder?: number
+  /**
+   * 注入侧相关性门槛：一条**记忆或技巧**要命中查询里**几个不同的词**才允许进注入。默认 `2`。
+   *
+   * 为什么不用绝对 BM25 分数做默认：分数取决于 IDF，而 IDF 取决于库的规模 —— 同一条命中
+   * 在 354 条的库里是 2.7、在 2 条的库里只有 0.5，默认值必然不可移植。实测不相关轮次的
+   * 特征是「四五个词里只中一个」（如「把函数重命名」只共享了 `config`），因此按命中词数
+   * 判定既尺度无关，又正好切在噪声上。查询本身不超过 2 个词时自动放宽为 1（见 `passesGate`）。
+   *
+   * **只管召回段与技巧段**：失败段不走相关性 —— 它由重复次数驱动，而且必须在动作**之前**
+   * 给出（等模型自己想起来去查，错已经犯完了），这正是它被设计成主动注入的全部理由。
+   *
+   * 只作用于**自动注入**；模型显式 `memory_search` / `technique_search` 不受影响。
+   */
+  injectMinMatched?: number
+  /**
+   * 每轮强制注入的**常驻规则**条数上限（长期偏好 / 约束）。默认 `4`，`0` = 关闭。
+   *
+   * 为什么它们不走检索：偏好与约束对任何任务都成立，靠词重叠命中是碰运气 ——
+   * 一条「不要自动提交」的约束在本轮聊正则时一个词都对不上。它们的条数天然很少
+   * （真库只有个位数），所以按最新优先直取，不判相关性。
+   */
+  injectStandingRules?: number
+  /**
+   * 注入侧的绝对 BM25 分数下限（`0` = 关闭，默认关闭）。
+   *
+   * 只在库规模稳定、观测过分数分布的环境里才值得设；语义同 `injectMinMatched`，
+   * 两条门槛是与关系。真库参考值：不相关查询最高 2.71、相关查询最低 9.28。
+   */
+  injectMinScore?: number
+  /** 「工作前先检索」常驻指引 section 的排序值。 */
+  guidancePromptOrder?: number
+  /** 是否注入「工作前先检索、用了就上报」的常驻指引。默认 `true`。 */
+  guidance?: boolean
   /** 示例代码的行数上限。 */
   exampleMaxLines?: number
   /** 示例代码的字符上限。 */
@@ -386,6 +428,18 @@ export const TECHNIQUE_ADOPTION_NOTICE: readonly string[] = [
   'evidence) — one call can carry several. Anything you do not report counts as NOT adopted.',
 ]
 
+/**
+ * 常驻规则说明行。
+ *
+ * 块内同时有「本轮相关」与「任何任务都成立」两类条目，语气不同：前者是参考，
+ * 后者是必须遵守的约定。不点明这一点，模型会把一条与当前话题无关的偏好当噪声丢掉 ——
+ * 而它恰恰是唯一需要跨话题生效的那类记忆。
+ */
+export const STANDING_RULE_NOTICE: readonly string[] = [
+  'Entries marked `long-term preference` / `long-term constraint` below are STANDING RULES:',
+  'they apply to every task regardless of topic, and a newer user instruction overrides them.',
+]
+
 /** 失败预警注入 section 名。 */
 export const FAILURE_SECTION_NAME = FAILURE_BLOCK.section
 
@@ -394,6 +448,15 @@ export const FAILURE_INJECTION_HEADER: readonly string[] = FAILURE_BLOCK.header
 
 /** 失败预警注入块尾部。 */
 export const FAILURE_INJECTION_FOOTER = FAILURE_BLOCK.footer
+
+/** 「工作前先检索」常驻指引的 section 名。 */
+export const GUIDANCE_SECTION_NAME = GUIDANCE_BLOCK.section
+
+/** 指引块头部；块首同时是 `isInjectedContext` 的识别标记。 */
+export const GUIDANCE_INJECTION_HEADER: readonly string[] = GUIDANCE_BLOCK.header
+
+/** 指引块尾部。 */
+export const GUIDANCE_INJECTION_FOOTER = GUIDANCE_BLOCK.footer
 
 /** 配置 schema：所有字段都有默认值，因此 `apply` 里拿到的配置始终完整。 */
 export const Config: z<Config> = z.object({
@@ -424,6 +487,11 @@ export const Config: z<Config> = z.object({
   techniqueLimit: z.natural().min(1).max(10).default(3),
   techniqueChars: z.natural().min(200).max(20_000).default(3000),
   techniquePromptOrder: z.number().default(260),
+  injectMinMatched: z.natural().min(0).max(20).default(2),
+  injectStandingRules: z.natural().min(0).max(20).default(4),
+  injectMinScore: z.number().min(0).max(1000).default(0),
+  guidancePromptOrder: z.number().default(265),
+  guidance: z.boolean().default(true),
   exampleMaxLines: z.natural().min(1).max(40).default(8),
   exampleMaxChars: z.natural().min(40).max(4000).default(480),
   allowConfidentialGlobal: z.boolean().default(false),
@@ -513,6 +581,12 @@ interface Settings {
   techniqueLimit: number
   techniqueChars: number
   techniquePromptOrder: number
+  injectMinMatched: number
+  injectStandingRules: number
+  injectMinScore: number
+  injectionGate: RelevanceGate
+  guidancePromptOrder: number
+  guidance: boolean
   exampleMaxLines: number
   exampleMaxChars: number
   allowConfidentialGlobal: boolean
@@ -1409,19 +1483,44 @@ export function apply(ctx: Context, config: Config): void {
       return record !== undefined && injectable(record)
     })
     if (docs.length === 0) return ''
+    // 常驻规则（长期偏好 / 约束）**不经过检索**：它们适用于任何任务，靠词重叠命中是
+    // 碰运气 —— 一条「不要自动提交」的约束在本轮聊正则时一个词都对不上，于是永远不进上下文，
+    // 而它恰恰是最该一直在的那类记忆。因此从检索语料里**摘出来**，按最新优先直取，
+    // 排在检索命中之前。摘出来这一步是必须的：留在语料里的话 `injectStandingRules`
+    // 的条数上限与 `0`（关闭）就管不住它们 —— 它们会从检索那条路照样进来。
+    const standing = docs
+      .filter(doc => isStandingRule(doc))
+      .sort((left, right) => right.ts - left.ts)
+      .slice(0, settings.injectStandingRules)
+    const standingIds = new Set(standing.map(doc => doc.id))
+    const queryDocs = docs.filter(doc => !standingIds.has(doc.id))
     // 与技巧层同一套 facet 机制：情景/语义层同样会「一句话讲了好几件事」，
     // 而且**当前轮碰过的文件**是比措辞更可靠的键（"为什么这个测试挂了"里没有文件名）。
-    const hits = recallDocsFacets(query, docs, {
+    const hits = recallDocsFacets(query, queryDocs, {
       limit: settings.recallLimit,
       extra: searchExtrasFor(current?.turns ?? [], query),
+      gate: settings.injectionGate,
     })
-    if (hits.length === 0) return ''
-    const lines = hits.map((hit, index) => {
+    const merged = [
+      ...standing.map(doc => ({
+        layer: doc.layer,
+        id: doc.id,
+        text: doc.text,
+        ts: doc.ts,
+        ...(doc.meta === undefined ? {} : { meta: doc.meta }),
+      })),
+      // 检索命中里若已含同一条常驻规则，不再重复一遍。
+      ...hits.filter(hit => !standingIds.has(hit.id)),
+    ]
+    if (merged.length === 0) return ''
+    const lines = merged.map((hit, index) => {
       const kind = recallLabel(hit.layer, hit.meta?.kind)
       // 逐条整形（去掉与正文重复的标题 + 封顶）：整块预算再砍尾巴时，至少不会出现半截条目。
       return `${index + 1}. (${kind}) ${sanitizeForInjection(compactEntryText(hit.text))}`
     })
-    return renderBlock(RECALL_BLOCK, [], lines, settings.recallChars)
+    // 常驻规则与「本轮相关」的条目在同一个块里，必须让模型分清语气差别，否则它会把
+    // 一条与本轮无关的偏好当成跑题的噪声而忽略掉。
+    return renderBlock(RECALL_BLOCK, standing.length === 0 ? [] : STANDING_RULE_NOTICE, lines, settings.recallChars)
   }
 
   /**
@@ -1462,6 +1561,7 @@ export function apply(ctx: Context, config: Config): void {
       symbols: symbolsInText(query),
       extra: searchExtrasFor(current?.turns ?? [], query),
       scorer: indexScorer(false),
+      gate: settings.injectionGate,
     })
     techniqueHitCache = { query, hits }
     return hits
@@ -1491,6 +1591,31 @@ export function apply(ctx: Context, config: Config): void {
     // 没注册工具时别提工具名：指向一个不存在的工具只会让模型白试一轮。
     const extraHeader = settings.registerTools ? TECHNIQUE_ADOPTION_NOTICE : []
     return renderBlock(TECHNIQUE_BLOCK, extraHeader, lines, settings.techniqueChars)
+  }
+
+  /**
+   * 渲染「工作前先检索」的常驻指引。
+   *
+   * 三个返回空串的前提，都是为了**不付没有回报的 token**：
+   * 1. 配置关掉了指引；
+   * 2. 没注册工具 —— 指引全是工具名，指向不存在的工具只会让模型白试一轮；
+   * 3. 库里没有任何可检索的东西 —— 此时「先查一下」查不到任何结果，纯属浪费。
+   *
+   * 第 3 条刻意用「**库非空**」而不是「本轮有命中」：最需要这条指引的，正是那些
+   * 库里一条现成经验都没有的陌生任务（模型得先知道库存在、且知道该主动查）。
+   * 也正因如此，技巧层关掉时也要给出只提 `memory_search` 的版本。
+   *
+   * @returns 注入文本；不该注入时为空串。
+   */
+  const renderGuidance = (): string => {
+    if (!settings.guidance || !settings.registerTools) return ''
+    const docs = corpusFor(current?.cwd)
+    const hasMemories = docs.some(doc => doc.layer !== 'technique')
+    // 草稿也算「查得到」：`technique_search(includeDrafts)` 正是要模型主动去翻未验证的知识。
+    const hasTechniques = settings.techniques && docs.some(doc => doc.layer === 'technique')
+    if (!hasMemories && !hasTechniques) return ''
+    const lines = settings.techniques ? GUIDANCE_LINES : GUIDANCE_MEMORY_ONLY_LINES
+    return renderBlock(GUIDANCE_BLOCK, [], lines, GUIDANCE_MAX_CHARS)
   }
 
   /**
@@ -2648,6 +2773,15 @@ export function apply(ctx: Context, config: Config): void {
           text: () => renderFailureInjection(),
         }), 'memory-layer:failure-injection')
       }
+      // 指引段排在最后：它是「该怎么做」的元指令，放在数据块之后离决策点更近。
+      // 注册顺序与 `INJECTION_BLOCKS` 的顺序必须一致 —— 黑盒用例 F-07 拿这两者交叉验证。
+      if (settings.guidance) {
+        promptCtx.effect(() => systemPrompt.context({
+          name: GUIDANCE_SECTION_NAME,
+          order: settings.guidancePromptOrder,
+          text: () => renderGuidance(),
+        }), 'memory-layer:guidance-injection')
+      }
     })
   }
 
@@ -2762,6 +2896,15 @@ function resolveSettings(config: Config): Settings {
     techniqueLimit: config.techniqueLimit ?? 3,
     techniqueChars: config.techniqueChars ?? 3000,
     techniquePromptOrder: config.techniquePromptOrder ?? 260,
+    injectMinMatched: config.injectMinMatched ?? 2,
+    injectStandingRules: config.injectStandingRules ?? 4,
+    injectMinScore: config.injectMinScore ?? 0,
+    injectionGate: {
+      minMatched: config.injectMinMatched ?? 2,
+      minScore: config.injectMinScore ?? 0,
+    },
+    guidancePromptOrder: config.guidancePromptOrder ?? 265,
+    guidance: config.guidance ?? true,
     exampleMaxLines: config.exampleMaxLines ?? 8,
     exampleMaxChars: config.exampleMaxChars ?? 480,
     allowConfidentialGlobal: config.allowConfidentialGlobal ?? false,
@@ -3205,17 +3348,35 @@ function hasLearningSignal(turns: readonly LiveTurn[]): boolean {
 }
 
 /**
- * 当前轮的结构化检索线索：最近几轮触达的文件名与工具名。
+ * 当前轮的结构化检索线索：**本轮**触达的文件名与工具名，加上**话题仍在延续**时前几轮的。
  *
- * 为什么要把它们塞进检索：用户问「为什么这个测试挂了」时，正文里往往**没有**任何符号名，
- * 但当前轮读过 `Foo.java`、跑过 `npm test` —— 这些是比措辞更可靠的键。
+ * 为什么要把文件/工具塞进检索：用户问「为什么这个测试挂了」时，正文里往往**没有**任何符号名，
+ * 但本轮或上一轮读过 `Foo.java`、跑过 `npm test` —— 这些是比措辞更可靠的键。
  *
- * @param query - 本轮查询文本（用于抽调用名）。
+ * 为什么**不能**无脑带上最近 3 轮（实测）：第 1 轮画图并 `write` 了 `docs/order-service.puml`，
+ * 之后 4 轮问完全无关的问题（重命名函数 / 修测试 / 加配置默认值 / 写正则），注入合计
+ * **6902 字符**；而同样的 4 个问题在一个「没碰过 .puml」的会话里只要 **4823 字符**（+43%），
+ * 多出来的正是 PlantUML 与 MC 技巧。原因是文件路径与工具名近乎**精确命中的强键**，
+ * 一旦进入查询就主导排序，并在之后几轮持续生效 —— 话题换了，注入还停在上一轮。
+ *
+ * 因此按话题延续判定：本轮线索总是算（同轮没有歧义）；更早轮次的线索只在该轮**用户文本**
+ * 与当前请求有共同 token 时才算。这样「跑过测试 → 为什么这个测试挂了」这类靠文件路径救回来的
+ * 场景仍然成立（两轮用户文本共享「测试」），而换话题后立刻停止沿用旧键。
+ *
+ * @param turns - 会话轮次（按时间顺序，最后一个是当前轮）。
+ * @param query - 本轮查询文本（用于抽调用名与话题判定）。
  * @returns 去重后的补充查询词。
  */
-function searchExtrasFor(turns: readonly { tools: readonly string[]; files: readonly string[] }[], query: string): string[] {
+function searchExtrasFor(
+  turns: readonly { user?: string; tools: readonly string[]; files: readonly string[] }[],
+  query: string,
+): string[] {
   const out: string[] = []
-  for (const turn of turns.slice(-3)) {
+  const queryTokens = new Set(tokenize(query))
+  const recent = turns.slice(-3)
+  for (const [index, turn] of recent.entries()) {
+    const isCurrent = index === recent.length - 1
+    if (!isCurrent && !tokenize(turn.user ?? '').some(token => queryTokens.has(token))) continue
     for (const file of turn.files) out.push(file)
     for (const tool of turn.tools) out.push(tool)
   }

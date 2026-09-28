@@ -334,6 +334,8 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `injectPrompt` | `true` | 是否把召回结果注入 system prompt |
 | `promptOrder` | `250` | 注入 section 的排序值 |
 | `recallLimit` | `5` | 单次召回条数上限（1–20） |
+| `injectMinMatched` / `injectMinScore` | `2` / `0` | 注入侧的**相关性门槛**：一条记忆/技巧要命中查询里几个不同的词（或达到多少 BM25 分）才允许进注入。不相关的轮次不再白付 token；`0` = 关闭对应判据 |
+| `injectStandingRules` | `4` | 每轮**强制注入**的常驻规则条数上限（`long-term preference` / `long-term constraint`）：这类记忆对任何任务都成立，因此不判相关性；`0` = 关闭 |
 | `recallChars` | `4000` | **条目正文**的字符上限；块头（不可信声明）与 `BEGIN/END` 边界永不截断 —— 安全围栏不能被预算裁掉，因此上限小于块头开销时实际长度会略超上限 |
 | `registerTools` | `true` | 是否注册记忆工具 |
 | `indexBackend` | `memory` | 检索索引后端：`memory`（默认，纯内存 BM25）或 `sqlite`（从真源派生的 FTS5 索引，可重建、可回退） |
@@ -349,6 +351,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `techniques` | `true` | 是否启用技巧层 |
 | `techniqueLimit` / `techniqueChars` | `3` / `3000` | 技巧索引注入的条数与正文上限；块头、采用回报提示与边界同上一行，永不截断 |
 | `techniquePromptOrder` | `260` | 技巧注入 section 排序（排在 recall 之后） |
+| `guidance` / `guidancePromptOrder` | `true` / `265` | 是否注入「工作前先检索、用了就上报」的常驻指引（库非空且已注册工具时才出现） |
 | `exampleMaxLines` / `exampleMaxChars` | `8` / `480` | 示例的硬上限 |
 | `allowConfidentialGlobal` | `false` | 是否允许 `confidential` 知识进入全局域 |
 | `reflectOnSessionEnd` | `true` | 会话内反思总开关 |
@@ -505,6 +508,36 @@ dsh plugin --profile <name> install --offline                       #    重装�
 `fact`）：记忆库是明文文件、读入时只做类型断言，标签又和正文同处注入块的一行 —— 若把
 `kind` 直接拼进去，一个带换行的取值就能伪造 `--- END UNTRUSTED MEMORY ---` 边界。
 
+### 注入只给**相关**的：相关性门槛与常驻规则
+
+召回命中不等于值得注入：BM25 只要共享一个常见词就会给分，于是「把这个函数重命名」这类
+完全不相关的轮次，过去每轮仍会注入 0.7k–2.3k 字符的技巧与记忆。现在注入段分三类处理：
+
+| 类别 | 判据 | 理由 |
+|---|---|---|
+| 技巧、语义事实/决定、情景摘要 | **相关性门槛**：命中查询里 ≥2 个不同的词（`injectMinMatched`）才注入 | 它们只对**当前任务**有价值，不相关就是纯噪声 |
+| `long-term preference` / `long-term constraint` | **常驻**：按最新优先直取，不判相关性（`injectStandingRules`，默认 4 条） | 偏好与约束对**任何**任务都成立；一条「不要自动提交」的约束不该因为本轮聊正则就消失 |
+| `recurring failure` | **提前注入**（不变） | 它必须在动作**之前**到达，等模型想起来去查时错误已经犯完了 |
+
+- 判据用「命中几个不同的词」而不是绝对 BM25 分数：分数取决于 IDF，而 IDF 取决于库的规模 ——
+  同一条命中在 354 条的库里是 2.7、在 2 条的库里只有 0.5，绝对阈值必然不可移植（小库会被
+  整段杀掉）。查询本身不超过 2 个词时门槛自动放宽为 1。
+- 常驻规则在块内带一行说明（`STANDING RULES`），否则模型会把与本轮无关的偏好当成跑题噪声。
+- 只作用于**自动注入**：模型显式 `memory_search` / `technique_search` 一条不少。
+- 真库实测（`.verify/measure/gate-acceptance.mjs`、`memory-gate.mjs`）：不相关轮次的技巧注入
+  4698 → 0 字符、召回段只剩常驻规则；相关查询 5/5 仍正常命中。
+
+### 常驻指引：让模型先检索
+
+注入的知识再多，模型不主动检索就等于不存在 —— 而技巧层的全部价值（采用回报、状态迁移、
+验收证据）都要经过「模型先想到去查」这一步。因此第 4 个注入段
+（`memory-layer:guidance`）常驻三句话：开工前先查（`technique_search` / `memory_search`）、
+适用就照做并回报 `technique_apply`、判错也回报 `failure`。
+
+它在「库非空」而不是「本轮有命中」时才出现：最需要这条指引的正是库里还一条都对不上的
+陌生任务。空库、未注册工具、`guidance: false` 三种情况下都不注入（前两种下它纯属浪费，
+甚至指向不存在的工具）。
+
 ## 代码逻辑卡（`kind: 'code-logic'`）
 
 技巧层不只有"怎么调库"，还有**这段代码在做什么**。逻辑卡的目标是：读需求时理解既有逻辑，
@@ -577,7 +610,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（316 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（335 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 
@@ -658,6 +691,20 @@ npm test            # 构建 + node --test（316 个用例：存储 / 召回 / �
 - **语义层的「取代」要显式声明**：`memory_save(supersedes=…)` 不会自动推断哪条旧事实被改口了
   （猜错会把两条互补的事实说成互相取代）；不声明时新旧两条会**同时存在并同时注入**。被取代的记录
   仍然留在库里、仍能被 `memory_search` 查到（标 `superseded`），所以它不是删除。
+- **注入的补充检索键会按话题延续判定**：`technique_search` / 技巧注入会把**最近几轮**碰过的文件与工具
+  当作强检索键（这样「为什么这个测试挂了」才能靠上一轮的文件名救回来）。但路径与工具名近乎精确命中，
+  会主导排序并连续几轮生效 —— 实测「画图并 `write` 了 `.puml`」之后，4 轮完全无关的任务多注入
+  **2079 字符（+43%）**。现在改为：本轮的键总是算；更早轮次的键只在该轮**用户文本**与当前请求有共同
+  token 时才算（话题延续）。代价是「换个说法继续同一话题」时可能丢掉上一轮的文件线索 —— 这是刻意的
+  取舍得：宁可少给一条，也不让上一话题霸占注入。
+- **草稿的可见性有三条通道，且都靠「模型主动」**：①自动注入**不收**草稿（`injectable()` 只认
+  validated/canonical）；②`technique_search` 默认也过滤草稿，但会**明说有几条被隐藏**并给出开关；
+  ③`memory_search` **不过滤**草稿，且现在会标出 `(technique (draft))`。因此草稿要变成已验证，
+  必须由模型显式检索 → 采用 → `technique_apply` 回报；**模型不查，它就一直是草稿** —— 这是刻意的
+  设计（未验证知识不该获得注入权威），代价是「冷启动」：库里 90% 以上的条目会长期停在 draft。
+  `memory_stats` 的 `Technique adoption` 行专门用来暴露这一点（采用率、至少被检索过一次的条数、
+  从未被检索过的草稿数）。检索遥测只统计**显式检索**（`technique_search` / `technique_get` /
+  `memory_search` 命中的技巧），自动注入不计数 —— 否则每请求一次写盘。
 - **召回不做 embedding**：按需求选择零依赖的 BM25，换取离线可用与零 token 成本；
   代价是同义改写的查询召回不到。需要语义召回时可后续替换 `recall.ts`。
 - **召回按项目分桶缓存，会话切换即换桶**：注入始终只读当前会话目录所属的桶，

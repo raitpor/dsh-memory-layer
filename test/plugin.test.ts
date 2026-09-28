@@ -511,7 +511,7 @@ test('召回结果被注入 system prompt，且声明为不可信数据', async 
     fake.emit('session/event', next, userMessage('我喜欢用 pnpm，不要用 npm。'))
     await fake.flush()
 
-    assert.equal(fake.prompts.length, 3, 'recall / techniques / failures 三个 section')
+    assert.equal(fake.prompts.length, 4, 'recall / techniques / failures / guidance 四个 section')
     const entry = fake.prompts.find(item => item.name === 'memory-layer:recall')
     assert.equal(entry?.name, 'memory-layer:recall')
     assert.equal(typeof entry?.text, 'function')
@@ -2538,6 +2538,66 @@ test('technique_learn 从真实代码库挖掘并落盘为草稿，且不泄露�
   }
 })
 
+test('上一话题的残留文件不再主导注入：换话题后立刻停止沿用旧键', async () => {
+  // 实测：第 1 轮画图并 write 了 docs/order-service.puml，之后 4 轮问完全无关的问题，
+  // 注入合计 6902 字符；而「没碰过 .puml」的同样 4 轮只要 4823 字符（+43%）。
+  // 原因是文件路径是近乎精确命中的强键，会连续几轮主导排序 —— 话题换了，注入还停在上一轮。
+  //
+  // 夹具形状是刻意的，两条约束缺一不可：
+  // 1. 技巧正文要含 `order-service`（即残留路径能带出**两个**词）—— 只带一个词的残留
+  //    已经被 0.2.4 的注入门槛挡掉了，那种夹具在今天不再有判别力（回退后用例照样通过）；
+  // 2. 两轮用户文本必须**一个词都不共享**，否则「话题延续」判定本身就会把残留算进来，
+  //    修复后的行为与回退后一致，用例同样失去判别力。
+  const seed = async (fake: FakeContext): Promise<void> => {
+    const session = fakeSession('s-seed', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'order-service 的图要先目视核验',
+      when: '把 order-service 的图作为可提交文档时',
+      summary: '渲染成 PNG 再看，语法通过不代表布局没问题。plantuml 无法发现悬空节点。',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
+  }
+  const run = async (withDiagram: boolean): Promise<string> => {
+    const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+    try {
+      await seed(fake)
+      const session = fakeSession(withDiagram ? 's-with' : 's-without', '/work/demo')
+      fake.emit('session/created', session)
+      await fake.flush()
+      fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+      fake.emit('session/event', session, userMessage('把这个函数重命名成更清晰的名字'))
+      if (withDiagram) {
+        fake.emit('session/event', session, event('tool/call', {
+          turn: 1, step: 1, callId: 'c1', name: 'write',
+          arguments: JSON.stringify({ file_path: 'docs/order-service.puml' }),
+        }))
+      }
+      await fake.flush()
+      fake.emit('session/event', session, event('turn/end', { turn: 1, reason: 'completed' }))
+      // 第 2 轮：换话题，且与上一轮的**用户文本没有任何共同词**（见夹具说明第 2 条）。
+      fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+      fake.emit('session/event', session, userMessage('修复失败的单元测试'))
+      await fake.flush()
+      return sectionText(fake, 'memory-layer:techniques') + '\u0000' + sectionText(fake, 'memory-layer:recall')
+    } finally {
+      await dispose()
+    }
+  }
+  const withDiagram = await run(true)
+  const withoutDiagram = await run(false)
+  const [techWith] = withDiagram.split('\u0000')
+  assert.doesNotMatch(
+    techWith ?? '',
+    /order-service|plantuml|puml/u,
+    `上一话题的 .puml 残留不得把 order-service 技巧带进新一轮：${techWith}`,
+  )
+  assert.equal(withDiagram, withoutDiagram, '「上一轮写过 .puml」的注入必须与「没写过」完全一致')
+})
+
 test('U1b/M1/M2：草稿在显式检索里带状态标签，检索被记账，采用率进 stats', async () => {
   const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
   try {
@@ -2653,7 +2713,6 @@ test('M1 口径：自动注入不计入检索遥测（它每请求都会发生�
     await dispose()
   }
 })
-
 
 test('结构卡的来源是 rule，不能被「这一轮跑过模型」整轮带成 model', async () => {
   // 旧实现按「整轮是否发生模型调用」打标：只要跑过模型，规则路径产出的普查卡也会被记成
@@ -3544,6 +3603,253 @@ test('indexBackend=sqlite：索引被建立、检索仍然正确，索引丢失�
     // 真源始终在：JSONL 里能读到这条记录。
     const records = await new MemoryStore(root).readTechniques('global')
     assert.ok(records.some(record => record.id === id), '真源不受索引影响')
+  } finally {
+    await dispose()
+  }
+})
+
+// ---- R4：「工作前先检索」常驻指引 -----------------------------------------
+//
+// 指引是**每轮都付**的固定成本，所以它的每一条生效条件都要有用例锁住：
+// 库里没东西可查、没注册工具、配置关掉，都必须不注入。
+
+test('R4：库非空时注入「先检索再用」指引，且含三个动作', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('把这个函数重命名成更清晰的名字'))
+    const text = sectionText(fake, 'memory-layer:guidance')
+    assert.match(text, /Before starting a task, search/u, '要先说要先检索')
+    assert.match(text, /technique_search/u, '要给出检索入口')
+    assert.match(text, /memory_search/u, '事实类检索也要提')
+    assert.match(text, /technique_apply/u, '采用要上报')
+    assert.match(text, /failure/u, '判错也要上报')
+    // 常驻成本必须是有界的：真库实测的正文约 340 字符，翻倍就是失控信号。
+    assert.ok(text.length <= 700, `指引不得失控：${text.length}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('R4：指引由「库非空」驱动，而不是「本轮有命中」', async () => {
+  // 这条是设计要点：最需要这条指引的是**陌生任务**，而陌生任务往往一条都命中不了。
+  // 若按本轮命中驱动，指引恰好会在最该出现的时刻消失。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('把这个函数重命名成更清晰的名字'))
+    assert.equal(sectionText(fake, 'memory-layer:techniques'), '', '本轮确实没有技巧命中')
+    assert.notEqual(sectionText(fake, 'memory-layer:guidance'), '', '指引仍要出现')
+  } finally {
+    await dispose()
+  }
+})
+
+test('R4：空库不注入指引（没有东西可查时它纯属浪费）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('把这个函数重命名成更清晰的名字'))
+    assert.equal(sectionText(fake, 'memory-layer:guidance'), '')
+  } finally {
+    await dispose()
+  }
+})
+
+test('R4：没注册工具时不注入指引（不得指向不存在的工具）', async () => {
+  // 这条要**库非空**才有判别力（空库本来就不注入，什么都测不出来）；而 tools 没注册时
+  // `memory_save` 也不存在，所以直接写库造一条记忆。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, registerTools: false })
+  try {
+    await new MemoryStore(root).saveEpisodic({
+      id: 'ep_guidance',
+      ts: 1_700_000_000_000,
+      sessionId: 's0',
+      scope: 'global',
+      title: '标题',
+      summary: '一条已有的记忆，用于让指引的非空判据成立。',
+      decisions: [],
+      todos: [],
+      files: [],
+      tags: [],
+      source: 'rule',
+    })
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('把这个函数重命名成更清晰的名字'))
+    assert.equal(sectionText(fake, 'memory-layer:guidance'), '')
+  } finally {
+    await dispose()
+  }
+})
+
+test('R4：配置关掉 guidance 即不注入（它是每轮都付的成本，必须可关）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, guidance: false })
+  try {
+    await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('把这个函数重命名成更清晰的名字'))
+    assert.equal(sectionText(fake, 'memory-layer:guidance'), '')
+  } finally {
+    await dispose()
+  }
+})
+
+test('R4：技巧层关掉时给出只提 memory_search 的版本', async () => {
+  // 指向未注册的工具只会让模型白试一轮，与技巧块头部的既有口径一致。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, techniques: false })
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('我之前说过的偏好是什么'))
+    await toolOf(fake, 'memory_save').execute({ text: '偏好用 pnpm', kind: 'preference' } as never, undefined as never)
+    const text = sectionText(fake, 'memory-layer:guidance')
+    assert.match(text, /memory_search/u)
+    assert.doesNotMatch(text, /technique_search|technique_apply/u, '技巧层关掉时不得提技巧工具')
+  } finally {
+    await dispose()
+  }
+})
+
+// ---- 常驻规则：长期偏好 / 约束不判相关性 ------------------------------------
+//
+// 为什么单独一组：召回段里有两类条目，语义相反 —— 「本轮相关」与「任何任务都成立」。
+// 前者靠检索，后者必须**永远在场**（一条「不要自动提交」的约束不会因为本轮聊正则就失效）。
+
+/** 写入一条语义记忆并跑一轮「完全不相关」的用户消息。 */
+async function injectWithUnrelatedTurn(
+  fake: FakeContext,
+  memories: readonly { text: string; kind: string }[],
+): Promise<string> {
+  for (const memory of memories) {
+    await toolOf(fake, 'memory_save').execute({ text: memory.text, kind: memory.kind } as never, undefined as never)
+  }
+  const session = fakeSession('s1', '/work/demo')
+  fake.emit('session/created', session)
+  await fake.flush()
+  fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+  // 与两条记忆一个词都不重叠：它们只能靠「常驻」而不是靠检索进来。
+  fake.emit('session/event', session, userMessage('写一个正则解析时间戳'))
+  return sectionText(fake, 'memory-layer:recall')
+}
+
+test('常驻规则：不相关的轮次也注入长期偏好与约束', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const block = await injectWithUnrelatedTurn(fake, [
+      { text: '提交前不要自动跑 git commit。', kind: 'constraint' },
+      { text: '用户偏好用 pnpm 而不是 npm。', kind: 'preference' },
+    ])
+    assert.match(block, /不要自动跑 git commit/u, '约束必须常驻')
+    assert.match(block, /pnpm/u, '偏好必须常驻')
+    assert.match(block, /STANDING RULES/u, '必须点明这类条目跨话题生效')
+    assert.match(block, /long-term constraint/u)
+    assert.match(block, /long-term preference/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('常驻规则只限偏好与约束：不相关的事实与决定不得注入', async () => {
+  // 事实/决定是「关于某件事的陈述」，只在相关时才有价值 —— 否则召回段会重新变成
+  // 「把库里所有东西倒进上下文」，这正是本轮要治的病。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const block = await injectWithUnrelatedTurn(fake, [
+      { text: '订单服务的超时配置是 3 秒。', kind: 'fact' },
+      { text: '团队决定用 Kafka 而不是 RabbitMQ。', kind: 'decision' },
+    ])
+    assert.doesNotMatch(block, /超时配置是 3 秒/u)
+    assert.doesNotMatch(block, /Kafka/u)
+    assert.doesNotMatch(block, /STANDING RULES/u, '没有常驻规则时不该出现说明行')
+  } finally {
+    await dispose()
+  }
+})
+
+test('常驻规则条数有上限，且 0 可关闭', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, injectStandingRules: 1 })
+  try {
+    // 「最新优先」是这条规则的取舍依据；两次写入必须跨过同一个毫秒，否则时间戳打平、
+    // 用例就会变成在赌 Map 的遍历顺序（曾经真的因此偶发失败）。
+    await toolOf(fake, 'memory_save').execute({ text: '旧偏好：用 npm。', kind: 'preference' } as never, undefined as never)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    const block = await injectWithUnrelatedTurn(fake, [{ text: '新偏好：用 pnpm。', kind: 'preference' }])
+    assert.match(block, /pnpm/u)
+    assert.doesNotMatch(block, /用 npm/u, '上限 1 时只留最新那条')
+    // 只数**条目行**：说明行里也印着 `long-term preference` 这个词，按子串数会数成 2。
+    const entryLines = block.split('\n').filter(line => /^\d+\. \(long-term preference\)/u.test(line))
+    assert.equal(entryLines.length, 1, `上限 1 时只能有一条常驻偏好：${block}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('常驻规则：injectStandingRules=0 时完全不注入', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, injectStandingRules: 0 })
+  try {
+    const block = await injectWithUnrelatedTurn(fake, [{ text: '用户偏好用 pnpm。', kind: 'preference' }])
+    assert.doesNotMatch(block, /pnpm/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('常驻规则：与检索命中同一条时不重复注入', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    // 查询里带上 uuid，保证 BM25 一定命中这条偏好 —— 此时常驻路径必须认出「已经在了」。
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    await toolOf(fake, 'memory_save').execute(
+      { text: '偏好：把 7f3a9c21 作为示例 id。', kind: 'preference' } as never,
+      undefined as never,
+    )
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('7f3a9c21 这个 id 有什么约定'))
+    const block = sectionText(fake, 'memory-layer:recall')
+    assert.equal(block.split('7f3a9c21').length - 1, 1, `同一条只能出现一次：${block}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('常驻规则：已被取代的偏好不再注入', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const first = String(await toolOf(fake, 'memory_save').execute(
+      { text: '用户偏好用 npm。', kind: 'preference' } as never,
+      undefined as never,
+    ))
+    const oldId = /sm_[0-9a-fA-F-]+/u.exec(first)?.[0]
+    assert.ok(oldId !== undefined, `保存应答应含 id：${first}`)
+    const second = String(await toolOf(fake, 'memory_save').execute(
+      { text: '用户偏好用 pnpm，不再用 npm。', kind: 'preference', supersedes: oldId } as never,
+      undefined as never,
+    ))
+    assert.match(second, /supersedes/u)
+    const block = await injectWithUnrelatedTurn(fake, [])
+    assert.match(block, /pnpm/u)
+    assert.doesNotMatch(block, /偏好用 npm/u, '被取代的旧偏好不得继续以常驻规则身份出现')
   } finally {
     await dispose()
   }

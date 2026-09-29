@@ -350,7 +350,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `recallLimit` | `5` | 单次召回条数上限（1–20） |
 | `injectMinMatched` / `injectMinScore` | `2` / `0` | 注入侧的**相关性门槛**：一条记忆/技巧要命中查询里几个不同的词（或达到多少 BM25 分）才允许进注入。不相关的轮次不再白付 token；`0` = 关闭对应判据 |
 | `injectStandingRules` | `4` | 每轮**强制注入**的常驻规则条数上限（`long-term preference` / `long-term constraint`）：这类记忆对任何任务都成立，因此不判相关性；`0` = 关闭 |
-| `techniqueAdvisory` / `techniqueAdvisoryDrafts` / `techniqueAdvisoryMax` | `true` / `true` / `12` | **动作点顾问**：模型对某文件/符号动手时，若库里有强证据命中的技巧且本会话还没推过，就在工具回执之后附一行 `· <技巧名> [id] — technique_get to read it.`（走 `tools/post-execute` 的 `additionalContexts`，不阻断、不改写工具结果）。默认连**草稿**一起看并标 `(draft, unverified)`：真实库里绝大多数知识是草稿，只看已验证等于在最需要它的场景不发声。同一条知识只推一次、**每轮最多一条**、每会话预算 `techniqueAdvisoryMax`（默认 12）| 证据只取**文件名与标识符**（驼峰切词）：目录名/扩展名（`src`/`java`）与代码正文、散文里的英文小写词都不算 —— 实测不剔除时误报很多 |
+| `techniqueAdvisory` / `techniqueAdvisoryDrafts` / `techniqueAdvisoryMax` / `firstContactAdvisory` | `true` / `true` / `12` / `true` | **动作点顾问**：模型对某文件/符号动手时，若库里有强证据命中的技巧且本会话还没推过，就在工具回执之后附一行 `· <技巧名> [id] — technique_get to read it.`（走 `tools/post-execute` 的 `additionalContexts`，不阻断、不改写工具结果）。默认连**草稿**一起看并标 `(draft, unverified)`：真实库里绝大多数知识是草稿，只看已验证等于在最需要它的场景不发声。同一条知识只推一次、**每轮最多一条**、每会话预算 `techniqueAdvisoryMax`（默认 12）。`firstContactAdvisory`（0.2.7）：**还没查过库**的会话，在动作点直接收到与本轮请求最相关的一条（**带要点**，不只是标题）—— 实测「你还没查过库」那句提醒出现 145 次、主动查询率仍只有 1%，而顾问通道的跟进率是 31%，差别在**出现的位置** | 证据只取**文件名与标识符**（驼峰切词）：目录名/扩展名（`src`/`java`）与代码正文、散文里的英文小写词都不算 —— 实测不剔除时误报很多 |
 | `injectStopwords` | `[]` | 追加到内置**通用词表**的词：命中它们不算「相关」，不能单独触发注入。内置表覆盖对话套话（继续/开始/可以）、交付元话题（技巧/文档/输出/中文/库里）与通用工程词（配置/函数/文件/路径/代码/测试/config/file/test）。**加一个词 = 放弃靠它触发注入**，因此别加本领域词（如「模组」「插件」） |
 | `recallChars` | `4000` | **条目正文**的字符上限；块头（不可信声明）与 `BEGIN/END` 边界永不截断 —— 安全围栏不能被预算裁掉，因此上限小于块头开销时实际长度会略超上限 |
 | `registerTools` | `true` | 是否注册记忆工具 |
@@ -380,6 +380,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `failureAskAfter` | `3` | 第几次重复开始在派发前询问（P2 生效） |
 | `failureBlockAfter` | `0` | 第几次重复开始硬拦截（P2 生效）；`0` = 从不 |
 | `failureInjectLimit` / `failureInjectChars` | `3` / `1500` | 预警与提醒合计的条数与正文上限；边界同上，永不截断 |
+| `failureInjectRelevantOnly` / `failureInjectPerSession` | `true` / `5` | **失败段的相关性与总量闸门**（0.2.7）：只注入与当前动作相关的预警（指纹的工具名或触发场景要对得上本会话用过的工具与最近 3 轮的措辞/文件；本会话**确实犯过**的指纹永远放行；会话还没有任何工具调用时一律放行 —— 那正是预警该出现的时刻），且每会话合计最多注入 `failureInjectPerSession` 条（`0` 不限）。实测：与动作无关的会话里失败段 1403 → 0 字符 | 逐指纹去重只能保证「同一条不重复」，保证不了总量：指纹一多，一轮 3 条连着十几轮就花掉上万字符（实测 24 小时 131k 字符，占插件注入 18%）|
 | `failurePromptOrder` | `255` | 失败预警 section 排序 |
 | `failurePreventWindowTurns` | `3` | 判定「防住了」的观察窗口（轮次） |
 | `fingerprintTemplateMaxChars` | `200` | 归一化错误模板的字符上限 |
@@ -565,6 +566,12 @@ dsh plugin --profile <name> install --offline                       #    重装�
 - **门槛可观测**：每个候选的 keep/drop 与命中词进 debug 日志，`memory_stats` 报
   `Injection gate: N dropped / M kept` —— 拦下的东西在上下文里没有痕迹，不报出来就没法排查
   「不相关技巧仍被注入」。
+- **召回去重**（0.2.7）：命中**彼此**近重复时只留一条 —— 开头 80 字符相同**且**包含度 ≥0.6
+  才判定重复（两个条件缺一不可：只按包含度会把「变体 1 / 变体 2」这类同题不同参数的条目
+  合并掉，等于删掉可执行信息）。实测 gt6 一次召回里 6 条情景摘要中有 5 条来自同一批子代理
+  会话，全文两两包含度 0.682–0.832、开头完全相同，而每条渲染只分到 ~418 字符（前言恰好占满）
+  ——模型付了 5 遍同样的话，从没读到过它们的分歧部分。同一查询注入 2960 → 1376 字符。
+  `memory_stats` 报 `Recall dedupe: N near-duplicate hit(s) dropped`。
 - 常驻规则在块内带一行说明（`STANDING RULES`），否则模型会把与本轮无关的偏好当成跑题噪声。
 - 只作用于**自动注入**：模型显式 `memory_search` / `technique_search` 一条不少。
 - 真库实测（`.verify/measure/gate-acceptance.mjs`、`memory-gate.mjs`）：不相关轮次的技巧注入
@@ -653,12 +660,50 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（357 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（364 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 
-> 依赖版本对齐到 dsh `0.1.5-rc.x` 版本线：`@deepseek-ai/*` 包彼此互为 peer，
-> 混用不同版本线（例如 latest 上的 `0.0.1-rc.1`）会导致 npm 解析冲突。
+> `devDependencies` 对齐到 dsh `0.1.5-rc.x` 版本线：`@deepseek-ai/*` 包彼此互为 peer，
+> 混用不同版本线（例如 latest 上的 `0.0.1-rc.1`）会导致 npm 解析冲突。**运行时**两条线都支持，
+> 见下节。
+
+### 兼容的 dsh 版本线
+
+同时支持 **`0.1.5-rc.x`（会话格式 v3）** 与 **`0.2.0-rc.1`（会话格式 v4）**：peer 范围写成
+`^0.1.5-rc.1 || ^0.2.0-rc.1`。两条线之间**唯一**影响本插件的破坏性变更，是消息来源的形状 ——
+v3 校验要求 `source: { kind: 'plugin', plugin: <名> }`，而 v4 的 `source()` 校验**直接拒绝**
+`kind: 'plugin'`、要求「产生者自有 kind」，插件来源提升为 `kind: 'plugin:<名>'`。插件因此按
+**实际安装的 `@deepseek-ai/dsh-session` 次版本号**选形状（`messageSourceFor`），注入过滤两条线
+都认；写死任何一边都会在另一边被格式校验拒绝而**静默丢掉注入**。
+
+验证方式如下。注意 `.verify/` 整体不入库，`.verify/compat/` 是**维护者本地夹具**（不随包发布）：
+它的 `paths.json` 指向本机那份 0.2.0-rc.1 安装，重定向加载器据此把 `@deepseek-ai/*` 解析换过去，
+因此**同一套用例能在另一条版本线上真跑**、也不需要启动第二个实例。
+
+```sh
+npm test                                  # 0.1.5 线：364/364
+npx tsc -p .verify/compat/tsconfig-020.json   # 对 0.2.0-rc.1 的 .d.ts 做类型检查：0 错误
+node --import ./.verify/compat/redirect.mjs --test lib/test/   # 0.2.0 线：364/364
+```
+
+> 后两条依赖本机的 0.2.0-rc.1 安装；换机器时按 `paths.json` 里的键改成对应路径即可。
+
+端到端也已经在真 0.2.0-rc.1 实例上跑过：`dsh plugin --profile web add file:<本包目录>` 之后
+`dsh.bundle.patch` 被识别、bundle 层自动登记进 profile 的 `dsh.profile.bundles`，重启后
+`memory_stats` 会自报实际选定的形状，活实例上可直接确认：
+
+```
+# 0.2.0-rc.1（会话格式 v4）
+Session format: dsh-session 0.2.0-rc.1 → plugin message source kind 'plugin:dsh-memory-layer'
+
+# 0.1.5-rc.2（会话格式 v3）
+Session format: dsh-session 0.1.5-rc.2 → plugin message source kind 'plugin'
+```
+
+0.1.5 上这把形状**与改动前逐字一致**（`{ kind: 'plugin', plugin: 'dsh-memory-layer' }`）；且即使探测
+判错也不会坏 —— 0.1.5 的格式校验只对 `system/message` 强制 `kind === 'plugin'`，`user/message`
+只要求 kind 是非空字符串，而本插件只产生 user 消息。
 
 ## 设计文档
 

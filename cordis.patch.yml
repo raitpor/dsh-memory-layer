@@ -63,6 +63,11 @@
         failureAskAfter: 3
         # 第几次重复开始硬拦截；0 = 从不硬拦截（默认，避免阻断正常工作）
         failureBlockAfter: 0
+        # 只注入与当前动作相关的失败预警（指纹的工具名/触发场景要对得上本会话动作）；
+        # 本会话确实犯过的指纹永远放行，会话还没有任何工具调用时也放行
+        failureInjectRelevantOnly: true
+        # 每个会话最多注入几条失败预警/提醒；0 = 不限
+        failureInjectPerSession: 5
         # 允许自动推导守卫的工具白名单：文件编辑/读取永不被自动拦截
         failureGuardTools:
           - bash
@@ -87,6 +92,8 @@
         skillExportDir: null
         # 写入 SKILL.md 前言 allowed-tools 的白名单；留空则不写该字段
         skillAllowedTools: []
+        # 未检索会话的首触顾问：还没查过库时，把与本轮最相关的一条技巧（含要点）推到动作点
+        firstContactAdvisory: true
         # 暴露 memory_* / technique_* / failure_* 工具
         registerTools: true
         # 检索索引后端：memory = 纯内存 BM25（零依赖）；sqlite = 从真源派生的 FTS5 索引

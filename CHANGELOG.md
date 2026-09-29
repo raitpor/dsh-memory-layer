@@ -2,6 +2,72 @@
 
 本插件遵循[语义化版本](https://semver.org/lang/zh-CN/)。`0.x` 期间 `minor` 版本可能包含**破坏性变更**。
 
+## 0.2.7 — 按实测砍注入成本（召回去重 / 失败段闸门 / 首触顾问），并兼容 dsh 0.2.0-rc.1
+
+问题（真库 + 真会话实测，最近 24 小时的 MC 开发工作）：插件在 11 个会话里注入 **715,408 字符**
+（180 条消息，平均 3,974 字符/条），而模型**主动查库率只有 1%**（`technique_search` +
+`memory_search` 16 次 / 2,420 次工具调用）。钱主要花在三处，各自有独立的成因。
+
+本版**同时合入** dsh `0.2.0-rc.1`（会话格式 v4）的兼容改动：注入成本削减与版本线兼容是同一次
+发布里要一起交付的内容，拆成两个版本号只会让「0.2.7 到底能不能装在 0.2.0-rc.1 上」变得含糊。
+
+### 修复与新增
+
+- **召回命中之间的近重复去重**：同一批子代理会话会写下同一个请求文本的 N 份情景摘要，检索时
+  分数相近、一起上榜。实测 gt6 一次召回里 6 条摘要中有 5 条属于这种重复：**全文**两两包含度
+  0.682–0.832、**开头 80 字符完全相同**，而每条渲染只分到 ~418 字符、公共前言恰好占满 ——
+  模型付了 5 遍同样的话，从未读到过它们的分歧部分。现在开头一致**且**包含度 ≥0.6 才合并，
+  同一查询注入 2960 → **1376 字符**。两个条件缺一不可：只按包含度会把「变体 1 / 变体 2」这类
+  同题不同参数的条目合并掉，等于删掉可执行信息（这条过度收紧被既有用例当场抓住）。
+  `memory_stats` 新增 `Recall dedupe:` 行。
+- **失败段相关性闸门 + 每会话总量预算**：预警原来只在「逐指纹去重」下注入，于是与本轮动作
+  毫无关系的指纹也会轮流上台 —— 实测失败段 24 小时花掉 **131,565 字符**（占插件注入的 18%）。
+  现在只注入与当前动作相关的预警（指纹的工具名或触发场景要对得上本会话用过的工具、
+  最近 3 轮的用户措辞与文件），且每会话合计最多 `failureInjectPerSession` 条。两条例外都必须
+  保留：本会话**确实犯过**的指纹（那是「你又犯了」）永远放行；会话**还没有任何工具调用**时
+  一律放行（那正是预警该出现的时刻 —— 收紧这一条时被既有用例「预警→prevented 闭环」抓住）。
+  实测：与动作无关的会话里失败段 1403 → **0 字符**。`memory_stats` 新增 `Failure gate:` 行。
+- **未检索提醒升级为首触顾问**：「本会话还没查过库」那句提醒实测出现 **145 次**，而主动查询率
+  仍是 1%；同一批会话里动作点顾问的跟进率是 **31%**。差别不在文字，在**出现的位置**：提醒躺在
+  系统提示里，顾问出现在模型刚做完一次动作、正要决定下一步的那一刻。现在未检索的会话会在
+  动作点收到与本轮请求最相关的一条技巧 —— **带要点**（不只是标题），仍走顾问通道
+  （强证据命中、按会话去重、每轮最多一条、每会话预算共用）。开关 `firstContactAdvisory`。
+
+- **兼容 dsh `0.2.0-rc.1`（会话格式 v4）**：差分 0.1.5-rc.2 与 0.2.0-rc.1 的全部依赖后，
+  唯一影响本插件的破坏性变更是**消息来源的形状** —— v4 的 `source()` 校验直接拒绝
+  `kind: 'plugin'`（`format v4 message requires a producer-owned source kind`），要求产生者自有
+  kind，插件来源提升为 `kind: 'plugin:<名>'`（见 `dsh-session-format-v3-to-v4` 的 `producerKind`）。
+  插件改成按**实际安装的 `@deepseek-ai/dsh-session` 次版本号**选形状，注入过滤两条线都认，
+  peer 范围放宽为 `^0.1.5-rc.1 || ^0.2.0-rc.1`。宿主事件名（`session/*`、`tools/pre-execute`、
+  `tools/post-execute`、`request/header`、`turn/*`）、`accept` 决定、`additionalContexts`、
+  `systemPrompt.context`、`tools.register`/`guard`、`llm.stream` 在 0.2.0-rc.1 上**均未变**。
+  证据三层：① 对 0.2.0-rc.1 的 `.d.ts` 类型检查 **0 错误**；② 把 `@deepseek-ai/*` 重定向到该
+  实例的包后，同一套用例 **364/364 通过**（`.verify/compat/` 是本机维护者夹具，不随包发布）；
+  ③ **真装真跑** —— `dsh plugin --profile web add file:<本包目录>`（`dsh.bundle.patch` 被识别，
+  bundle 层自动登记进 profile 的 `dsh.profile.bundles`），活实例 `memory_stats` 自报
+  `Session format: dsh-session 0.2.0-rc.1 → plugin message source kind 'plugin:dsh-memory-layer'`，
+  即 v4 下选中的正是 `plugin:<名>` 而不是会被校验拒绝的 `plugin`。
+
+### 说明
+
+- 三处都只动**注入侧**，不改检索语义、不改工具行为：显式 `memory_search` / `technique_search`
+  一条不少，闸门拦下的内容仍可被显式检索到。
+- 新增配置：`failureInjectRelevantOnly`（`true`）、`failureInjectPerSession`（`5`）、
+  `firstContactAdvisory`（`true`）；随包的 `cordis.patch.yml` 已同步。
+- 度量脚本：`.verify/measure/mc-value-audit.mjs`（按会话审计注入成本/查询率/顾问跟进/采纳/沉淀）、
+  `.verify/measure/cut-cost.mjs`（三处改动的前后对比）。
+
+### 验证
+
+- `npm test` 364/364（新增 4 条：去重精度、失败段闸门、每会话预算、首触顾问）。
+- 黑盒 `.verify/bt/cases-*.mjs` 89/89（7 组 7+15+17+10+8+10+22）；`.verify/revert-check.mjs`
+  75 条判别用例全部「回退即失败」（新增 R6–R9 对应本次三处改动），另 1 条已标注为结构性关闭。
+- 真库副本实测（`.verify/measure/cut-cost.mjs`）：相关查询召回 2960 → 1376 字符、
+  失败段 1403 → 0 字符、`Recall dedupe: 3` / `Failure gate: 3 skipped as irrelevant`。
+- 版本线兼容：`npx tsc -p .verify/compat/tsconfig-020.json` **0 错误**；
+  `node --import ./.verify/compat/redirect.mjs --test lib/test/` **364/364**（与 0.1.5 线同一套用例）；
+  端到端见上文兼容条目的第 ③ 层证据。
+
 ## 0.2.6 — 主动学习：退避不再关闭学习，候选只收「本次新确立」的知识
 
 问题（真库存量证据）：**自动学习被自己锁死了**。`reflections` 长期停在 17、`provenance=model`

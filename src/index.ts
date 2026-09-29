@@ -24,7 +24,10 @@
  */
 
 import { homedir } from 'node:os'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
@@ -248,6 +251,8 @@ export interface Config {
    * 最多一条**（`advisoryLastTurn`），所以放开预算是安全的。
    */
   techniqueAdvisoryMax?: number
+  /** 首触顾问：未检索的会话在动作点直接收到最相关的一条技巧（含要点）。默认 `true`。 */
+  firstContactAdvisory?: boolean
   /**
    * 追加到内置**通用词表**的词：命中这些词不算「相关」，因此不能单独触发注入。默认 `[]`。
    *
@@ -298,6 +303,10 @@ export interface Config {
   failureInjectLimit?: number
   /** 失败预警注入的字符上限。 */
   failureInjectChars?: number
+  /** 只注入与当前动作相关的失败预警（指纹的工具名/触发场景要对得上）。默认 `true`。 */
+  failureInjectRelevantOnly?: boolean
+  /** 每个会话最多注入几条失败预警/提醒；`0` 表示不限。默认 `5`。 */
+  failureInjectPerSession?: number
   /** 失败预警 section 的排序值。 */
   failurePromptOrder?: number
   /** 判定「防住了」的观察窗口（轮次）。 */
@@ -489,6 +498,19 @@ const LIBRARY_RESTATEMENT_RATIO = 0.6
 const SESSION_RESTATEMENT_RATIO = 0.5
 
 /**
+ * 注入段内判「召回命中彼此近重复」的包含度门槛（与「开头 80 字符相同」**同时**成立才丢弃）。
+ *
+ * 取落盘侧同一个数 0.6 的依据是实测：gt6 一次召回里 6 条情景摘要中有 5 条来自同一批子代理
+ * 会话，**全文**两两包含度 0.682–0.832、开头 80 字符完全相同（渲染截断后看是 0.864–0.946）。
+ * 它们的分歧全在公共前言之后，而每条渲染时只分到 ~418 字符、前言恰好占满 ——
+ * 也就是说模型从来没有读到过那部分分歧：付了 5 遍 418 字符，只为读同一段前言。
+ *
+ * 「开头相同」是必须的第二个条件：同题不同参数的条目（`变体 1` / `变体 2`）开头就分叉，
+ * 只按包含度去重会把它们合并，等于删掉可执行信息 —— 既有用例当场抓住了这一点。
+ */
+const RECALL_DUPLICATE_RATIO = 0.6
+
+/**
  * 把一条技巧草稿压成用于复述比对的正文。
  *
  * 与存储用的 `techniqueText` 保持同源字段（名称/触发/正文/步骤/不变量/坑/判据），
@@ -565,6 +587,10 @@ export const Config: z<Config> = z.object({
   techniqueAdvisory: z.boolean().default(true),
   techniqueAdvisoryDrafts: z.boolean().default(true),
   techniqueAdvisoryMax: z.natural().min(0).max(100).default(12),
+  // 未检索会话的首触顾问：会话还没查过库时，把与本轮最相关的一条技巧（含要点）推到动作点。
+  // 只靠「本会话还没查过库」那句提醒实测无效（提醒 145 次、主动查询率仍 1%），所以换成
+  // 走已验证有效的顾问通道把真东西递过去。
+  firstContactAdvisory: z.boolean().default(true),
   injectMinScore: z.number().min(0).max(1000).default(0),
   guidancePromptOrder: z.number().default(265),
   guidance: z.boolean().default(true),
@@ -584,6 +610,13 @@ export const Config: z<Config> = z.object({
   failureBlockAfter: z.natural().min(0).max(50).default(0),
   failureInjectLimit: z.natural().min(1).max(10).default(3),
   failureInjectChars: z.natural().min(200).max(20_000).default(1500),
+  // 只注入与**当前动作**相关的预警：指纹的工具名/触发场景与本会话用过的工具、最近轮次的
+  // 用户原话与文件对不上时，这条预警只是在讲一个与本轮无关的故事（实测 24 小时内失败段
+  // 花了 131k 字符，占插件注入的 18%）。本会话**确实犯过**的指纹永远放行。
+  failureInjectRelevantOnly: z.boolean().default(true),
+  // 每个会话最多注入几条失败预警/提醒（0 = 不限）。逐指纹去重只能保证「同一条不重复」，
+  // 保证不了总量：指纹一多，一轮 3 条、连着十几轮就花掉上万字符。
+  failureInjectPerSession: z.natural().min(0).max(50).default(5),
   failurePromptOrder: z.number().default(255),
   failurePreventWindowTurns: z.natural().min(1).max(20).default(3),
   fingerprintTemplateMaxChars: z.natural().min(40).max(2000).default(200),
@@ -666,6 +699,7 @@ interface Settings {
   techniqueAdvisory: boolean
   techniqueAdvisoryDrafts: boolean
   techniqueAdvisoryMax: number
+  firstContactAdvisory: boolean
   exampleMaxLines: number
   exampleMaxChars: number
   allowConfidentialGlobal: boolean
@@ -680,6 +714,8 @@ interface Settings {
   failureBlockAfter: number
   failureInjectLimit: number
   failureInjectChars: number
+  failureInjectRelevantOnly: boolean
+  failureInjectPerSession: number
   failurePromptOrder: number
   failurePreventWindowTurns: number
   fingerprintTemplateMaxChars: number
@@ -955,7 +991,7 @@ export function apply(ctx: Context, config: Config): void {
         system,
         messages: [createUserMessage({
           content: [{ type: 'text', text: user }],
-          source: { kind: 'plugin', plugin: name },
+          source: PLUGIN_MESSAGE_SOURCE as UserMessage['source'],
         })],
       }
       const assembler = new BlockAssembler()
@@ -1672,6 +1708,15 @@ export function apply(ctx: Context, config: Config): void {
   /** 落盘前被判为复述而丢弃的候选（进程内计数，供 `memory_stats` 观测过滤是否在干活）。 */
   const restatementDrops: string[] = []
 
+  /** 召回命中里被判为**彼此近重复**而丢弃的 id（进程内计数，同上）。 */
+  const recallDedupeDrops: string[] = []
+
+  /**
+   * 失败预警的注入门槛计数（进程内，供 `memory_stats` 观测）：
+   * `skippedIrrelevant` = 与本会话动作无关而没注入；`skippedBudget` = 每会话总量已用完。
+   */
+  const failureGateTally = { skippedIrrelevant: 0, skippedBudget: 0 }
+
   /**
    * 每个会话最后一次投递顾问的**轮号**（每轮最多一条）。
    *
@@ -1683,8 +1728,7 @@ export function apply(ctx: Context, config: Config): void {
   const advisoryLastTurn = new Map<string, number>()
 
   /** 动作点顾问：从工具调用里抽文件路径与调用名，只认强证据命中。 */
-  const advisoryFor = (exec: { name: string; arguments: unknown }): string | undefined => {
-    if (!settings.techniques || !settings.techniqueAdvisory) return undefined
+  const advisoryFor = (exec: { name: string; arguments: unknown }): string | undefined => {    if (!settings.techniques || !settings.techniqueAdvisory) return undefined
     const sessionId = current?.sessionId
     if (sessionId === undefined) return undefined
     const seen = advisorySeen.get(sessionId) ?? new Set<string>()
@@ -1715,6 +1759,54 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * 首触顾问：会话还没查过库时，把**与本轮请求最相关的那条技巧连同要点**直接推到动作点。
+   *
+   * 为什么不再只靠「本会话还没查过库」那句提醒：实测 24 小时里那条提醒出现了 145 次，
+   * 而模型主动查询率仍是 **1%**（16/2420）；同一批会话里动作点顾问的跟进率是 **31%**。
+   * 差别不在文字，在**出现的位置**：提醒躺在系统提示里，顾问出现在模型刚做完一次动作、
+   * 正要决定下一步的那一刻。所以这里把提醒内容换成真东西，并走同一条已证明有效的通道。
+   *
+   * 三条约束与 `advisoryFor` 完全一致（同一份 `seen` / `advisoryLastTurn` 预算）：
+   * 命中的是过门槛的检索结果（跑题不推）、每会话有总量上限、同一轮最多一条。
+   *
+   * @returns 顾问正文；不该推或没有过门槛的命中时 `undefined`。
+   */
+  const firstContactNote = (): string | undefined => {
+    if (!settings.techniques || !settings.firstContactAdvisory) return undefined
+    const sessionId = current?.sessionId
+    if (sessionId === undefined || consultedSessions.has(sessionId)) return undefined
+    const seen = advisorySeen.get(sessionId) ?? new Set<string>()
+    if (seen.size >= settings.techniqueAdvisoryMax) return undefined
+    const liveTurn = current?.turns.at(-1)?.turn
+    if (liveTurn !== undefined && advisoryLastTurn.get(sessionId) === liveTurn) return undefined
+    const query = current?.turns.at(-1)?.user ?? ''
+    if (query.trim().length === 0) return undefined
+    // 用**顾问同款强证据匹配**而不是技巧段的检索：两条通道的取向不同 ——
+    // 技巧段只给已验证知识（未验证的不自动注入），而顾问按设计可以推草稿并如实标注
+    // （真库里 90% 是草稿，只看已验证等于在最需要它的场景里不发声）。未受邀请就推东西，
+    // 精度比召回重要，所以坚持「命中必须是符号/领域这类强证据」。
+    const corpus = gatedCorpus(current?.cwd).filter(doc => doc.layer === 'technique'
+      && (settings.techniqueAdvisoryDrafts || doc.meta?.status !== 'draft'))
+    const terms = [...new Set(tokenize(query))]
+    const [top] = terms.length === 0 ? [] : advisoryMatches(corpus, terms, { limit: 1, seen })
+    if (top === undefined) return undefined
+    const record = techniqueById.get(top.id)
+    const draft = record?.status === 'draft'
+    const gist = (record?.gist ?? '').trim()
+    const label = top.label.slice(0, 120)
+    seen.add(top.id)
+    advisorySeen.set(sessionId, seen)
+    if (liveTurn !== undefined) advisoryLastTurn.set(sessionId, liveTurn)
+    logger.debug(`memory: first-contact advisory → ${top.id.slice(0, 11)}`)
+    return advisoryText([
+      `· 本会话还没查过知识库。与本轮最相关的一条：${label} [${top.id.slice(0, 11)}]`
+      + `${draft ? ' (draft, unverified)' : ''}`
+      + (gist.length === 0 ? '' : ` — ${gist.slice(0, 200)}`)
+      + ' — technique_get for the full steps.',
+    ])
+  }
+
+  /**
    * 把顾问正文包成宿主认识的 `UserMessage`。
    *
    * 来源必须是 `plugin`：宿主据此把它当注入上下文，**本插件的捕获端也按结构识别**
@@ -1728,7 +1820,7 @@ export function apply(ctx: Context, config: Config): void {
     id: `ms_${randomUUID()}` as UserMessage['id'],
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'dsh-memory-layer' },
+    source: PLUGIN_MESSAGE_SOURCE as UserMessage['source'],
   })
 
   const renderInjection = (query: string): string => {
@@ -1792,7 +1884,26 @@ export function apply(ctx: Context, config: Config): void {
       ...hits.filter(hit => !standingIds.has(hit.id)),
     ]
     if (merged.length === 0) return ''
-    const lines = merged.map((hit, index) => {
+    // 命中**彼此**近重复时只留最能代表它的那一条（排序在前者胜）。同一段里塞 5 份
+    // 措辞略异的同一件事，模型要付 5 遍 token 才读到一条信息，而且更难判断「这是同一件事」。
+    // 比较**开头 80 字符**而不是「首行」：注入前正文会被压成单行，按 `\n` 切根本没有
+    // 首行之别；而真实的重复（同一份请求写下的 N 份摘要）差别在后面，开头一长段完全一致。
+    const headOf = (text: string): string => compactEntryText(text).slice(0, 80)
+    const kept: typeof merged = []
+    for (const hit of merged) {
+      if (standingIds.has(hit.id)) { kept.push(hit); continue }
+      const head = headOf(hit.text)
+      // 两个条件缺一不可：**开头一致**挡掉「同一份记录写下的 N 份摘要」（真库实测它们彼此
+      // 包含度 0.864–0.946），而「构建命令变体 1 / 变体 2」这类**同题不同参数**的条目
+      // 开头就分叉，必须各自保留 —— 只按包含度去重会把它们合并，等于删掉可执行信息。
+      if (kept.some(other => headOf(other.text) === head
+        && maxContainment(hit.text, [other.text], tokenize) >= RECALL_DUPLICATE_RATIO)) {
+        recallDedupeDrops.push(hit.id)
+        continue
+      }
+      kept.push(hit)
+    }
+    const lines = kept.map((hit, index) => {
       const kind = recallLabel(hit.layer, hit.meta?.kind)
       // 逐条整形（去掉与正文重复的标题 + 封顶）：整块预算再砍尾巴时，至少不会出现半截条目。
       return `${index + 1}. (${kind}) ${sanitizeForInjection(compactEntryText(hit.text))}`
@@ -2080,6 +2191,29 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * 失败预警/提醒共用的「当前动作上下文」：最近 3 轮的用户原话、工具名与文件路径。
+   *
+   * 两者口径刻意不同：
+   * - **词元上下文**只看最近 3 轮：措辞与文件是「当下在干什么」，久了就不代表现在；
+   * - **工具集合**看整个会话：会话用什么工具是稳定属性，而成本本身由「逐指纹一次 +
+   *   每会话总量上限」兜住，不需要再靠缩短窗口来省。
+   *
+   * @param state - 当前会话状态。
+   * @returns 上下文的词元集合与本会话用过的工具名。
+   */
+  const failureActionContext = (state: LiveSession): { contextTokens: Set<string>; sessionTools: Set<string> } => {
+    const query = [
+      ...state.turns.slice(-3).map(turn => turn.user),
+      ...state.turns.slice(-3).flatMap(turn => turn.tools),
+      ...state.turns.slice(-3).flatMap(turn => turn.files),
+    ].join('\n')
+    return {
+      contextTokens: new Set(tokenize(query)),
+      sessionTools: new Set(state.turns.flatMap(turn => turn.tools)),
+    }
+  }
+
+  /**
    * 渲染失败预警注入。
    *
    * 排序刻意让「本会话刚犯过的错」置顶：同一轮里刚出现的失败，远比历史统计更值得立刻纠正。
@@ -2102,17 +2236,45 @@ export function apply(ctx: Context, config: Config): void {
     // 而这正是最常见的情形（预警本来就是给没犯过这个错的本会话看的）。
     const session = failureState(state.sessionId)
     const turn = currentTurnOf(state)
+    // 相关性判据（与 `renderLessons` 同一套）：指纹的工具名或触发场景要对得上当前动作。
+    const { contextTokens, sessionTools } = failureActionContext(state)
+    const hitThisSession = (record: FailureRecord): boolean =>
+      session?.lastSeenTurn.has(record.fingerprint.key) === true
 
-    const candidates = [...failureById.values()].filter(record =>
-      shouldWarn(record, escalation)
-      && !(session?.forgiven.has(record.fingerprint.key) ?? false)
+    let skippedIrrelevant = 0
+    const candidates = [...failureById.values()].filter(record => {
+      if (!(shouldWarn(record, escalation))) return false
+      if (session?.forgiven.has(record.fingerprint.key) ?? false) return false
       // B7：同一条预警在本会话里只发一次。它是给「还没犯这个错」的会话看的；
       // 同一场景每轮重发同一段文字，模型已经读过，只是噪声与开销
       // （最多 3 条 × 1500 字符/请求）。场景真的再次发生时，机械失败会被重新观测到，
       // 那时走的是「你又犯了」的计数路径，而不是重发这条历史预警。
-      && !session?.advisoriesSent.has(record.fingerprint.key)
-      && failureApplies(record, state.stack)
-      && (record.scope === 'project' || record.partition === settings.partition))
+      if (session?.advisoriesSent.has(record.fingerprint.key) ?? false) return false
+      if (!failureApplies(record, state.stack)) return false
+      if (!(record.scope === 'project' || record.partition === settings.partition)) return false
+      // 与本会话动作无关的预警不讲当下的事，只是在花 token —— 除非本会话**确实犯过**
+      // 这个指纹（那是「你又犯了」，永远放行）。
+      // `sessionTools.size === 0`：会话还没有任何工具调用时**一律放行** —— 那正是预警最该
+      // 出现的时刻（用户刚说「接着写 report.json」，而历史失败就是写它时 ENOENT）。
+      // 这里收紧过一次，被既有用例「闭环度量：预警后…计入 prevented」当场抓住：新会话没有
+      // 动作上下文，闸门把所有预警都挡掉了。放行成本有界（逐指纹一次 + 每会话总量上限）。
+      if (settings.failureInjectRelevantOnly && !hitThisSession(record)
+        && sessionTools.size > 0
+        && !lessonMatches(record, contextTokens, sessionTools)) {
+        skippedIrrelevant += 1
+        return false
+      }
+      return true
+    })
+
+    // 每会话总量上限：逐指纹去重挡不住「指纹一多，一轮 3 条连着十几轮」。
+    const delivered = session?.advisoriesSent.size ?? 0
+    const sessionBudget = settings.failureInjectPerSession <= 0
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, settings.failureInjectPerSession - delivered)
+    const cap = Math.min(settings.failureInjectLimit, sessionBudget)
+    failureGateTally.skippedIrrelevant += skippedIrrelevant
+    failureGateTally.skippedBudget += Math.max(0, candidates.length - cap)
 
     const now = Date.now()
     const score = (record: FailureRecord): number =>
@@ -2122,7 +2284,7 @@ export function apply(ctx: Context, config: Config): void {
 
     const ranked = candidates
       .sort((left, right) => score(right) - score(left))
-      .slice(0, settings.failureInjectLimit)
+      .slice(0, cap)
     const recentFiles = state.turns.at(-1)?.files ?? []
     const warnings = ranked.map(record => {
       if (session !== undefined && !session.warned.has(record.fingerprint.key)) {
@@ -2130,10 +2292,10 @@ export function apply(ctx: Context, config: Config): void {
       }
       session?.advisoriesSent.add(record.fingerprint.key)
       // 只在本会话确实见过这个指纹时才给出现场文件：全局域记录不带项目路径。
-      const files = session?.lastSeenTurn.has(record.fingerprint.key) === true ? recentFiles : []
+      const files = hitThisSession(record) ? recentFiles : []
       return sanitizeForInjection(failureWarningLine(record, files))
     })
-    const lessons = renderLessons(state, settings.failureInjectLimit - warnings.length)
+    const lessons = renderLessons(state, cap - warnings.length)
     if (warnings.length === 0 && lessons.length === 0) return ''
     // DEF-07：两类条目同处一段，编号必须**连续** —— 各自从 1 开始会让「已解决提醒」
     // 与「你又犯了」的编号撞车，削弱块头刻意强调的语气区分。
@@ -2158,26 +2320,25 @@ export function apply(ctx: Context, config: Config): void {
   const renderLessons = (state: LiveSession, budget: number): string[] => {
     if (budget <= 0) return []
     const session = failuresBySession.get(state.sessionId)
-    const query = [
-      ...state.turns.slice(-3).map(turn => turn.user),
-      ...state.turns.slice(-3).flatMap(turn => turn.tools),
-      ...state.turns.slice(-3).flatMap(turn => turn.files),
-    ].join('\n')
-    if (query.trim().length === 0) return []
-    const contextTokens = new Set(tokenize(query))
-    const sessionTools = new Set(state.turns.flatMap(turn => turn.tools))
+    const { contextTokens, sessionTools } = failureActionContext(state)
+    if (contextTokens.size === 0) return []
 
     return [...failureById.values()]
       .filter(record =>
         record.status === 'deprecated'
         && record.remedy.length > 0
         && !(session?.forgiven.has(record.fingerprint.key) ?? false)
+        // 提醒同样每会话只发一次：同一条「已解决提醒」在同一个场景里每轮重发，模型已经读过。
+        && !(session?.advisoriesSent.has(record.fingerprint.key) ?? false)
         && failureApplies(record, state.stack)
         && (record.scope === 'project' || record.partition === settings.partition)
         && lessonMatches(record, contextTokens, sessionTools))
       .sort((left, right) => right.lastSeen - left.lastSeen)
       .slice(0, budget)
-      .map(record => sanitizeForInjection(failureLessonLine(record)))
+      .map(record => {
+        session?.advisoriesSent.add(record.fingerprint.key)
+        return sanitizeForInjection(failureLessonLine(record))
+      })
   }
 
   /** 失败工具行为实现。 */
@@ -2517,6 +2678,10 @@ export function apply(ctx: Context, config: Config): void {
       return [
         `Memory root: ${settings.dir}`,
         `Layer scopes: episodic=${settings.scopeEpisodic}, semantic=${settings.scopeSemantic}, technique=${settings.scopeTechnique}, failure=${settings.scopeFailure} (partition ${settings.partition})`,
+        // 宿主版本决定协议形状（消息来源），选错会让注入被格式校验拒绝 —— 必须自报，
+        // 否则「换了 dsh 版本后注入静默消失」只能靠考古。
+        `Session format: dsh-session ${SESSION_VERSION.length === 0 ? 'unknown（按 0.1 线）' : SESSION_VERSION}`
+          + ` → plugin message source kind '${PLUGIN_MESSAGE_SOURCE.kind}'`,
         `Episodic summaries: ${episodic} (this project) · ${episodicTotal} (all projects)`,
         `Semantic facts: ${semantic}${superseded === 0 ? '' : ` (${superseded} superseded, not injected)`}`,
         `Techniques: ${verified} verified, ${techniques.length - verified} draft`,
@@ -2538,6 +2703,9 @@ export function apply(ctx: Context, config: Config): void {
         `Recurring failures: ${[...failureById.values()].filter(record => record.status !== 'deprecated').length} active, `
           + `${[...failureById.values()].filter(record => record.status === 'deprecated').length} resolved, `
           + `${[...failureById.values()].reduce((sum, record) => sum + record.prevented, 0)} prevented`,
+        // 失败段同样有看不见的拦截：没注入就没有痕迹，必须报出来。
+        `Failure gate: ${failureGateTally.skippedIrrelevant} skipped as irrelevant, `
+          + `${failureGateTally.skippedBudget} skipped by per-session budget`,
         ...(store.integrityBroken
           ? [`Store integrity: BROKEN — ${store.brokenFile ?? 'unknown file'} cannot be decoded; writes are refused until the key is restored`]
           : store.undecodableLines > 0
@@ -2552,6 +2720,9 @@ export function apply(ctx: Context, config: Config): void {
         // 会被误读成「反思没学到东西」。
         `Restatement filter: ${restatementDrops.length} candidate(s) dropped this process`
           + (restatementDrops.length === 0 ? '' : ` — e.g. ${restatementDrops.slice(-3).join(' | ')}`),
+        // 召回命中之间的近重复去重：与门槛同理，拦下的东西在上下文里没有痕迹，必须报出来。
+        `Recall dedupe: ${recallDedupeDrops.length} near-duplicate hit(s) dropped this process`
+          + (recallDedupeDrops.length === 0 ? '' : ` — e.g. ${recallDedupeDrops.slice(-3).join(' | ')}`),
       ].join('\n')
     },
   })
@@ -3162,7 +3333,9 @@ export function apply(ctx: Context, config: Config): void {
           const decision = await next()
           try {
             if (decision.kind !== 'accept' || result.isError === true) return decision
-            const note = advisoryFor(exec)
+            // 先试**动作点**命中（工具参数里的文件/调用名），没有再试**首触**（本轮请求最相关的一条）。
+            // 两者共用同一份会话预算与轮节流，所以任一路都不会把成本打开。
+            const note = advisoryFor(exec) ?? firstContactNote()
             if (note === undefined) return decision
             return {
               ...decision,
@@ -3292,6 +3465,7 @@ function resolveSettings(config: Config): Settings {
     techniqueAdvisory: config.techniqueAdvisory ?? true,
     techniqueAdvisoryDrafts: config.techniqueAdvisoryDrafts ?? true,
     techniqueAdvisoryMax: config.techniqueAdvisoryMax ?? 12,
+    firstContactAdvisory: config.firstContactAdvisory ?? true,
     exampleMaxLines: config.exampleMaxLines ?? 8,
     exampleMaxChars: config.exampleMaxChars ?? 480,
     allowConfidentialGlobal: config.allowConfidentialGlobal ?? false,
@@ -3306,6 +3480,8 @@ function resolveSettings(config: Config): Settings {
     failureBlockAfter: config.failureBlockAfter ?? 0,
     failureInjectLimit: config.failureInjectLimit ?? 3,
     failureInjectChars: config.failureInjectChars ?? 1500,
+    failureInjectRelevantOnly: config.failureInjectRelevantOnly ?? true,
+    failureInjectPerSession: config.failureInjectPerSession ?? 5,
     failurePromptOrder: config.failurePromptOrder ?? 255,
     failurePreventWindowTurns: config.failurePreventWindowTurns ?? 3,
     fingerprintTemplateMaxChars: config.fingerprintTemplateMaxChars ?? 200,
@@ -3442,7 +3618,7 @@ function messageText(message: { content?: unknown }): string {
  * 判断一条 `user/message` 是宿主注入的上下文块，还是用户自己说的话。
  *
  * 主判据是**结构性**的：用户输入由前端以 `source.kind === 'user'` 发出，而运行时快照 /
- * 召回块 / 失败预警由 `@deepseek-ai/dsh-system-prompt` 以 `source.kind === 'plugin'`
+ * 召回块 / 失败预警由宿主以 `source.kind === 'plugin'`（0.1 线）或 `'plugin:<名>'`（0.2 线）
  * 注入。按结构判定不依赖宿主的具体措辞，宿主改写或本地化那句提示也不会让过滤失效。
  *
  * 结构信息缺失（或换了一个宿主实现）时退回按块首标记判定；两条都判不出时**保留**这条
@@ -3451,10 +3627,87 @@ function messageText(message: { content?: unknown }): string {
  * @param data - `user/message` 事件的数据。
  * @returns 该消息由宿主注入时为 true。
  */
-function isInjectedUserMessage(data: { source?: { kind?: unknown }; content?: unknown }): boolean {
-  if (data.source?.kind === 'plugin') return true
+export function isInjectedUserMessage(data: { source?: { kind?: unknown }; content?: unknown }): boolean {
+  const kind = data.source?.kind
+  // v3 写 `plugin`（另带 `plugin: <名>` 字段），v4 要求产生者自有 kind、插件写成 `plugin:<名>`。
+  // 两条都要认：只认旧的会让 0.2 线上的注入块被当成用户原话记进记忆（自我放大）。
+  if (kind === 'plugin' || (typeof kind === 'string' && kind.startsWith('plugin:'))) return true
   return isInjectedContext(messageText(data))
 }
+
+/**
+ * 已安装 `@deepseek-ai/dsh-session` 的次版本号；探测不到时按 `1`（0.1 线）。
+ *
+ * 为什么必须按版本选形状：**两条线的消息来源是互斥的**。
+ * - 0.1.x（会话格式 v3）：校验要求 `{ kind: 'plugin', plugin: <非空名> }`；
+ * - 0.2.x（格式 v4）：`source()` 校验**直接拒绝** `kind === 'plugin'`，要求「产生者自有 kind」，
+ *   插件来源统一提升为 `kind: 'plugin:<名>'`（见 `dsh-session-format-v3-to-v4` 的
+ *   `producerKind` 兜底分支 `return \`plugin:${plugin}\``）。
+ *
+ * 写死任何一边都会在另一边报错，或者更糟 —— 在 0.2 上被格式校验拒绝而**静默丢掉注入**。
+ *
+ * @returns 次版本号（`0.2.0-rc.1` → `2`；主版本非 0 时返回 `99`）。
+ */
+function installedSessionVersion(): string {
+  try {
+    // 优先用 ESM 解析（`import.meta.resolve`）：它**走加载器钩子**，因此在换了包来源的
+    // 测试环境里也能探到真正被加载的那一份；`createRequire` 是 CJS 解析、不经过钩子，
+    // 只能在真实安装里用（作为兜底）。
+    let resolved: string
+    try {
+      resolved = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-session'))
+    } catch {
+      resolved = createRequire(import.meta.url).resolve('@deepseek-ai/dsh-session')
+    }
+    let dir = dirname(resolved)
+    for (let depth = 0; depth < 6; depth += 1) {
+      const file = join(dir, 'package.json')
+      if (existsSync(file)) {
+        const parsed = JSON.parse(readFileSync(file, 'utf8')) as { name?: string; version?: string }
+        if (parsed.name === '@deepseek-ai/dsh-session') return String(parsed.version ?? '')
+        
+      }
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+  } catch {
+    // 探测失败返回空串，由 `sessionFormatMinor` 按 0.1 线处理。
+  }
+  return ''
+}
+
+/**
+ * 纯函数：把 `@deepseek-ai/dsh-session` 的版本号换算成会话格式次版本号。
+ *
+ * @param version - 版本字符串（探测不到时为空串）。
+ * @returns 次版本号；探测不到按 `1`（0.1 线 —— 旧写法在那条线上必然可用，也是当前主流安装）。
+ */
+export function sessionFormatMinor(version: string): number {
+  const [major = '0', minor = '1'] = version.split('.')
+  if (version.length === 0) return 1
+  return Number(major) === 0 ? Number(minor) : 99
+}
+
+/** 探测到的 `@deepseek-ai/dsh-session` 版本（空串=探测失败）。 */
+const SESSION_VERSION = installedSessionVersion()
+
+/** 本次运行据以选择消息来源形状的会话格式次版本号。 */
+const SESSION_FORMAT_MINOR = sessionFormatMinor(SESSION_VERSION)
+
+/**
+ * 纯函数：按会话格式次版本号给出插件消息的来源形状（便于两条分支各自单测）。
+ *
+ * @param sessionMinor - `@deepseek-ai/dsh-session` 的次版本号。
+ * @param plugin - 插件名。
+ * @returns v4 起为 `{ kind: 'plugin:<名>' }`，v3 为 `{ kind: 'plugin', plugin: <名> }`。
+ */
+export function messageSourceFor(sessionMinor: number, plugin: string): { kind: string; plugin?: string } {
+  return sessionMinor >= 2 ? { kind: `plugin:${plugin}` } : { kind: 'plugin', plugin }
+}
+
+/** 本次运行该用的插件消息来源（按实际安装的 dsh 版本选定）。 */
+const PLUGIN_MESSAGE_SOURCE = messageSourceFor(SESSION_FORMAT_MINOR, name)
 
 /**
  * 把标识符切成小写词：`GTItemDataComponents` → `gt item data components`。

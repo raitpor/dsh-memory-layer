@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { apply } from '../src/index.js'
+import { apply, messageSourceFor, isInjectedUserMessage, sessionFormatMinor } from '../src/index.js'
 import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS, advisoryText } from '../src/injection.js'
 import { isInjectedContext } from '../src/distill.js'
 import type { Config } from '../src/index.js'
@@ -1059,6 +1059,9 @@ test('退避期间、窗口全被库覆盖时不反思（成本控制仍然成�
       kind: 'procedure',
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 从回执里抠出来的 id 必须立刻断言：可选链在格式变化时静默给 undefined，
+    // 失败会漂到下游的 apply 里，报错指向与真实原因脱节。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
     await toolOf(fake, 'technique_apply').execute(
       { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )
@@ -4113,6 +4116,9 @@ test('动作点顾问：对文件/符号动手且库里有强证据命中时附�
       kind: 'procedure',
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 从回执里抠出来的 id 必须立刻断言：可选链在格式变化时静默给 undefined，
+    // 失败会漂到下游的 apply 里，报错指向与真实原因脱节。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
     await toolOf(fake, 'technique_apply').execute(
       { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )
@@ -4153,6 +4159,9 @@ test('动作点顾问：失败结果、无路径无标识符、目录名/扩展�
       kind: 'procedure',
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 从回执里抠出来的 id 必须立刻断言：可选链在格式变化时静默给 undefined，
+    // 失败会漂到下游的 apply 里，报错指向与真实原因脱节。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
     await toolOf(fake, 'technique_apply').execute(
       { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )
@@ -4275,6 +4284,9 @@ test('动作点顾问：散文里的普通英文词不算证据（实测误报�
       kind: 'procedure',
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 从回执里抠出来的 id 必须立刻断言：可选链在格式变化时静默给 undefined，
+    // 失败会漂到下游的 apply 里，报错指向与真实原因脱节。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
     await toolOf(fake, 'technique_apply').execute(
       { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )
@@ -4314,6 +4326,9 @@ test('动作点顾问：句首大写的普通英文词不算标识符（实测�
       kind: 'procedure',
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 从回执里抠出来的 id 必须立刻断言：可选链在格式变化时静默给 undefined，
+    // 失败会漂到下游的 apply 里，报错指向与真实原因脱节。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
     await toolOf(fake, 'technique_apply').execute(
       { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
     )
@@ -4456,6 +4471,274 @@ test('C：真新知识不会被复述过滤误杀（阈值有实测余量：真�
     await fake.flush()
     const names = (await new MemoryStore(root).readTechniques('global')).map(record => record.name)
     assert.equal(names.length, 2, `两条真新知识都应落盘：${names.join(' | ')}`)
+  } finally {
+    await dispose()
+  }
+})
+
+// ---- 成本三砍（0.2.7）：召回去重 / 失败段闸门与预算 / 首触顾问 --------------------
+
+test('召回命中近重复只留一条：开头一致且包含度高者合并，同题不同参数各自保留', async () => {
+  // 实测依据：gt6 一次召回里 6 条情景摘要中有 5 条彼此包含度 0.864–0.946（同一批子代理
+  // 会话写下的同一份请求），光这 5 条就占该次注入 2960 字符里的 2090。
+  //
+  // 夹具必须用**情景摘要**：语义事实走 `memory_save` 时同 key 会在写入时就合并，造不出重复；
+  // 而情景摘要天然每会话一条，正是实测里那些重复的来源。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const body = '你是移植作业代理之一，负责 grep 出旧接口的全部调用点并逐个替换，工作目录是工作区根目录，'
+      + '编译命令是 ./gradlew build，产物在 build/libs 下，遇到不确定的 API 先去 reference 目录里'
+      + '对上游分支的写法，不要凭记忆改签名。'
+    for (const id of ['s1', 's2', 's3']) {
+      await runSession(fake, fakeSession(id, '/work/demo'), `${body}你负责的包是 ${id}。`, ['src/a.ts'])
+      await flushWrites(fake)
+    }
+    // 同题不同参数：开头就分叉，必须各自保留（合并它们等于删掉可执行信息）。
+    const s = fakeSession('q', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    for (const n of [1, 2]) {
+      await toolOf(fake, 'memory_save').execute({
+        text: `移植时的编译命令变体 ${n}：用 make target-${n}，别用 target-${n + 1}。`,
+        kind: 'fact',
+      } as never, undefined as never)
+    }
+    await fake.flush()
+    fake.emit('session/event', s, userMessage('移植作业代理要先做哪一步，编译命令用哪个变体'))
+    const rendered = sectionText(fake, 'memory-layer:recall')
+    const duplicates = [...rendered.matchAll(/你是移植作业代理之一/gu)].length
+    const variants = [...rendered.matchAll(/编译命令变体 \d/gu)].length
+    assert.ok(duplicates < 3, `近重复摘要应被合并，实际留下 ${duplicates} 条：${rendered}`)
+    assert.equal(variants, 2, `同题不同参数的条目必须各自保留：${rendered}`)
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Recall dedupe: [1-9]\d* near-duplicate hit\(s\) dropped/u,
+      '去重必须在 stats 里可见（拦下的东西不留痕迹）',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('失败段相关性闸门：与会话动作无关的预警不注入，但「你又犯了」永远放行', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, failureWarnAfter: 2 })
+  try {
+    await failSession(fake, fakeSession('f1', '/work/demo'), 'ENOENT: cannot write report.json')
+    await failSession(fake, fakeSession('f2', '/work/demo'), 'ENOENT: cannot write report.json')
+
+    // (a) 本会话只用 read 动作：bash 指纹的预警与当前动作无关 → 不注入。
+    const busy = fakeSession('a1', '/work/demo')
+    fake.emit('session/created', busy)
+    fake.emit('session/event', busy, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', busy, userMessage('先读一下说明文档'))
+    fake.emit('session/event', busy, event('tool/call', {
+      turn: 1, step: 1, callId: 'c1', name: 'read', arguments: JSON.stringify({ file_path: 'docs/intro.md' }),
+    }))
+    await fake.flush()
+    const quiet = sectionText(fake, 'memory-layer:failures')
+    assert.doesNotMatch(quiet, /已重复 2 次/u, `无关动作不该付这段成本：${quiet}`)
+
+    // (b) 同一批失败，但本会话用的是 bash：命中指纹工具 → 正常预警。
+    const matching = fakeSession('a2', '/work/demo')
+    fake.emit('session/created', matching)
+    fake.emit('session/event', matching, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', matching, userMessage('继续生成报告'))
+    fake.emit('session/event', matching, event('tool/call', {
+      turn: 1, step: 1, callId: 'c2', name: 'bash', arguments: JSON.stringify({ command: 'ls -la' }),
+    }))
+    await fake.flush()
+    assert.match(sectionText(fake, 'memory-layer:failures'), /已重复 2 次/u, '动作对得上时应预警')
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Failure gate: [1-9]\d* skipped as irrelevant/u,
+      '闸门拦下的条数必须可见',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('失败段每会话预算：逐指纹去重挡不住的总量在这里兜住', async () => {
+  // 逐指纹去重只能保证「同一条不重复」，保证不了总量：指纹一多，一轮 3 条连着十几轮。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    failureWarnAfter: 2,
+    failureInjectLimit: 3,
+    failureInjectPerSession: 1,
+  })
+  try {
+    for (const error of ['ENOENT: cannot write report.json', 'EACCES: permission denied on build']) {
+      await failSession(fake, fakeSession(`f-${error.slice(0, 5)}`, '/work/demo'), error)
+      await failSession(fake, fakeSession(`g-${error.slice(0, 5)}`, '/work/demo'), error)
+    }
+    const s = fakeSession('budget', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', s, userMessage('继续生成报告'))
+    fake.emit('session/event', s, event('tool/call', {
+      turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: JSON.stringify({ command: 'ls' }),
+    }))
+    await fake.flush()
+    const first = [...sectionText(fake, 'memory-layer:failures').matchAll(/^\d+\. /gmu)].length
+    assert.equal(first, 1, '预算=1 时第一轮恰好一条')
+    // 第二轮：预算已用完，即使还有别的指纹也不再注入。
+    fake.emit('session/event', s, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', s, userMessage('再试一次生成'))
+    fake.emit('session/event', s, event('tool/call', {
+      turn: 2, step: 1, callId: 'c2', name: 'bash', arguments: JSON.stringify({ command: 'ls -la' }),
+    }))
+    await fake.flush()
+    assert.equal(sectionText(fake, 'memory-layer:failures'), '', '预算用完后不再注入')
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Failure gate: \d+ skipped as irrelevant, [1-9]\d* skipped by per-session budget/u,
+      '预算拦下的条数必须可见',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('首触顾问：未检索的会话在动作点收到最相关的一条（含要点），查过之后不再推', async () => {
+  // 实测依据：24 小时里「本会话还没查过库」的提醒出现 145 次，模型主动查询率仍是 1%；
+  // 而同一批会话里动作点顾问的跟进率是 31% —— 差别在**出现的位置**，所以把提醒换成真东西。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: '沙箱内 HOME 只读：把 GRADLE_USER_HOME 指到工作区',
+      when: '受限 HOME 下跑 Gradle 构建时',
+      summary: '沙箱 HOME 只读会让 Gradle 解压 native-platform 失败，把 GRADLE_USER_HOME 指向工作区内可写目录即可。',
+      kind: 'env-recipe',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+
+    const s = fakeSession('first-contact', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', s, userMessage('Gradle 构建失败：沙箱 HOME 只读怎么办'))
+    await fake.flush()
+    // 动作本身没有强证据（只有一条无害的 ls），所以命中的只能是首触通道。
+    const decision = await fake.postExecute(
+      { name: 'bash', arguments: JSON.stringify({ command: 'ls' }) },
+      { isError: false },
+    )
+    const text = advisoryOf(decision)
+    assert.match(text, /Knowledge library advisory/u, `应附首触顾问：${JSON.stringify(decision)}`)
+    assert.match(text, /还没查过知识库/u, '要说清这是首触提醒')
+    assert.match(text, /GRADLE_USER_HOME/u, `要点要进顾问（不是只给标题）：${text}`)
+    assert.match(text, /technique_get for the full steps/u, '要给出下一步动作')
+
+    // 查过之后不再推：`technique_search` 一落地，首触通道就该沉默。
+    await toolOf(fake, 'technique_search').execute({ query: 'gradle home' } as never, undefined as never)
+    fake.emit('session/event', s, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', s, userMessage('Gradle 构建还是失败'))
+    await fake.flush()
+    const after = await fake.postExecute(
+      { name: 'bash', arguments: JSON.stringify({ command: 'ls' }) },
+      { isError: false },
+    )
+    assert.doesNotMatch(advisoryOf(after), /还没查过知识库/u, '查过库之后不该再推首触顾问')
+  } finally {
+    await dispose()
+  }
+})
+
+// ---- dsh 0.2.0-rc.1 兼容：消息来源形状随会话格式线自适应 ----------------------------
+
+test('消息来源形状按 dsh 会话格式线自适应，且注入过滤两条线都认', () => {
+  // 实测（0.2.0-rc.1 差分）：0.1.x 的校验要求 `{kind:'plugin', plugin:<名>}`；0.2.x 的
+  // `source()` 直接**拒绝** `kind:'plugin'`，要求产生者自有 kind，插件写成 `plugin:<名>`。
+  // 写死任何一边都会在另一边被格式校验拒绝而静默丢掉注入。
+  assert.deepEqual(messageSourceFor(1, 'dsh-memory-layer'), { kind: 'plugin', plugin: 'dsh-memory-layer' })
+  assert.deepEqual(messageSourceFor(2, 'dsh-memory-layer'), { kind: 'plugin:dsh-memory-layer' })
+  assert.deepEqual(messageSourceFor(99, 'x'), { kind: 'plugin:x' })
+
+  // 过滤：两条线的形状都必须被认成「注入的上下文」而不是用户原话 ——
+  // 只认旧的会让 0.2 线上的注入块被记进记忆，正是要防的自我放大。
+  const content = [{ type: 'text', text: '随便一句像是用户说的话' }]
+  assert.equal(isInjectedUserMessage({ source: { kind: 'plugin' }, content }), true)
+  assert.equal(isInjectedUserMessage({ source: { kind: 'plugin:dsh-memory-layer' }, content }), true)
+  assert.equal(isInjectedUserMessage({ source: { kind: 'user' }, content }), false)
+  assert.equal(isInjectedUserMessage({ source: {}, content }), false)
+})
+
+test('顾问消息的来源形状与当前安装的 dsh 会话格式线一致（两条线各自自证）', async () => {
+  // 测试端**独立**探测一次版本（不借用插件的实现），再断言顾问消息的形状符合该线的校验规则：
+  // 0.1.x 要求 `{kind:'plugin', plugin:<非空名>}`；0.2.x 要求 kind 非 'plugin'（用 `plugin:<名>`）。
+  const { readFileSync, existsSync } = await import('node:fs')
+  const { dirname, join } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  let minor = 1
+  try {
+    let dir = dirname(fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-session')))
+    for (let depth = 0; depth < 6; depth += 1) {
+      const file = join(dir, 'package.json')
+      if (existsSync(file)) {
+        const parsed = JSON.parse(readFileSync(file, 'utf8')) as { name?: string; version?: string }
+        if (parsed.name === '@deepseek-ai/dsh-session') {
+          minor = Number(String(parsed.version ?? '0.1').split('.')[1] ?? 1)
+          break
+        }
+      }
+      dir = dirname(dir)
+    }
+  } catch { minor = 1 }
+
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    await toolOf(fake, 'technique_save').execute({
+      name: '沙箱内 HOME 只读：把 GRADLE_USER_HOME 指到工作区',
+      when: '受限 HOME 下跑 Gradle 构建时',
+      summary: '沙箱 HOME 只读会让 Gradle 解压 native-platform 失败，把 GRADLE_USER_HOME 指向工作区内可写目录。',
+      kind: 'env-recipe',
+    } as never, undefined as never)
+    const s = fakeSession('shape', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', s, userMessage('Gradle 构建失败：沙箱 HOME 只读怎么办'))
+    await fake.flush()
+    const decision = await fake.postExecute(
+      { name: 'bash', arguments: JSON.stringify({ command: 'ls' }) },
+      { isError: false },
+    ) as { additionalContexts?: Array<{ source?: { kind?: string; plugin?: string } }> }
+    const source = decision.additionalContexts?.[0]?.source
+    assert.ok(source !== undefined, `顾问消息应带来源：${JSON.stringify(decision)}`)
+    if (minor >= 2) {
+      assert.notEqual(source.kind, 'plugin', '0.2 线的 v4 格式拒绝 kind=plugin')
+      assert.equal(source.kind, 'plugin:dsh-memory-layer', `0.2 线应写成 plugin:<名>：${JSON.stringify(source)}`)
+    } else {
+      assert.equal(source.kind, 'plugin', `0.1 线要求 kind=plugin：${JSON.stringify(source)}`)
+      assert.equal(source.plugin, 'dsh-memory-layer', '0.1 线要求非空 plugin 字段')
+    }
+  } finally {
+    await dispose()
+  }
+})
+
+test('memory_stats 自报会话格式线与实际发出的消息来源形状', async () => {
+  // 「选错了形状」是个静默故障（注入被格式校验拒绝、上下文里没有痕迹），所以必须自报。
+  assert.equal(sessionFormatMinor('0.1.5-rc.2'), 1)
+  assert.equal(sessionFormatMinor('0.2.0-rc.1'), 2)
+  assert.equal(sessionFormatMinor('1.4.0'), 99)
+  assert.equal(sessionFormatMinor(''), 1, '探测不到时按 0.1 线（旧写法在那条线上必然可用）')
+
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    void root
+    const report = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+    const line = report.split('\n').find(row => row.startsWith('Session format:'))
+    assert.ok(line !== undefined, `应有自报行：${report}`)
+    // 形状必须与探测到的线一致：0.2 起用 `plugin:<名>`，0.1 用 `plugin`。
+    const minor = /dsh-session 0\.(\d+)/u.exec(line)?.[1]
+    if (minor !== undefined && Number(minor) >= 2) assert.match(line, /kind 'plugin:dsh-memory-layer'/u)
+    else assert.match(line, /kind 'plugin'/u)
   } finally {
     await dispose()
   }

@@ -73,6 +73,8 @@ import {
   confidenceOf,
   gistOf,
   injectable,
+  mentionsNeedle,
+  referenceNeedles,
   resolveTechniqueId,
   techniqueIndexLine,
   techniqueInjectionLine,
@@ -234,6 +236,13 @@ export interface Config {
    * 去重（同一条只提一次）且有硬上限，成本有界。
    */
   techniqueAdvisory?: boolean
+  /**
+   * L2：检测到「模型引用了某条推给它的技巧」时，在工具回执后附一行回报提示。默认 `true`。
+   *
+   * 只在**真的被引用**时出现（稀有事件），因此不像常驻指引那样每轮付费。依据是实测：
+   * 显式回报为 0，而引用检测能在同一批会话里抓到 3/7 被碰过的卡 —— "用了但没回报"是真实断层。
+   */
+  referenceNudge?: boolean
   /**
    * 顾问是否也看**草稿**（未经验证的技巧）。默认 `true`。
    *
@@ -494,6 +503,16 @@ export const STANDING_RULE_NOTICE: readonly string[] = [
 /** 落盘前判「库内复述」的包含度门槛（真库实测：真新知识 ≤0.412，近重复 ≥0.53）。 */
 const LIBRARY_RESTATEMENT_RATIO = 0.6
 
+/**
+ * 判断「库里的最佳答案是不是草稿」时向后多扫几条。
+ *
+ * 用分数比较而不是命中条数，是因为实测 BM25 会把 `limit` 填满：三种真实查询在默认参数下
+ * 都返回 5 条已验证命中，「命中不足 N 条」这个条件永远不成立。改成同一份排名内
+ * `最佳草稿分 > 最佳已验证分` 后，三条查询分别以 14.7>13.6、8.9>6.5、22.0>8.8 触发，
+ * 且正好把三条对题的草稿卡送到第一屏。`limit` 被调用方调小时仍要能看见隐藏草稿，故取 5。
+ */
+const DRAFT_SCAN_LIMIT = 5
+
 /** 落盘前判「复述本会话刚读过的条目」的包含度门槛；比库内复述更该拦，所以更低。 */
 const SESSION_RESTATEMENT_RATIO = 0.5
 
@@ -585,6 +604,12 @@ export const Config: z<Config> = z.object({
   injectStandingRules: z.natural().min(0).max(20).default(4),
   injectStopwords: z.array(z.string()).default([]),
   techniqueAdvisory: z.boolean().default(true),
+  /**
+   * L2：检测到「模型引用了某条被推给它的技巧」时，在工具回执后附一行回报提示。
+   *
+   * 只在**真的被引用**时出现（稀有事件），因此不像常驻指引那样每轮付费。
+   */
+  referenceNudge: z.boolean().default(true),
   techniqueAdvisoryDrafts: z.boolean().default(true),
   techniqueAdvisoryMax: z.natural().min(0).max(100).default(12),
   // 未检索会话的首触顾问：会话还没查过库时，把与本轮最相关的一条技巧（含要点）推到动作点。
@@ -697,6 +722,7 @@ interface Settings {
   guidancePromptOrder: number
   guidance: boolean
   techniqueAdvisory: boolean
+  referenceNudge: boolean
   techniqueAdvisoryDrafts: boolean
   techniqueAdvisoryMax: number
   firstContactAdvisory: boolean
@@ -1704,6 +1730,17 @@ export function apply(ctx: Context, config: Config): void {
 
   /** 本会话**读过**（search/get/memory_search 命中）的技巧 id：用于拦「复述刚读到的条目」。 */
   const retrievedBySession = new Map<string, Set<string>>()
+  /**
+   * L1 引用检测的会话状态：**推给过**本会话的技巧（注入 / 召回段 / 顾问），以及其中**已被引用**的。
+   *
+   * 为什么需要它：`technique_apply`（显式回报）是唯一的"被采用"信号，实测是 0 —— 于是
+   * 「模型到底有没有用上推给它的知识」完全不可测，任何改进都无法验收。这里用**插件自己能看到
+   * 的证据**补一个信号：卡片的符号/调用名出现在了模型随后的工具调用参数里。
+   */
+  const surfacedBySession = new Map<string, Set<string>>()
+  const referencedBySession = new Map<string, Set<string>>()
+  /** 引用针缓存：符号面在运行期不变，按卡算一次。 */
+  const needlesById = new Map<string, string[]>()
 
   /** 落盘前被判为复述而丢弃的候选（进程内计数，供 `memory_stats` 观测过滤是否在干活）。 */
   const restatementDrops: string[] = []
@@ -1746,16 +1783,34 @@ export function apply(ctx: Context, config: Config): void {
       // 如实标注未验证，正文仍要模型显式 `technique_get` —— 这是「不自动注入未验证知识」
       // 的边界内能给的最大帮助。
       .filter(doc => doc.layer !== 'technique' || settings.techniqueAdvisoryDrafts || doc.meta?.status !== 'draft')
-    const hits = advisoryMatches(corpus, terms, { limit: 2, seen })
+    // L4：改文件的动作点**优先**推"符号逐字出现在这次编辑里"的那条。
+    //
+    // 为什么是"优先"而不是"只认"：实测 **52% 的注入卡没有可匹配的符号面**（散文型 subject、
+    // 没有 api），硬过滤等于在编辑点让一半库彻底失声 —— 而 0.2.8 的输入侧去伪（P0）之后，
+    // 动作点的泛化证据词噪声已经从"18 行里 11 行"降到最近窗口的 0 行（2 条动作点顾问全部对题）。
+    // 所以这里只做**排序偏好**：有精确命中就用精确的，没有才回退到证据词规则。
+    const precise = ADVISORY_PRECISE_TOOLS.has(exec.name)
+      ? corpus.filter(doc => doc.layer !== 'technique' || needleInArgs(doc.id, raw))
+      : []
+    const hits = precise.length === 0
+      ? advisoryMatches(corpus, terms, { limit: 1, seen })
+      : advisoryMatches(precise, terms, { limit: 1, seen })
     if (hits.length === 0) return undefined
     for (const hit of hits) seen.add(hit.id)
     advisorySeen.set(sessionId, seen)
+    noteSurfaced(hits.map(hit => hit.id))
     if (liveTurn !== undefined) advisoryLastTurn.set(sessionId, liveTurn)
     logger.debug(`memory: advisory on ${exec.name} → ${hits.map(hit => hit.id.slice(0, 11)).join(', ')}`)
-    return advisoryText(hits.map(hit =>
-      `· ${hit.label} [${hit.id.slice(0, 11)}]${hit.draft ? ' (draft, unverified)' : ''} matched `
-      + `${hit.strong.join(', ')} — technique_get to read it.`,
-    ))
+    return advisoryText(hits.map(hit => {
+      // 0.2.8：把要点**直接带进上下文**，不再要模型为看一眼而多调一次 `technique_get` ——
+      // 实测 18 条顾问都写了「technique_get to read it」，其中 0 条被执行，差别就在这一步的成本。
+      const record = techniqueById.get(hit.id)
+      const gist = (record === undefined ? '' : gistOf(record)).trim()
+      return `· ${hit.label} [${hit.id.slice(0, 11)}]${hit.draft ? ' (draft, unverified)' : ''} matched `
+        + `${hit.strong.join(', ')}`
+        + (gist.length === 0 ? '' : ` — ${gist.slice(0, 200)}`)
+        + ' — technique_get for the full steps.'
+    }))
   }
 
   /**
@@ -1796,6 +1851,7 @@ export function apply(ctx: Context, config: Config): void {
     const label = top.label.slice(0, 120)
     seen.add(top.id)
     advisorySeen.set(sessionId, seen)
+    noteSurfaced([top.id])
     if (liveTurn !== undefined) advisoryLastTurn.set(sessionId, liveTurn)
     logger.debug(`memory: first-contact advisory → ${top.id.slice(0, 11)}`)
     return advisoryText([
@@ -1903,6 +1959,8 @@ export function apply(ctx: Context, config: Config): void {
       }
       kept.push(hit)
     }
+    // L1：这一块推给本会话的技巧记下来，供引用检测用。
+    noteSurfaced(kept.filter(hit => hit.layer === 'technique').map(hit => hit.id))
     const lines = kept.map((hit, index) => {
       const kind = recallLabel(hit.layer, hit.meta?.kind)
       // 逐条整形（去掉与正文重复的标题 + 封顶）：整块预算再砍尾巴时，至少不会出现半截条目。
@@ -1976,6 +2034,7 @@ export function apply(ctx: Context, config: Config): void {
     if (!settings.techniques) return ''
     const hits = injectedTechniqueHits(query)
     if (hits.length === 0) return ''
+    noteSurfaced(hits.map(hit => hit.id))
     const lines = hits.map((hit, index) => {
       const record = techniqueById.get(hit.id)
       const body = record === undefined ? hit.text : techniqueInjectionLine(record)
@@ -2480,6 +2539,108 @@ export function apply(ctx: Context, config: Config): void {
    *
    * @param ids - 本次返回给模型的技巧 id。
    */
+  /**
+   * L1：记下「这些技巧被推给过本会话」。
+   *
+   * 引用检测只在**推过**的卡里找 —— 「模型用了某条没给它的知识」不算这条知识的功劳。
+   */
+  const noteSurfaced = (ids: readonly string[]): void => {
+    const sessionId = current?.sessionId
+    if (sessionId === undefined || ids.length === 0) return
+    const seen = surfacedBySession.get(sessionId) ?? new Set<string>()
+    for (const id of ids) seen.add(id)
+    surfacedBySession.set(sessionId, seen)
+  }
+
+  /**
+   * 这条卡的引用针是否**逐字**出现在本次调用的参数里（L1 与 L4 共用）。
+   *
+   * @param id - 技巧 id。
+   * @param raw - 工具参数的原始文本。
+   * @returns 命中时为 `true`。
+   */
+  const needleInArgs = (id: string, raw: string): boolean => {
+    const record = techniqueById.get(id)
+    if (record === undefined) return false
+    let needles = needlesById.get(id)
+    if (needles === undefined) {
+      needles = referenceNeedles(record)
+      needlesById.set(id, needles)
+    }
+    return needles.some(needle => mentionsNeedle(raw, needle))
+  }
+
+  /**
+   * L1：把「模型在工具调用参数里引用了这条卡」记到记录上。
+   *
+   * 落盘方式与 {@link noteTechniqueRetrieval} 完全一致（读-改-写 + 内存索引同步），
+   * 但**不碰置信度**：`confidenceOf()` 仍然只认显式回报的成功/失败 —— 「被提及」不是「被验证」。
+   *
+   * @param ids - 本批被引用的技巧 id。
+   */
+  const noteTechniqueReference = async (ids: readonly string[]): Promise<void> => {
+    const now = Date.now()
+    const patched: TechniqueRecord[] = []
+    for (const id of new Set(ids)) {
+      const record = techniqueById.get(id)
+      if (record === undefined) continue
+      patched.push({ ...record, referenced: (record.referenced ?? 0) + 1, lastReferencedAt: now })
+    }
+    if (patched.length === 0) return
+    try {
+      const cwd = patched.some(record => record.scope === 'project') ? projectCwd() : undefined
+      await store.updateTechniques(patched, cwd)
+      for (const record of patched) techniqueById.set(record.id, record)
+    } catch (error) {
+      logger.debug(`memory: reference not recorded (${describe(error)})`)
+    }
+  }
+
+  /**
+   * L1：从一次工具调用里检测引用。
+   *
+   * 只看**模型写下的参数**（不看工具结果），且只在本会话**被推过**、**还没记过**的卡里比 ——
+   * 每次调用最多比几张卡，成本可忽略。同一条卡每个会话只记一次：否则一个符号出现在每一处编辑里
+   * 会把计数灌成噪声。
+   *
+   * 落盘是 **await 的**（不是 `track` 的 fire-and-forget）：引用是稀有事件（每条卡每会话至多一次），
+   * 而丢了它等于这个信号不存在 —— 观测功能不值得为一次写盘延迟做取舍。
+   *
+   * @param exec - 工具调用（名字 + 原始参数）。
+   */
+  const detectReferences = async (
+    exec: { name: string; arguments: unknown },
+  ): Promise<{ id: string; needle: string }[]> => {
+    const sessionId = current?.sessionId
+    if (!settings.techniques || sessionId === undefined) return []
+    const surfaced = surfacedBySession.get(sessionId)
+    if (surfaced === undefined || surfaced.size === 0) return []
+    const done = referencedBySession.get(sessionId) ?? new Set<string>()
+    const raw = typeof exec.arguments === 'string' ? exec.arguments : JSON.stringify(exec.arguments ?? {})
+    const hitIds: string[] = []
+    const matched: { id: string; needle: string }[] = []
+    for (const id of surfaced) {
+      if (done.has(id)) continue
+      const record = techniqueById.get(id)
+      if (record === undefined) continue
+      let needles = needlesById.get(id)
+      if (needles === undefined) {
+        needles = referenceNeedles(record)
+        needlesById.set(id, needles)
+      }
+      const needle = needles.find(item => mentionsNeedle(raw, item))
+      if (needle === undefined) continue
+      hitIds.push(id)
+      matched.push({ id, needle })
+    }
+    if (hitIds.length === 0) return []
+    for (const id of hitIds) done.add(id)
+    referencedBySession.set(sessionId, done)
+    logger.debug(`memory: technique referenced → ${hitIds.map(id => id.slice(0, 11)).join(', ')}`)
+    await noteTechniqueReference(hitIds)
+    return matched
+  }
+
   const noteTechniqueRetrieval = async (ids: readonly string[]): Promise<void> => {
     // 「查过库」不等于「搜过库」：`technique_get`（按 id 直接读）与 `memory_search` 命中的技巧
     // 同样是主动咨询。实测子智能体会话只 get 不 search，提醒于是重复了 5–12 次/轮 —— 每轮
@@ -2696,6 +2857,16 @@ export function apply(ctx: Context, config: Config): void {
           return `Technique adoption: ${adopted}/${total} adopted (${rate}%), ${retrieved} retrieved at least once, `
             + `${coldDrafts} draft(s) never retrieved`
         })(),
+        // L1：引用检测。这是**除显式回报之外**唯一能看出「推给模型的技巧有没有被用上」的数。
+        // 它与上面那行要挨着看：采纳 0 + 引用不为 0 = 用了但没回报；两个都是 0 = 连碰都没碰。
+        // 注意它**不进置信度**（`confidenceOf` 只认显式回报），所以两行不同源是刻意的。
+        (() => {
+          const total = techniques.length
+          const referenced = techniques.filter(record => (record.referenced ?? 0) > 0).length
+          const events = techniques.reduce((sum, record) => sum + (record.referenced ?? 0), 0)
+          const rate = total === 0 ? '0' : (100 * referenced / total).toFixed(1)
+          return `Technique references: ${referenced}/${total} referenced at least once (${rate}%), ${events} event(s)`
+        })(),
         // 门槛拦下多少条是**看不见的**（不注入就没有痕迹），因此单独报一行：排查
         // 「不相关技巧仍被注入」时，先看这里是不是 0 —— 0 说明门槛根本没在干活。
         `Injection gate: ${gateTally.dropped} dropped / ${gateTally.kept} kept since start `
@@ -2839,23 +3010,38 @@ export function apply(ctx: Context, config: Config): void {
         symbols: symbolsInText(query),
         extra: extras,
       }
-      const hits = recallFacets(query, docs, {
+      // 0.2.8：默认只看已验证时，若**库里的最佳答案其实是草稿**，就在同一次响应里把它带回来。
+      //
+      // 判据是同一份排名内的分数比较，不是命中条数 —— 实测 BM25 总会把 limit 填满（三种真实
+      // 查询都返回 5 条已验证），所以「已验证命中不足」这个条件永远不成立。而「草稿分更高」在
+      // 那三条查询上分别以 14.7>13.6、8.9>6.5、22.0>8.8 成立，并且正好把三条对题的草稿卡
+      // （会话级状态、`ctx.tools.restrict` opt-in、token 计量）送到第一屏；默认参数下第一屏
+      // 是 `tq_05bee0d2`/`tq_a1626970`/`tq_5e2c895d`，与提问无关。
+      //
+      // 为什么必须当场给：旧行为是「报个数量，让模型再调一次 includeDrafts: true」——那个
+      // 第二步决策与顾问的 `technique_get` 同类，实测 18 次提示 0 次执行，于是草稿永远等不到采用。
+      const scanLimit = Math.max(limit, DRAFT_SCAN_LIMIT)
+      const draftInclusive = recallFacets(query, docs, {
         ...recallOptions,
-        includeDrafts,
-        scorer: indexScorer(includeDrafts),
+        limit: scanLimit,
+        includeDrafts: true,
+        scorer: indexScorer(true),
       })
-      // U1a：默认过滤掉草稿时**承认它们存在**。此前是静默吞掉 —— 模型既看不到草稿，
-      // 也就不知道「该加 includeDrafts」，草稿于是永远等不到采用（冷启动死循环的第一环）。
-      // 这里只给**数量与开关**，不给正文，仍然守住「未验证知识不自动进上下文」的原则。
-      const hiddenDrafts = includeDrafts
+      const verifiedOnly = includeDrafts
         ? []
-        : recallFacets(query, docs, { ...recallOptions, limit: 5, includeDrafts: true, scorer: indexScorer(true) })
-          .filter(hit => techniqueById.get(hit.id)?.status === 'draft')
+        : recallFacets(query, docs, { ...recallOptions, includeDrafts: false, scorer: indexScorer(false) })
+      const isDraftHit = (hit: { id: string }): boolean => techniqueById.get(hit.id)?.status === 'draft'
+      const bestDraft = draftInclusive.find(isDraftHit)
+      const bestVerified = draftInclusive.find(hit => !isDraftHit(hit))
+      const fallbackToDrafts = !includeDrafts
+        && bestDraft !== undefined
+        && (bestVerified === undefined || bestDraft.score > bestVerified.score)
+      const hits = (includeDrafts || fallbackToDrafts ? draftInclusive : verifiedOnly).slice(0, limit)
+      const draftHits = hits.filter(isDraftHit)
+      // 只有「没有回退」时才需要报告被隐藏的草稿数量（回退时它们已经在结果里了）。
+      const hiddenDrafts = includeDrafts || fallbackToDrafts ? [] : draftInclusive.filter(isDraftHit)
       if (hits.length === 0) {
-        return hiddenDrafts.length === 0
-          ? `No technique matched "${query}" for the current stack.`
-          : `No verified technique matched "${query}" for the current stack, but ${hiddenDrafts.length} draft(s) do — `
-            + 'call again with includeDrafts: true to read them (drafts are unverified: check before relying on them).'
+        return `No technique matched "${query}" for the current stack.`
       }
       await noteTechniqueRetrieval(hits.map(hit => hit.id))
       // 把 facet 写进表头：一次调用覆盖了哪几个主题是**可核对**的，而不是黑箱。
@@ -2875,8 +3061,18 @@ export function apply(ctx: Context, config: Config): void {
       const draftNote = hiddenDrafts.length === 0
         ? ''
         : ` (+${hiddenDrafts.length} draft(s) hidden — includeDrafts: true)`
+      // 回退必须**说明白**：模型要知道这几条是未验证的草稿，才不会把猜测当结论用。
+      const fallbackNote = fallbackToDrafts && draftHits.length > 0
+        ? ` (best match is an unverified draft — ${draftHits.length} draft(s) included and marked [draft]; check before relying on them)`
+        : ''
+      // 采纳标记要有解释，否则 `✓3` 只是一串符号。只在真出现时印，不占常量预算。
+      const hasAdoption = hits.some(hit => {
+        const record = techniqueById.get(hit.id)
+        return record !== undefined && (record.successes > 0 || record.failures > 0)
+      })
+      const adoptionNote = hasAdoption ? ' (✓N = N confirmed adoptions, ✗N = reported failures)' : ''
       const lines = [
-        `${hits.length} technique(s) for "${query}"${includeDrafts ? ' (including drafts)' : ''}${facetNote}${draftNote}:`,
+        `${hits.length} technique(s) for "${query}"${includeDrafts ? ' (including drafts)' : ''}${fallbackNote}${facetNote}${draftNote}${adoptionNote}:`,
         ...detailed.map((hit, index) => render(hit, index, true)),
       ]
       if (tail.length > 0) {
@@ -3325,6 +3521,29 @@ export function apply(ctx: Context, config: Config): void {
         logger.warn('memory: tools.guard is absent; hard blocking of repeated failures is disabled')
       }
 
+      // L1：引用检测。**独立于顾问开关** —— 它是观测，不是提示：即使顾问关掉，
+      // 也要能回答「推给模型的技巧到底有没有出现在它随后的动作里」。
+      // 放在 post-execute（不是 pre-execute）是因为这里能确认这次调用真的发生了。
+      toolCtx.effect(() => toolCtx.on('tools/post-execute', async (exec, _result, next) => {
+        const decision = await next()
+        try {
+          const referenced = await detectReferences(exec)
+          // L2：刚被引用就顺手提示回报 —— 这是"用了但没回报"那个断层唯一的补救点。
+          if (!settings.referenceNudge || referenced.length === 0) return decision
+          return {
+            ...decision,
+            additionalContexts: [
+              ...(decision.additionalContexts ?? []),
+              advisoryMessage(referenceNudge(exec.name, referenced)),
+            ],
+          }
+        } catch (error) {
+          // 观测与提示都是增益功能，任何失败都不得影响工具调用本身。
+          logger.debug(`memory: reference detection skipped (${describe(error)})`)
+          return decision
+        }
+      }))
+
       // A：动作点顾问。走 `tools/post-execute` 的 `additionalContexts` —— **不阻断、不改写**
       // 工具结果（`content` 是替换语义，用它会覆盖工具回执），只给下一条请求附一段上下文。
       // 按会话去重 + 硬上限，因此成本有界；命中的是符号/领域这类强证据，不是模糊词。
@@ -3463,6 +3682,7 @@ function resolveSettings(config: Config): Settings {
     guidancePromptOrder: config.guidancePromptOrder ?? 265,
     guidance: config.guidance ?? true,
     techniqueAdvisory: config.techniqueAdvisory ?? true,
+    referenceNudge: config.referenceNudge ?? true,
     techniqueAdvisoryDrafts: config.techniqueAdvisoryDrafts ?? true,
     techniqueAdvisoryMax: config.techniqueAdvisoryMax ?? 12,
     firstContactAdvisory: config.firstContactAdvisory ?? true,
@@ -3720,10 +3940,15 @@ const PLUGIN_MESSAGE_SOURCE = messageSourceFor(SESSION_FORMAT_MINOR, name)
  */
 function camelWords(text: string): string[] {
   return text
+    // 先切「连续大写 + 首字母大写的词」：`GTEnchantment` → `GT Enchantment`。
+    // 缺这刀时整个标识符会粘成一个词元（`gtenchantment`），正文里的 `enchantment` 永远命不中，
+    // 于是只能靠路径里的目录名去命中 —— 这正是一条错误证据的来源（见 0.2.8 的输入侧清洗）。
+    .replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
     .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
     .split(/[^A-Za-z0-9\u4e00-\u9fa5]+/u)
     .map(word => word.toLowerCase())
-    .filter(word => word.length >= 4 || /[\u4e00-\u9fa5]/u.test(word))
+    // 纯数字不是知识证据：`2026` 这种路径里的年份曾把一条 PlantUML 技巧推给 TS 项目。
+    .filter(word => (word.length >= 4 || /[\u4e00-\u9fa5]/u.test(word)) && !/^\d+$/u.test(word))
 }
 
 /**
@@ -3749,12 +3974,54 @@ function proseTerms(text: string): string[] {
 /** 代码正文：整段代码/脚本，不能当顾问证据（否则文件里每个词都算相关）。 */
 const ADVISORY_BODY_KEYS: ReadonlySet<string> = new Set(['content', 'command', 'old_string', 'new_string', 'patch', 'text', 'body'])
 
-/** 散文键：只从中取命名实体（见 {@link proseTerms}）。 */
-const ADVISORY_PROSE_KEYS: ReadonlySet<string> = new Set(['description', 'reason', 'summary', 'query', 'goal', 'note'])
+/**
+ * 路径键：只取**文件名**（见 {@link advisoryTerms} 的 basename 分支），
+ * 因此不参与通用 walk —— 目录名不是知识证据。
+ *
+ * 实测（0.2.8）：`file_path: "docs/design/2026-09-29-…设计初稿.md"` 会被走两遍，
+ * 通用 walk 那遍把目录名 `design` 变成了证据，推出两条 PlantUML 技巧。
+ */
+const ADVISORY_PATH_KEYS: ReadonlySet<string> = new Set(['file_path', 'filePath', 'path', 'notebook_path', 'target_file'])
 
 /**
- * 汇总一次工具调用的**顾问证据词**：文件名（去目录/扩展名、驼峰切词）+ 参数里的标识符，
- * 散文键只取命名实体，代码正文整段跳过。
+ * L4：**改文件**的工具把动作点顾问收紧到「符号逐字命中」。
+ *
+ * 依据是实测：动作点顾问原先按"证据词交集"选卡，命中的常是 `design` / `progress` 这类泛化词，
+ * 推来的卡与模型正在写的东西无关（窗口内 18 行里 11 行如此）。而 `edit` / `write` 的参数里
+ * **带着它真正要写的标识符** —— 用它当判据既精确又几乎免费。其它工具保持原有规则：读文件、
+ * 跑命令的参数并不包含"它正在实现什么"，逐字匹配在那里只会把顾问关掉。
+ */
+const ADVISORY_PRECISE_TOOLS: ReadonlySet<string> = new Set([
+  'edit', 'write', 'multi_edit', 'apply_patch', 'str_replace_editor', 'notebook_edit',
+])
+
+/**
+ * L2：引用之后的**回报提示**文案。
+ *
+ * 与顾问同一条通道（`additionalContexts`），但用途不同：顾问是"你可能需要这条知识"，
+ * 这条是"你刚用了一条知识，顺手记一下"。依据是实测 —— 显式回报为 0，而引用检测能在同一批
+ * 会话里抓到 3/7 被碰过的卡，说明"用了但没回报"是真实存在的断层，缺的正是这一步提醒。
+ *
+ * @param tool - 触发引用的工具名。
+ * @param hits - 本次新检测到的引用（id 与命中的针）。
+ * @returns 一行提示文本。
+ */
+export function referenceNudge(tool: string, hits: readonly { id: string; needle: string }[]): string {
+  const list = hits.map(hit => `${hit.id.slice(0, 11)}（${hit.needle}）`).join('、')
+  return `· 你刚用到了 ${list} —— 它的符号出现在这次 ${tool} 里。`
+    + "若确实奏效，用 technique_apply(id, 'success', '<一句话验收：带数字或路径>') 记一下："
+    + '不回报的采用不计入，这条卡也就不会因为「真有用」而在以后排得更前。'
+}
+
+/**
+ * 汇总一次工具调用的**顾问证据词**。
+ *
+ * 规则（0.2.8 起收紧，动机见 {@link ADVISORY_PATH_KEYS}）：
+ *   1. **文件名**走 `camelWords`（含驼峰与连续大写的切分），只取 basename；
+ *   2. **路径键**不再参与通用 walk —— 目录名（`design`）不是「你正在动的东西」；
+ *   3. 其余字符串值一律按**命名实体**取词（`proseTerms`）：枚举/状态值（`status: "in_progress"`
+ *      里的 `in`/`progress`）与散文里的小写英文词都太泛化，不构成证据；
+ *   4. 代码正文（`command`/`old_string`/`content`…）整段跳过。
  *
  * @param raw - 工具参数的原始 JSON。
  * @returns 小写证据词列表。
@@ -3771,9 +4038,8 @@ function advisoryTerms(raw: string): string[] {
   }
   const walk = (value: unknown, key: string | undefined): void => {
     if (typeof value === 'string') {
-      if (key === undefined || ADVISORY_BODY_KEYS.has(key)) return
-      const words = ADVISORY_PROSE_KEYS.has(key) ? proseTerms(value) : camelWords(value)
-      for (const word of words) terms.add(word)
+      if (key === undefined || ADVISORY_BODY_KEYS.has(key) || ADVISORY_PATH_KEYS.has(key)) return
+      for (const word of proseTerms(value)) terms.add(word)
       return
     }
     if (Array.isArray(value)) {

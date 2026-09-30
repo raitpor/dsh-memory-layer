@@ -22,11 +22,14 @@ import {
   ID_PREFIX_CHARS,
   MAX_VERIFICATION_CHARS,
   MAX_VERIFICATIONS,
+  adoptionMark,
   applyOutcome,
   clampVerificationEvidence,
   checkVerificationEvidence,
   confidenceOf,
   gistOf,
+  mentionsNeedle,
+  referenceNeedles,
   injectable,
   promotedStatus,
   resolveTechniqueId,
@@ -526,4 +529,80 @@ test('subject 进符号索引：代码单元名与调用名一样能当精确键
   assert.equal(symbols[0], 'DiscountCalculator', 'subject 排在最前')
   assert.ok(symbols.includes('DiscountCalculator.resolve'), '调用面仍在')
   assert.deepEqual(symbolIndex([card]).get('DiscountCalculator'), [card.id], '按 subject 能查到 id')
+})
+
+test('L5 采纳标记：检索/注入行带上「这条被证实用过几次」', () => {
+  const adopted = record({ status: 'validated', successes: 3, applied: 3 })
+  assert.match(techniqueSearchLine(adopted, 1), /\[validated\] ✓3/u)
+  assert.match(techniqueTailLine(adopted, 1), /\[validated\] ✓3/u)
+  assert.match(techniqueInjectionLine(adopted), /\[validated\] ✓3/u)
+  assert.match(techniqueIndexLine(adopted), /\[validated\] ✓3/u)
+
+  // 被证伪过的卡也要给反向信号：只看状态的话 `draft` 与「被用过且失败」长得一样。
+  const failed = record({ status: 'draft', successes: 0, failures: 2, applied: 2 })
+  assert.match(techniqueSearchLine(failed, 1), /\[draft\] ✗2/u)
+
+  // 没有采纳记录时**一个字符都不加**：标记不能变成常量噪声。
+  assert.equal(adoptionMark(record({ status: 'validated' })), '')
+  assert.match(techniqueSearchLine(record({ status: 'validated' }), 1), /^1\. \[validated\] name — /u)
+})
+
+test('gist 不再把版本号里的小数点当句读', () => {
+  // 实测：`0.2.4 里 technique_get 接受前缀…` 的 gist 曾退化成 "0."，顾问内联后直接让人看到。
+  assert.equal(gistOf(record({ summary: '0.2.4 里只接受完整 id。第二句。' })), '0.2.4 里只接受完整 id。')
+  // 普通句号仍然要断句。
+  assert.equal(gistOf(record({ summary: 'First sentence. Second one.' })), 'First sentence.')
+})
+
+test('L1 引用针：只留可匹配的实体名，挡住占位符与泛化词', () => {
+  const rich = record({
+    subject: 'ItemStack.getOrDefault',
+    api: [
+      { symbol: 'tools.register' },
+      { symbol: '<Class1>.setPropertyOverride' },
+      { symbol: 'apply' },
+      { symbol: 'Machine GUI screen class' },
+    ],
+  })
+  const needles = referenceNeedles(rich)
+  assert.ok(needles.includes('ItemStack.getOrDefault'), `多段符号要保留：${needles}`)
+  // 代码里通常写 `stack.getOrDefault(...)`：只按完整多段符号匹配会成片漏计。
+  assert.ok(needles.includes('getOrDefault'), `末段也要当针：${needles}`)
+  // 占位符是去标识化的产物；剥掉它剩下的实体名才是可匹配的。
+  assert.ok(needles.includes('setPropertyOverride'), `占位符要剥掉：${needles}`)
+  // `register` 是泛化小写词，放进针里会把「编辑了任何 register*」都算成引用。
+  assert.ok(!needles.includes('register'), `泛化单段词不得当针：${needles}`)
+  assert.ok(!needles.includes('apply'), `过短的泛化词不得当针：${needles}`)
+  assert.equal(referenceNeedles(record({ subject: 'Machine GUI screen class' })).length, 0, '散文符号面没有可匹配的针')
+
+  // 边界：单段针不得命中同前缀的更长的标识符，多段针按子串匹配。
+  assert.equal(mentionsNeedle('{"file_path":"src/registerAll.ts"}', 'register'), false)
+  assert.equal(mentionsNeedle('{"old_string":"stack.getOrDefault(C, D)"}', 'getOrDefault'), true)
+  assert.equal(mentionsNeedle('{"command":"grep tools.register src"}', 'tools.register'), true)
+  assert.equal(mentionsNeedle('', 'getOrDefault'), false)
+})
+
+test('L5 引用加成：被引用过的卡排更前，但**不动置信度**，且加成有上限', () => {
+  const mk = (id: string, referenced: number) => record({
+    id,
+    status: 'validated',
+    successes: 1,
+    summary: 'zqblatWire 的用法。',
+    referenced,
+  })
+  const docs = toTechniqueDocs([mk('tq_zero', 0), mk('tq_five', 5), mk('tq_huge', 100)])
+  const hits = recallTechniques('zqblatWire 的用法', docs, { limit: 3, stack: { languages: ['java'] } })
+  const scoreOf = (id: string) => hits.find(hit => hit.id === id)?.score ?? 0
+
+  // 被引用过的排在未引用之前（five 与 huge 触顶后同分，稳定排序决定二者次序，不断言谁先）。
+  assert.equal(hits.at(-1)?.id, 'tq_zero', `未引用的应排最后：${JSON.stringify(hits.map(h => h.id))}`)
+  assert.deepEqual(hits.slice(0, 2).map(hit => hit.id).sort(), ['tq_five', 'tq_huge'], '被引用的应在前两位')
+  // 加成上限 +10%：再多引用也不会无限加权（否则排序会被字符串巧合主导）。
+  assert.ok(scoreOf('tq_five') > scoreOf('tq_zero'), '引用为正应高过引用为 0')
+  assert.ok(
+    Math.abs(scoreOf('tq_huge') - scoreOf('tq_five')) < 1e-9,
+    `超过上限后不应再涨：huge=${scoreOf('tq_huge')} five=${scoreOf('tq_five')}`,
+  )
+  // 关键不变量：引用**不进置信度** —— 「被提及」不是「被验证」。
+  assert.equal(confidenceOf(mk('tq_huge', 100)), confidenceOf(mk('tq_zero', 0)), '引用不得改动置信度')
 })

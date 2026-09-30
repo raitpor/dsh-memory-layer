@@ -157,8 +157,28 @@ export function gistOf(record: Pick<TechniqueRecord, 'summary'> & Pick<Technique
  */
 function firstSentence(summary: string): string {
   const flat = summary.replace(/\s+/gu, ' ').trim()
-  const match = /^.*?[。．.!！?？;；]/u.exec(flat)
+  // `.` 可能是版本号/小数的一部分（`0.2.4 里 …` 曾把 gist 切成 "0."），只有后面不接数字时才当句读。
+  const match = /^.*?(?:[。！？；]|\.(?!\d))/u.exec(flat)
   return (match?.[0] ?? flat).trim()
+}
+
+/**
+ * 采纳标记：把「这条知识被真的用过吗」带进检索/注入行。
+ *
+ * 为什么必须有：状态只分 draft / validated / canonical，而 `validated` 只要求 1 次成功采纳 ——
+ * 44 条 validated 里有多少真被反复证实过，行里看不出来。采纳计数正是**被证实好用**的信号，
+ * 也是「回报」这件事唯一的可见产出：回报 → 下次它带着 `✓3` 出现在结果里。
+ *
+ * 取「成功次数优先、失败次数兜底」，不显示 `applied`（它等于 successes + failures，没有增量信息）；
+ * 无任何采纳记录时返回空串，保持行短。
+ *
+ * @param record - 技巧记录。
+ * @returns 形如 ` ✓3` / ` ✗1` 的前缀片段（带前导空格，无记录时为空）。
+ */
+export function adoptionMark(record: Pick<TechniqueRecord, 'successes' | 'failures'>): string {
+  if (record.successes > 0) return ` ✓${record.successes}`
+  if (record.failures > 0) return ` ✗${record.failures}`
+  return ''
 }
 
 /**
@@ -280,6 +300,64 @@ export function techniqueSymbols(record: TechniqueRecord): string[] {
 }
 
 /**
+ * 引用检测用的最小长度：`apply` / `inject` 这类短标识符在参数里到处都是，
+ * 拿它们当"用了这条知识"的证据只会把计数变成噪声。
+ */
+const REFERENCE_NEEDLE_MIN_CHARS = 6
+
+/**
+ * 从一条技巧的符号面（`subject` + 调用名）提取**可匹配的引用针**（L1 引用检测）。
+ *
+ * 判据是"这个字符串出现在模型的工具调用参数里，就算它被用上了"，因此必须挡住两类伪符号：
+ *   1. **占位符**：`<Class1>.setPropertyOverride` 里的 `<Class1>` 是去标识化的产物，
+ *      去掉后剩下的 `setPropertyOverride` 才是可匹配的实体名；
+ *   2. **泛化词**：`apply` / `inject` / `requires` 这类小写单词，或 `Machine GUI screen class`
+ *      这种散文 subject —— 只保留**含 `.`/`/`/`#`/`-` 的多段符号**，或**含大写/下划线且 ≥6 字符**的标识符。
+ *
+ * @param record - 技巧记录。
+ * @returns 去重后的引用针（可能为空 —— 这条卡没有可匹配的符号面）。
+ */
+export function referenceNeedles(record: TechniqueRecord): string[] {
+  const out = new Set<string>()
+  for (const raw of techniqueSymbols(record)) {
+    const text = raw.replace(/<[^<>]*>/gu, ' ').trim()
+    if (text.length === 0 || /[\u4e00-\u9fa5\s]/u.test(text)) continue
+    for (const part of text.split(/[^A-Za-z0-9_.$#/-]+/u)) {
+      const needle = part.replace(/^[^A-Za-z]+/u, '').replace(/[^A-Za-z0-9_$]+$/u, '')
+      if (needle.length < REFERENCE_NEEDLE_MIN_CHARS) continue
+      // 多段符号（`tools.register`）自带命名空间，够具体；单段符号必须带大写或下划线。
+      if (!/[./#-]/u.test(needle) && !/[A-Z_$]/u.test(needle)) continue
+      out.add(needle)
+      // 末段也当针：代码里通常写 `stack.getOrDefault(...)` 而不是 `ItemStack.getOrDefault(...)`，
+      // 只按完整多段符号匹配会成片漏计。末段仍要自己够具体（带大写/下划线），所以
+      // `tools.register` 不会因此放出泛化的 `register`。
+      const tail = needle.split(/[./#]/u).at(-1) ?? ''
+      if (tail !== needle && tail.length >= REFERENCE_NEEDLE_MIN_CHARS && /[A-Z_$]/u.test(tail)) {
+        out.add(tail)
+      }
+    }
+  }
+  return [...out]
+}
+
+/**
+ * 判断一段工具调用参数里是否**提到**了某个引用针。
+ *
+ * 单段标识符要求两侧不是标识符字符（避免 `register` 命中 `registerAll`）；
+ * 多段符号直接用子串匹配（`ctx.tools.register` 里出现 `tools.register` 也算数）。
+ *
+ * @param raw - 工具参数的原始文本（通常是 JSON 字符串）。
+ * @param needle - {@link referenceNeedles} 产出的引用针。
+ * @returns 提到时为 `true`。
+ */
+export function mentionsNeedle(raw: string, needle: string): boolean {
+  if (raw.length === 0 || needle.length === 0) return false
+  if (/[./#-]/u.test(needle)) return raw.includes(needle)
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  return new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, 'u').test(raw)
+}
+
+/**
  * 建立「调用名 → 技巧 id」索引，供召回时精确命中。
  * @param records - 技巧记录。
  * @returns 符号索引。
@@ -307,13 +385,14 @@ export function symbolIndex(records: readonly TechniqueRecord[]): Map<string, st
  */
 export function techniqueIndexLine(record: TechniqueRecord): string {
   const stack = stackSummary(record.stack)
+  const badge = `${record.status === 'draft' ? '' : `[${record.status}]`}${adoptionMark(record)}`.trim()
   const parts = [
     record.name,
     stack.length === 0 ? '' : `适用: ${stack}`,
     `何时用: ${record.when}`,
     `id ${record.id}`,
   ]
-  if (record.status !== 'draft') parts.splice(1, 0, `[${record.status}]`)
+  if (badge.length > 0) parts.splice(1, 0, badge)
   if (record.conflictsWith !== undefined && record.conflictsWith.length > 0) {
     parts.push(`同一触发下另有做法: ${record.conflictsWith.join(', ')}`)
   }
@@ -339,7 +418,8 @@ export function techniqueInjectionLine(record: TechniqueRecord): string {
     `何时用: ${record.when}`,
     `id ${shortTechniqueId(record.id)}`,
   ]
-  if (record.status !== 'draft') parts.splice(1, 0, `[${record.status}]`)
+  const badge = `${record.status === 'draft' ? '' : `[${record.status}]`}${adoptionMark(record)}`.trim()
+  if (badge.length > 0) parts.splice(1, 0, badge)
   if (record.conflictsWith !== undefined && record.conflictsWith.length > 0) {
     parts.push(`同一触发下另有做法: ${record.conflictsWith.join(', ')}`)
   }
@@ -412,7 +492,7 @@ export function shortTechniqueId(id: string): string {
  */
 export function techniqueSearchLine(record: TechniqueRecord, ordinal: number): string {
   return [
-    `${ordinal}. [${record.status}] ${clampText(record.name, SEARCH_NAME_MAX_CHARS)}`,
+    `${ordinal}. [${record.status}]${adoptionMark(record)} ${clampText(record.name, SEARCH_NAME_MAX_CHARS)}`,
     gistOf(record),
     `id ${shortTechniqueId(record.id)}`,
   ].join(' — ')
@@ -428,7 +508,7 @@ export function techniqueSearchLine(record: TechniqueRecord, ordinal: number): s
  * @returns 单行文本。
  */
 export function techniqueTailLine(record: TechniqueRecord, ordinal: number): string {
-  return `${ordinal}. [${record.status}] ${clampText(record.name, TAIL_NAME_MAX_CHARS)} — id ${shortTechniqueId(record.id)}`
+  return `${ordinal}. [${record.status}]${adoptionMark(record)} ${clampText(record.name, TAIL_NAME_MAX_CHARS)} — id ${shortTechniqueId(record.id)}`
 }
 
 /** id 解析结果。 */

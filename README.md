@@ -102,6 +102,31 @@
 被召回（注入）的技巧是否「被采用」，只认**模型显式调用 `technique_apply`**（`id` + `outcome` +
 `evidence`）。注入块头部会写明这一点。**没有回报的一律按「未采用」处理** —— 既不计成功也不计失败。
 
+**「被引用」是另一个独立信号（L1，0.2.8）**：插件在 `tools/post-execute` 里看**模型自己写下的
+工具参数**，如果某条已推给本会话的技巧的符号/调用名（`subject`/api）出现在参数里，就记一次
+`referenced`（每条卡每会话至多一次）。它与 `applied` 的分工是刻意的：
+
+| 计数 | 来源 | 进不进置信度 | 回答什么问题 |
+|---|---|---|---|
+| `applied` / `successes` / `failures` | 模型**显式回报** | ✅ 进（`confidenceOf`） | 这条知识被**验证**过吗 |
+| `referenced` | 插件**自己观测**参数 | ❌ **不进** | 这条知识**被碰过**吗 |
+
+为什么必须有后者：实测一个 21 轮 / 868 次工具调用的真实开发会话里 `technique_apply` 是 **0**，
+于是"推给它的知识到底有没有被用上"完全不可测、任何改进都无法验收。真会话回放给出的基线是
+**12.5%**（16 条有可匹配符号面的注入卡里 2 条被引用）。
+
+**L5：引用参与排序，但只值一个小加成。** `recallTechniques` 在 `confidence` 之外乘一个
+`1 + min(referenced, 5) × 0.02`（**上限 +10%**）。刻意压得很小、且与 `confidence` 分开：
+显式回报才是「被验证」，引用只是「被提及」，不能盖过相关性本身（一条用例钉住「引用更多则排前」
+与「触顶不再涨」，另一条钉住 `confidenceOf` 完全不受引用影响）。「被提及」不是「被验证」，所以它只做
+可见性与研究指标，绝不参与排序。
+
+回报是**闭环的上半段**，0.2.8 把下半段也接上了：成功/失败计数会写进置信度（`(successes+1)/
+(successes+failures+2)`，直接参与排序），并作为 `✓N` / `✗N` 标记出现在**检索行与注入行**里
+（`✓N = N confirmed adoptions`）。为什么需要这个标记：状态阈值很松 —— `draft → validated`
+只要 **1** 次成功采纳，所以 `[validated]` 说明不了「被证实过几次」；`✓7` 与 `✓1` 的可信度差别
+只有这个计数能表达。回报因此有可见产出：回报 → 下次它带着更高的 `✓N` 排在前面。
+
 `evidence` 必须是**可证伪**的：说清按什么判据检查、看到什么结果，具体到别人能照着复核
 （如「重跑 `npm test`：240/240 通过，改动前是 238」）。只有结论词（`ok` / `已采用` / `通过`）
 会被拒绝，且**拒绝时不记账** —— 这是因为「用了就算成功」的成功信号会饱和：实测一次任务里
@@ -350,7 +375,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `recallLimit` | `5` | 单次召回条数上限（1–20） |
 | `injectMinMatched` / `injectMinScore` | `2` / `0` | 注入侧的**相关性门槛**：一条记忆/技巧要命中查询里几个不同的词（或达到多少 BM25 分）才允许进注入。不相关的轮次不再白付 token；`0` = 关闭对应判据 |
 | `injectStandingRules` | `4` | 每轮**强制注入**的常驻规则条数上限（`long-term preference` / `long-term constraint`）：这类记忆对任何任务都成立，因此不判相关性；`0` = 关闭 |
-| `techniqueAdvisory` / `techniqueAdvisoryDrafts` / `techniqueAdvisoryMax` / `firstContactAdvisory` | `true` / `true` / `12` / `true` | **动作点顾问**：模型对某文件/符号动手时，若库里有强证据命中的技巧且本会话还没推过，就在工具回执之后附一行 `· <技巧名> [id] — technique_get to read it.`（走 `tools/post-execute` 的 `additionalContexts`，不阻断、不改写工具结果）。默认连**草稿**一起看并标 `(draft, unverified)`：真实库里绝大多数知识是草稿，只看已验证等于在最需要它的场景不发声。同一条知识只推一次、**每轮最多一条**、每会话预算 `techniqueAdvisoryMax`（默认 12）。`firstContactAdvisory`（0.2.7）：**还没查过库**的会话，在动作点直接收到与本轮请求最相关的一条（**带要点**，不只是标题）—— 实测「你还没查过库」那句提醒出现 145 次、主动查询率仍只有 1%，而顾问通道的跟进率是 31%，差别在**出现的位置** | 证据只取**文件名与标识符**（驼峰切词）：目录名/扩展名（`src`/`java`）与代码正文、散文里的英文小写词都不算 —— 实测不剔除时误报很多 |
+| `techniqueAdvisory` / `techniqueAdvisoryDrafts` / `techniqueAdvisoryMax` / `firstContactAdvisory` / `referenceNudge` | `true` / `true` / `12` / `true` / `true` | **动作点顾问**：模型对某文件/符号动手时，若库里有证据命中的技巧且本会话还没推过，就在工具回执之后附一行 `· <技巧名> [id] matched <依据> — <要点> — technique_get for the full steps.`（走 `tools/post-execute` 的 `additionalContexts`，不阻断、不改写工具结果）。默认连**草稿**一起看并标 `(draft, unverified)`。同一条知识只推一次、**每轮最多一条**、每会话预算 `techniqueAdvisoryMax`（默认 12）。0.2.8 起**要点内联**（不再要模型为看一眼而多调一次 `technique_get`：实测 18 条顾问都写了 `technique_get`，其中 0 条被执行）。`firstContactAdvisory`（0.2.7）：**还没查过库**的会话，在动作点直接收到与本轮请求最相关的一条（带要点） | 证据只取**文件名（basename）与命名实体**（0.2.8）：路径键不再参与通用抽取，枚举/状态值（`status: "in_progress"`）与纯数字（年份）都不是证据 —— 实测这三类伪证据占了 18 条顾问里的 11 条。**L4**：`edit`/`write` 这类**改文件**的动作点**优先**推「符号逐字出现在这次编辑里」的那条（有精确命中就用精确的，否则回退证据词规则 —— 实测 52% 的卡没有可匹配的符号面，硬过滤会让一半库在编辑点失声）。**L2**（`referenceNudge`）：检测到模型引用了某条被推给它的技巧时附一行回报提示（只在真被引用时出现） |
 | `injectStopwords` | `[]` | 追加到内置**通用词表**的词：命中它们不算「相关」，不能单独触发注入。内置表覆盖对话套话（继续/开始/可以）、交付元话题（技巧/文档/输出/中文/库里）与通用工程词（配置/函数/文件/路径/代码/测试/config/file/test）。**加一个词 = 放弃靠它触发注入**，因此别加本领域词（如「模组」「插件」） |
 | `recallChars` | `4000` | **条目正文**的字符上限；块头（不可信声明）与 `BEGIN/END` 边界永不截断 —— 安全围栏不能被预算裁掉，因此上限小于块头开销时实际长度会略超上限 |
 | `registerTools` | `true` | 是否注册记忆工具 |
@@ -403,12 +428,12 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `memory_save` | 把一条长期事实/偏好写入语义层（立即去重合并）；用户**改口**时用 `supersedes: <旧事实 id>`：新事实照常写入，旧的那条**停止注入**但留在库里可追溯（检索时标 `superseded`） |
 | `memory_forget` | 按 id 删除，按前缀转交对应层：`sm_`/`ep_` 记在记忆层、`tq_` 转交技巧层、`fa_`（来自 `failure_list`）转交失败层 —— 误记的失败只能这样整条删掉，`failure_resolve` 只是标记「已解决」。**默认跨全部作用域**（id 全局唯一，而 `memory_save` 写的是语义层作用域）；`*` 清空某个作用域需显式 `confirm: true`，默认只清 `project`，且**只清情景/语义层** —— 技巧层与失败层要按 id 删 |
 | `memory_stats` | 查看各层条数、按层作用域与「经验复利」指标，并报**技巧采用率**（`Technique adoption: 已采用/总数、至少被检索过一次的条数、从未被检索过的草稿数` —— 冷启动问题必须能被看见）；存储不健康时额外给出 `Store integrity:` 行（整库不可读 / 跳过的坏行数） |
-| `technique_search` | 按当前技术栈检索技巧（默认只返回已验证条目；**命中草稿时会明说「有 N 条草稿被隐藏，加 `includeDrafts: true`」**，不再静默吞掉）。结果**分两档**：前 3 条给可执行要点（`gist`）+ 短 id，其余只给「还存在」的指针；`verbose: true` 退回完整索引行 |
+| `technique_search` | 按当前技术栈检索技巧。默认以已验证条目为主；**当同一份排名里草稿的分数高于所有已验证命中时，草稿在同一次响应里一并给出**并标 `[draft]`（0.2.8：实测三种真实查询在默认参数下第一屏全是无关卡，带草稿后正好是三条对题的卡；旧行为「报数量 + 让模型再调一次」几乎不会被走）。其余情况下仍会明说「有 N 条草稿被隐藏，加 `includeDrafts: true`」。结果**分两档**：前 3 条给可执行要点（`gist`）+ 短 id，其余只给「还存在」的指针；`verbose: true` 退回完整索引行。行里带**采纳标记**（`✓N` / `✗N`，有记录时才出现，并在表头给一次图例）|
 | `technique_get` | 按 id（完整 id 或唯一前缀，如 `tq_f6233ebe`）展开完整正文：要点、步骤、调用面、示例、坑、验证判据与历次验收证据；`ids` 可一次展开多条。回执末尾附**采用回报入口**（`technique_apply`）—— 读完正文正是最可能真正采用的时刻 |
 | `technique_learn` | 从一个代码仓库挖掘技巧（显式、受限；产出为草稿）。回执会列出**本轮新建草稿的短 id 与名称**，模型当场就能 `technique_get` / `technique_apply`；结构观察（调用面普查）只进回执、默认不入库 |
 | `technique_export` | 把一条**已验证**技巧物化成 `SKILL.md`（confidential 拒绝导出） |
 | `technique_save` | 手工写入一条技巧草稿（与自动提炼走同一条脱敏 + 去标识化管线），或按 `id` **就地更新**已有技巧：只替换显式给出的字段，`successes`/状态/验收记录与适用栈全部保留（改措辞不该把信任清零）；`kind: 'code-logic'` 写**代码逻辑卡**：`subject`（代码单元主键，按它精确命中）、`location`（抽象锚点）、`steps`（逻辑顺序）、`invariants`（不变量）、`reuse`（新增业务时怎么接上去）、`appliesTo`（版本/模块范围） |
-| `technique_apply` | 回报采用结果**与可证伪的验收证据**，驱动置信度与状态迁移（**采用回报的唯一通道**）；`updates[]` 可一次回报多条，合并成一次写入 |
+| `technique_apply` | 回报采用结果**与可证伪的验收证据**，驱动置信度与状态迁移（**采用回报的唯一通道**）；`updates[]` 可一次回报多条，合并成一次写入。回报同时决定**将来的排序**：被证实的卡带着 `✓N` 排在前面。0.2.8（L3）：**已有回执就能当证据**（例如「见 npm test：240/240 通过」），不必为回报再跑一遍检查 —— 门槛拒的只是「空洞结论」，不是「短」 |
 | `technique_forget` | 按 id 删除；`*` 清空需显式 `confirm: true` |
 | `failure_list` | 列出反复犯的错（按重复次数排序）；`includeResolved` 可看已解决记录及其触发方式、解决后复发次数 |
 | `failure_resolve` | 标记已解决，并记录**正确做法**与**触发场景**；场景再现时该记录会以 `[已解决…]` 条目提前提醒 |
@@ -550,8 +575,8 @@ dsh plugin --profile <name> install --offline                       #    重装�
   实测（MC 移植会话）模型在 147 次工具调用里一次没查库、只在用户点名时才查，而那句只讲策略、
   不讲「库里有什么」的提示压不过任务压力。**首次检索后自动消失**，所以成本有界。
   覆盖主题按库的实际内容汇总，不写死某个技术栈（别的任务也有它的技巧）。
-- **动作点顾问**：模型正要改某个文件/用某个符号时，若库里有**强证据**（调用名/领域/标签）命中、
-  且本会话还没推过的技巧，就在工具结果之后附一行 `· <技巧名> [id] — technique_get to read it.`。
+- **动作点顾问**：模型正要改某个文件/用某个符号时，若库里有**证据词命中**（卡片正文/符号 ∩
+  本次动作的证据词）且本会话还没推过的技巧，就在工具结果之后附一行，**要点直接内联**（0.2.8）。
   提示落点从「系统提示里的一句策略」挪到「它正要动手的那一刻」。按会话去重 + 每会话 ≤3 条，
   因此不会变成噪声；失败的工具结果不附、无路径无标识符不附。
 - **空查询（或全通用词）不注入**：注入路径拿不到可核对的意图时**什么都不给**，而不是退回
@@ -572,6 +597,9 @@ dsh plugin --profile <name> install --offline                       #    重装�
   会话，全文两两包含度 0.682–0.832、开头完全相同，而每条渲染只分到 ~418 字符（前言恰好占满）
   ——模型付了 5 遍同样的话，从没读到过它们的分歧部分。同一查询注入 2960 → 1376 字符。
   `memory_stats` 报 `Recall dedupe: N near-duplicate hit(s) dropped`。
+- **引用可观测**（L1）：`memory_stats` 报
+  `Technique references: M/N referenced at least once (X%), K event(s)` —— 挨着 `Technique adoption:`
+  读：采纳 0 而引用不为 0 = **用了但没回报**；两个都是 0 = 连碰都没碰。
 - 常驻规则在块内带一行说明（`STANDING RULES`），否则模型会把与本轮无关的偏好当成跑题噪声。
 - 只作用于**自动注入**：模型显式 `memory_search` / `technique_search` 一条不少。
 - 真库实测（`.verify/measure/gate-acceptance.mjs`、`memory-gate.mjs`）：不相关轮次的技巧注入
@@ -660,7 +688,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（364 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（373 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 
@@ -682,9 +710,9 @@ v3 校验要求 `source: { kind: 'plugin', plugin: <名> }`，而 v4 的 `source
 因此**同一套用例能在另一条版本线上真跑**、也不需要启动第二个实例。
 
 ```sh
-npm test                                  # 0.1.5 线：364/364
+npm test                                  # 0.1.5 线：373/373
 npx tsc -p .verify/compat/tsconfig-020.json   # 对 0.2.0-rc.1 的 .d.ts 做类型检查：0 错误
-node --import ./.verify/compat/redirect.mjs --test lib/test/   # 0.2.0 线：364/364
+node --import ./.verify/compat/redirect.mjs --test lib/test/   # 0.2.0 线：373/373
 ```
 
 > 后两条依赖本机的 0.2.0-rc.1 安装；换机器时按 `paths.json` 里的键改成对应路径即可。
@@ -786,7 +814,8 @@ Session format: dsh-session 0.1.5-rc.2 → plugin message source kind 'plugin'
   token 时才算（话题延续）。代价是「换个说法继续同一话题」时可能丢掉上一轮的文件线索 —— 这是刻意的
   取舍得：宁可少给一条，也不让上一话题霸占注入。
 - **草稿的可见性有三条通道，且都靠「模型主动」**：①自动注入**不收**草稿（`injectable()` 只认
-  validated/canonical）；②`technique_search` 默认也过滤草稿，但会**明说有几条被隐藏**并给出开关；
+  validated/canonical）；②`technique_search` 默认以已验证为主，**最佳答案是草稿时就当场带出来**（0.2.8），
+  否则明说有几条被隐藏并给出开关；
   ③`memory_search` **不过滤**草稿，且现在会标出 `(technique (draft))`。因此草稿要变成已验证，
   必须由模型显式检索 → 采用 → `technique_apply` 回报；**模型不查，它就一直是草稿** —— 这是刻意的
   设计（未验证知识不该获得注入权威），代价是「冷启动」：库里 90% 以上的条目会长期停在 draft。

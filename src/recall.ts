@@ -165,6 +165,7 @@ export function toTechniqueDocs(records: readonly TechniqueRecord[], scope?: Mem
       symbols: techniqueSymbols(record),
       successes: record.successes,
       failures: record.failures,
+      referenced: record.referenced ?? 0,
       evidenceCount: record.evidence.length,
       tags: record.tags,
       ...(record.domain === undefined ? {} : { domain: record.domain }),
@@ -385,6 +386,9 @@ function judgeTerms(terms: readonly string[], stopwords: ReadonlySet<string>): {
 const ADVISORY_NOISE: ReadonlySet<string> = new Set([
   'java', 'gradle', 'jar', 'src', 'main', 'test', 'tests', 'command', 'content', 'file', 'files',
   'path', 'api', 'doc', 'docs', 'json', 'xml', 'yaml', 'mod', 'build', 'class', 'code', 'data',
+  // 泛化英文词：与 `code`/`data` 同类，作为「你正在动的东西」没有任何指向性。
+  // 实测 `dsh-software-dev-office设计初稿.md` 的文件名让 `software` 推出 3 条无关技巧。
+  'software', 'design',
   // 扩展名同样不是知识证据。实测：`src/newmodule.ts` 仅因库里某条技巧出现过词元 `ts`
   // 就被判成「库已覆盖」，于是 0.2.6 的「新领域」放行判据对最常见的源码文件整体失效。
   'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'rb', 'go', 'rs', 'kt', 'kts', 'cs', 'php',
@@ -395,13 +399,13 @@ const ADVISORY_NOISE: ReadonlySet<string> = new Set([
 /** 门槛同款通用词（这里再用于顾问：`make`/`turn`/`per` 这类英文填充词不是实体名）。 */
 const GATE_STOPWORDS_SET: ReadonlySet<string> = new Set(GATE_STOPWORDS)
 
-/** 一条「动作点顾问」命中：只给把手与理由，正文交给 `technique_get`。 */
+/** 一条「动作点顾问」命中：给把手、命中依据与要点，正文仍可交给 `technique_get`。 */
 export interface AdvisoryHit {
   /** 技巧 id。 */
   id: string
   /** 可读标签（技巧名/首行）。 */
   label: string
-  /** 命中的**强证据**词（符号 / 领域 / 标签）。 */
+  /** 命中的证据词：卡片正文/符号 与 动作证据词的交集（已剔除 {@link ADVISORY_NOISE}）。 */
   strong: readonly string[]
   /** 这条还是草稿（未经验证）——顾问要如实标注，让模型知道该怎么用。 */
   draft: boolean
@@ -410,14 +414,16 @@ export interface AdvisoryHit {
 /**
  * 为一次**工具调用**找「可能相关、且本会话还没看过」的技巧（动作点顾问）。
  *
- * 与注入的区别是**判据更严**：只认强证据（调用名 / 领域 / 标签命中文档），不做自由文本
- * 模糊匹配 —— 顾问出现在模型正要动手的那一刻，漏一条只是少点帮助，错一条就是打断。
- * 也正因如此它用不着通用词表：命中的是 `DataComponents` 这类符号，不是「文件」「路径」。
+ * 判据是**证据词交集**：卡片正文/符号 切出的词元 ∩ 本次动作的证据词（见 `advisoryTerms`），
+ * 再剔除 {@link ADVISORY_NOISE} 与通用词。因此它的精度完全取决于**输入侧的证据词干不干净** ——
+ * 0.2.8 修的就是这一侧（枚举值、目录名、纯数字不能再当证据）。
+ *
+ * 调用方按「每轮最多一条」节流，所以 `limit` 一般传 1。
  *
  * @param docs - 候选文档（注入语料：只含已验证技巧）。
- * @param actionTerms - 本次动作的检索词（文件路径分段 + 调用名，已 tokenize）。
- * @param options - 条数上限与「本会话已看过/已推过」的 id 集合。
- * @returns 按强证据数、更新时间排序的命中。
+ * @param actionTerms - 本次动作的证据词（文件名切词 + 命名实体）。
+ * @param options - 条数上限与「本会话已推过」的 id 集合。
+ * @returns 按命中词数、词长、更新时间排序的命中。
  */
 export function advisoryMatches(
   docs: readonly RecallDoc[],
@@ -672,8 +678,11 @@ export function recallTechniques(
     const symbolHit = (meta?.symbols ?? []).some(symbol => symbols.has(symbol))
     const symbolBonus = symbolHit ? 1.6 : 1
     const domainBonus = meta?.domain !== undefined && lowerQuery.includes(meta.domain.toLowerCase()) ? 1.2 : 1
+    // L5：引用（L1 观测到的"被模型碰过"）给一个**上限 +10% 的小加成**。刻意压得很小、且
+    // 与 `confidence` 分开：显式回报才是"被验证"，引用只是"被提及"，不能盖过相关性本身。
+    const referenceBonus = 1 + Math.min(meta?.referenced ?? 0, 5) * 0.02
     const base = entry.score > 0 || emptyQuery ? (entry.score > 0 ? entry.score : 1) : 0
-    const score = base * TECHNIQUE_WEIGHT * confidence * evidenceBonus * symbolBonus * domainBonus
+    const score = base * TECHNIQUE_WEIGHT * confidence * evidenceBonus * symbolBonus * domainBonus * referenceBonus
     if (score <= 0) continue
     // 判定在加权**之后**做，但判定用的 `matched` 来自原始词命中（measure），不被加成放大。
     const ok = judge(entry.metrics, score, gate, judgeTerms(terms, gateStopwords(gate)))

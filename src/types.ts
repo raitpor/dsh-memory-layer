@@ -418,6 +418,17 @@ export interface TechniqueRecord {
   deidentified: boolean
   /** 被召回次数。 */
   hits: number
+  /**
+   * 被模型**实际引用**过几次（L1 引用检测）。
+   *
+   * 与 `applied` 的分工：`applied` 是模型**显式回报**的采纳，进置信度（`confidenceOf`）；
+   * `referenced` 是插件自己观测到的「这条卡的符号/调用名出现在了模型随后的工具调用参数里」，
+   * **不进置信度** —— 「被提及」不等于「被验证」，混进去会把排名建立在猜测上。
+   * 它存在的唯一理由是让"有没有被用上"可测（此前唯一信号是显式回报，而实测是 0）。
+   */
+  referenced?: number
+  /** 最近一次被引用的时间。 */
+  lastReferencedAt?: number
   /** 被实际采用次数。 */
   applied: number
   /** 采用成功次数。 */
@@ -497,6 +508,14 @@ export interface RecallMeta {
   successes?: number
   /** 技巧专用：失败次数。 */
   failures?: number
+  /**
+   * 技巧专用：被模型**引用**过的次数（L1 引用检测）。
+   *
+   * 与 `successes`/`failures` 分开带出来，是因为两者在排序里的待遇**不同**：
+   * 显式回报进 `confidence`（Beta 平滑，权重实打实），引用只给一个**上限 +10% 的小加成**
+   * （L5）。理由是"被提及"远弱于"被验证"：把两者混成一个数，排序就会被字符串巧合推动。
+   */
+  referenced?: number
   /** 技巧专用：证据条数。 */
   evidenceCount?: number
 }

@@ -23,7 +23,7 @@ import type { Config } from '../src/index.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
 import { createCodec } from '../src/crypto.js'
 import { RECALL_ENTRY_CHARS } from '../src/injection.js'
-import { DETAILED_HITS, MAX_VERIFICATION_CHARS } from '../src/technique.js'
+import { DETAILED_HITS, MAX_VERIFICATION_CHARS, checkVerificationEvidence } from '../src/technique.js'
 import { parseSkillFrontmatter, verifySkill } from '../src/skill.js'
 
 /** 一段注入到 system prompt 的注册记录。 */
@@ -2772,7 +2772,7 @@ test('U1b/M1/M2：草稿在显式检索里带状态标签，检索被记账，�
   }
 })
 
-test('U1a：默认检索到不了的知识，会告诉模型「有草稿」并给出开关', async () => {
+test('U1a（0.2.8 修订）：库里的最佳答案若是草稿，就在**同一次响应**里给出并标注', async () => {
   const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
   try {
     fake.emit('session/created', fakeSession('s1', '/work/demo'))
@@ -2781,28 +2781,43 @@ test('U1a：默认检索到不了的知识，会告诉模型「有草稿」并�
       name: '只有草稿覆盖的主题', when: '遇到该主题时', summary: '正文。',
     } as never, undefined as never)
 
-    // 旧行为是静默返回「没有匹配」——模型连「该加 includeDrafts」都不知道，草稿于是永远等不到采用。
+    // 旧行为是「只报草稿数量 + 让模型再调一次 includeDrafts: true」。实测那一步几乎不会被走
+    // （同类第二步决策：顾问 18 次 `technique_get` 提示 0 次执行），而真库 340/384 是草稿，
+    // 于是默认参数下的第一屏全是勉强相关的已验证卡，模型的结论是「这库没用」，再也不查。
     const dflt = String(await toolOf(fake, 'technique_search').execute(
       { query: '只有草稿覆盖的主题' } as never, undefined as never,
     ))
-    assert.match(dflt, /No verified technique matched/u, `默认应答应区分「没有已验证的」：${dflt}`)
-    assert.match(dflt, /includeDrafts: true/u, `必须告诉模型开关：${dflt}`)
+    assert.match(dflt, /只有草稿覆盖的主题/u, `草稿要点要当场给到：${dflt}`)
+    assert.match(dflt, /\[draft\]/u, `草稿必须带 [draft] 标记：${dflt}`)
+    assert.match(dflt, /best match is an unverified draft/u, `必须声明最佳命中是未验证草稿：${dflt}`)
+    assert.doesNotMatch(dflt, /call again with includeDrafts/u, `不得再要求模型二次调用：${dflt}`)
+
+    // 反例：已验证命中明显更强时**不回退**（判据是同一份排名内的分数，不是命中条数）。
+    for (const suffix of ['A', 'B']) {
+      const saved = String(await toolOf(fake, 'technique_save').execute({
+        name: `EnchantmentTable 迁移要点 ${suffix}`,
+        when: '迁移附魔台时',
+        summary: `EnchantmentTable 迁移要点 ${suffix}：资源键改为 ResourceKey。`,
+      } as never, undefined as never))
+      const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
+      await toolOf(fake, 'technique_apply').execute(
+        { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+      )
+    }
+    await toolOf(fake, 'technique_save').execute({
+      name: '附魔杂记', when: '随便看看', summary: '杂记：EnchantmentTable 相关的零散备注。',
+    } as never, undefined as never)
+    const mixed = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'EnchantmentTable 迁移要点' } as never, undefined as never,
+    ))
+    assert.doesNotMatch(mixed, /best match is an unverified draft/u, `已验证明显更强时不得回退：${mixed}`)
+    assert.match(mixed, /\(\+\d+ draft\(s\) hidden — includeDrafts: true\)/u, `有隐藏草稿时应提示开关：${mixed}`)
 
     const withDrafts = String(await toolOf(fake, 'technique_search').execute(
       { query: '只有草稿覆盖的主题', includeDrafts: true } as never, undefined as never,
     ))
     assert.match(withDrafts, /只有草稿覆盖的主题/u, `给了开关就能看到：${withDrafts}`)
-
-    // 有已验证命中时也要提示「另有草稿被隐藏」。
-    const saved = String(await toolOf(fake, 'technique_save').execute({
-      name: '同一主题的已验证条目', when: '遇到该主题时', summary: '正文。',
-    } as never, undefined as never))
-    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
-    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
-    const mixed = String(await toolOf(fake, 'technique_search').execute(
-      { query: '该主题' } as never, undefined as never,
-    ))
-    assert.match(mixed, /\(\+\d+ draft\(s\) hidden — includeDrafts: true\)/u, `有隐藏草稿时应提示：${mixed}`)
+    assert.match(withDrafts, /\(including drafts\)/u, `显式要求时应说明含草稿：${withDrafts}`)
   } finally {
     await dispose()
   }
@@ -4135,7 +4150,10 @@ test('动作点顾问：对文件/符号动手且库里有强证据命中时附�
     const decision = await fake.postExecute(action, { isError: false })
     const text = advisoryOf(decision)
     assert.match(text, /Knowledge library advisory/u, `应附顾问：${JSON.stringify(decision)}`)
-    assert.match(text, /technique_get to read it/u, '要给出下一步动作')
+    assert.match(text, /technique_get for the full steps/u, '要给出下一步动作')
+    // 0.2.8：要点必须**直接带进上下文**，否则「要不要再调一次 get」又会变成一次不划算的决策
+    // （实测 18 条顾问都写了 technique_get，其中 0 条被执行）。
+    assert.match(text, /数据包注册表/u, `要点要内联，不能只给 id：${text}`)
     assert.match(text, /matched enchantment/u, '要说清命中依据（文件名切词后的命中）')
     assert.doesNotMatch(text, /class GTEnchantment/u, '代码正文不得进入顾问')
     // 同一条不再重复提（否则会训练模型忽略它）。
@@ -4191,6 +4209,54 @@ test('动作点顾问：失败结果、无路径无标识符、目录名/扩展�
   }
 })
 
+test('顾问证据词（0.2.8）：状态枚举、目录名、年份都不得当证据', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    // 卡片正文故意带上这四个词：旧规则下它们正是被伪证据命中的东西。
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: '阶段名与目录名样本',
+      when: '进度条渲染时',
+      summary: '展示 in progress 进度、design 目录约定、software 归属与 2026 版本号。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 抠出来的 id 必须立刻断言，否则失败会漂到下游的 apply 里。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+
+    // 1) 枚举值：`status: "in_progress"` 曾产出证据词 `progress`（实测推了 2 条 MC 卡）。
+    const enumOnly = await fake.postExecute(
+      { name: 'todo_write', arguments: JSON.stringify({ todos: [{ content: 'x', status: 'in_progress' }] }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(enumOnly), '', '状态枚举值不得当证据')
+    // 2) 目录名 + 年份：`docs/design/2026-…` 曾产出 `design` 与 `2026`（实测推了 5 条无关卡）。
+    const pathNoise = await fake.postExecute(
+      { name: 'read', arguments: JSON.stringify({ file_path: 'docs/design/2026-09-29-design.md' }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(pathNoise), '', '目录名与年份不得当证据')
+    // 3) 反例：文件名里的标识符仍然必须命中 —— 收紧不能把真证据一起收掉。
+    //    `ProgressBar.md` 切出 `progress`，与卡片正文命中（这不是伪证据，是真的在动相关代码）。
+    const real = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/ProgressBar.md' }) },
+      { isError: false },
+    )
+    assert.match(advisoryOf(real), /Knowledge library advisory/u, '文件名里的标识符必须仍然命中')
+  } finally {
+    await dispose()
+  }
+})
+
 test('动作点顾问：每轮最多一条，跨轮摊开（预算可配）', async () => {
   // 实测暴露的问题：两条顾问在同一轮各带 2 个 id，把当时的每会话上限（3）一轮耗尽，
   // 之后 10+ 轮完全沉默 —— 而那些轮里明明有大量强证据命中。所以：每轮最多一条 + 预算可配。
@@ -4222,10 +4288,17 @@ test('动作点顾问：每轮最多一条，跨轮摊开（预算可配）', as
     // 同一轮里连发三次：只能出一条（节流）。
     fake.emit('session/event', session, event('turn/start', { turn: 1 }))
     let sameTurn = 0
+    let linesPerDelivery = 0
     for (let index = 0; index < 3; index += 1) {
-      if (advisoryOf(await fake.postExecute(action, { isError: false })).length > 0) sameTurn += 1
+      const text = advisoryOf(await fake.postExecute(action, { isError: false }))
+      if (text.length > 0) {
+        sameTurn += 1
+        linesPerDelivery = (text.match(/· /gu) ?? []).length
+      }
     }
     assert.equal(sameTurn, 1, `同一轮最多一条，实际 ${sameTurn}`)
+    // 0.2.8：每次投递只给一条（limit 从 2 收到 1）—— 交付两条时命中率并没有变好，只是多一份噪声。
+    assert.equal(linesPerDelivery, 1, `每次投递应只给一条顾问，实际 ${linesPerDelivery}`)
     // 跨轮：把预算（3）用完后不再推，且总数不超过预算。
     let total = sameTurn
     for (let turn = 2; turn <= 8; turn += 1) {
@@ -4739,6 +4812,152 @@ test('memory_stats 自报会话格式线与实际发出的消息来源形状', a
     const minor = /dsh-session 0\.(\d+)/u.exec(line)?.[1]
     if (minor !== undefined && Number(minor) >= 2) assert.match(line, /kind 'plugin:dsh-memory-layer'/u)
     else assert.match(line, /kind 'plugin'/u)
+  } finally {
+    await dispose()
+  }
+})
+
+test('L5：检索回执带采纳计数与图例（回报的可见产出）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat 采纳样本', when: '遇到该主题时', summary: 'Zqblat 正文。',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 抠出来的 id 必须立刻断言，否则失败会漂到下游的 apply 里。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    const out = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'Zqblat 采纳样本' } as never, undefined as never,
+    ))
+    // 回报的可见产出：这条卡现在带着 ✓1 出现，且回执解释了这个符号。
+    assert.match(out, /\[validated\] ✓1/u, `行里要带采纳次数：${out}`)
+    assert.match(out, /✓N = N confirmed adoptions/u, `要给出图例，否则 ✓1 只是符号：${out}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('L1 引用检测：模型在参数里用到卡片符号就记一次，且不进置信度', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat 引用样本',
+      when: '遇到该主题时',
+      summary: 'Zqblat 正文。',
+      apiSymbols: ['zqblatWire'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    // 抠出来的 id 必须立刻断言，否则失败会漂到下游的 apply 里。
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('Zqblat 引用样本怎么用'))
+    await fake.flush()
+    // 技巧段把它推给本会话（读一次注入文本即触发「已推给本会话」的记录）。
+    assert.match(sectionText(fake, 'memory-layer:techniques'), /Zqblat 引用样本/u, '技巧段应把它推给本会话')
+
+    // 反例：参数里没提到符号 → 不算引用。
+    await fake.postExecute(
+      { name: 'read', arguments: JSON.stringify({ file_path: 'src/other.ts' }) },
+      { isError: false },
+    )
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Technique references: 0\/\d+ referenced at least once \(0\.0%\), 0 event\(s\)/u,
+      '没碰到符号时不得记引用',
+    )
+
+    // 正例：参数里出现符号 → 记一次；同一会话再出现不重复记（否则计数会被灌成噪声）。
+    const action = {
+      name: 'edit',
+      arguments: JSON.stringify({ file_path: 'src/a.ts', new_string: 'zqblatWire(1)' }),
+    }
+    const nudged = advisoryOf(await fake.postExecute(action, { isError: false }))
+    // L2：刚被引用就顺手提示回报 —— 这是"用了但没回报"那个断层唯一的补救点。
+    assert.match(nudged, /你刚用到了/u, `引用后应提示回报：${nudged}`)
+    assert.match(nudged, /technique_apply/u, '提示要给出回报入口')
+    const repeated = advisoryOf(await fake.postExecute(action, { isError: false }))
+    assert.doesNotMatch(repeated, /你刚用到了/u, `同一条卡只提示一次：${repeated}`)
+    const stats = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+    assert.match(stats, /Technique references: 1\/\d+ referenced at least once/u, `应记到引用：${stats}`)
+    assert.match(stats, /, 1 event\(s\)/u, `同一会话只记一次：${stats}`)
+
+    // 关键不变量：引用**不进置信度** —— 采纳计数与状态都不能被引用推高。
+    assert.match(stats, /Technique adoption: 1\/\d+ adopted/u, `引用不得被当成采纳：${stats}`)
+    const search = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'Zqblat 引用样本' } as never, undefined as never,
+    ))
+    assert.match(search, /\[validated\] ✓1 /u, `引用不得把成功计数 +1：${search}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('L4 改文件时优先推「符号逐字命中」的卡，没有精确命中才回退', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    // 泛化卡：没有符号面（52% 的卡就是这样），但正文命中**两个**证据词 —— 旧规则下它会赢。
+    await toolOf(fake, 'technique_save').execute({
+      name: '泛化卡 Frobnicator',
+      when: '遇到 Frobnicator 时',
+      summary: 'Frobnicator 与 zqblatWire 都只是正文里出现的词。',
+    } as never, undefined as never)
+    // 精确卡：带符号面，且该符号**逐字**出现在这次编辑里。
+    await toolOf(fake, 'technique_save').execute({
+      name: '精确卡 Zqblat',
+      when: '改 Frobnicator 时',
+      summary: 'Frobnicator 的调用面。',
+      apiSymbols: ['zqblatWire'],
+    } as never, undefined as never)
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    // 两个证据词都命中（Frobnicator + zqblatWire），但只有精确卡的符号逐字在参数里。
+    const precise = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/Frobnicator.java', new_string: 'zqblatWire(1)' }) },
+      { isError: false },
+    ))
+    assert.match(precise, /精确卡 Zqblat/u, `应优先精确命中：${precise}`)
+    assert.doesNotMatch(precise, /泛化卡 Frobnicator/u, `有精确命中时不得推泛化卡：${precise}`)
+
+    // 反例：没有符号面命中时**仍然回退**到证据词规则 —— 否则 52% 没有符号面的卡在编辑点彻底失声。
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    const fallback = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/Frobnicator.java', new_string: 'x' }) },
+      { isError: false },
+    ))
+    assert.match(fallback, /Knowledge library advisory/u, `无精确命中时应回退：${fallback}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('L3 回报门槛：已有回执可当证据，说明里必须讲清（否则模型以为要重跑一遍）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const tool = toolOf(fake, 'technique_apply') as unknown as { description?: string }
+    assert.match(String(tool.description), /do NOT have to run a new check/u, `说明要点明回执可复用：${tool.description}`)
+    // 前提成立：带具体锚点的短回执本来就能过校验（门槛只拒"空洞结论"，不拒"短"）。
+    assert.equal(checkVerificationEvidence('`npm test`: 240/240 pass').ok, true)
+    assert.equal(checkVerificationEvidence('ok').ok, false)
   } finally {
     await dispose()
   }

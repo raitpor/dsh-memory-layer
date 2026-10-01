@@ -355,6 +355,13 @@ export function createTechniqueTools(deps: TechniqueToolDeps): ToolDefinition[] 
         'Do not paste full implementations: summary is the payload, example is at most a few illustrative lines.',
         'Pass id (from technique_search / technique_get) to fix an existing entry in place: only the fields you',
         'give are replaced, and its counters, status and verification records are kept.',
+        // A（0.2.9）：散文类字段里禁止 ASCII 双引号。实测依据：成功的 technique_save 调用里**没有一次**
+        // 出现过转义引号（0/23），而坏掉的调用**全部**含引号（4/4）—— 即"payload 里带引号"这个工具
+        // 几乎必然写不对。代价是整轮报废（一次还打死了一个子 agent 的整张任务卡），所以宁可不写引号。
+        'JSON escaping: inside prose VALUES do NOT write ASCII double quotes — one unescaped quote makes the entire',
+        'tool call invalid JSON and aborts the whole turn. Quote a phrase with 「」 instead, or wrap it in backticks.',
+        'This covers summary/when/reuse/steps/pitfalls/verify/invariants/subject; the only exception is `example`,',
+        'which is code: keep its quotes and escape them as \\".',
       ].join(' '),
       parameters: {
         id: { type: 'string', description: 'Existing technique id or unique prefix (e.g. tq_f6233ebe) to update in place. When given, name/when/summary are optional and only the fields you pass are replaced.' },

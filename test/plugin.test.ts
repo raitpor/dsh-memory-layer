@@ -4962,3 +4962,31 @@ test('L3 回报门槛：已有回执可当证据，说明里必须讲清（否�
     await dispose()
   }
 })
+
+test('A：technique_save 说明禁止散文值内写 ASCII 双引号（实测调用级失败 4/27）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const tool = toolOf(fake, 'technique_save') as unknown as { description?: string }
+    const text = String(tool.description)
+    // 约束本身：一句话说清"值里别写 ASCII 双引号"，并给出替代符号。
+    assert.match(text, /do NOT write ASCII double quotes/u, `说明里必须有这条约束：${text}`)
+    assert.match(text, /「」/u, '要给出可用的替代符号（「」）')
+    assert.match(text, /invalid JSON and aborts the whole turn/u, '要说清代价（整轮报废）')
+    // 例外：example 是代码，引号是语法必需，不能被这条约束误伤。
+    assert.match(text, /`example`,?\s+which is code/u, `example 必须显式例外：${text}`)
+
+    // 前提仍然成立：不带引号的正常内容照旧能落盘（约束不是"什么都不许写"）。
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat 无引号样本',
+      when: '遇到该主题时',
+      summary: '用「」引用短语，不写 ASCII 双引号。',
+      pitfalls: ['别在值里写 ASCII 双引号'],
+    } as never, undefined as never))
+    assert.match(saved, /tq_[0-9a-fA-F-]+/u, `无引号内容必须能存：${saved}`)
+  } finally {
+    await dispose()
+  }
+})

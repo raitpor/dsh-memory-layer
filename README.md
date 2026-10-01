@@ -432,7 +432,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `technique_get` | 按 id（完整 id 或唯一前缀，如 `tq_f6233ebe`）展开完整正文：要点、步骤、调用面、示例、坑、验证判据与历次验收证据；`ids` 可一次展开多条。回执末尾附**采用回报入口**（`technique_apply`）—— 读完正文正是最可能真正采用的时刻 |
 | `technique_learn` | 从一个代码仓库挖掘技巧（显式、受限；产出为草稿）。回执会列出**本轮新建草稿的短 id 与名称**，模型当场就能 `technique_get` / `technique_apply`；结构观察（调用面普查）只进回执、默认不入库 |
 | `technique_export` | 把一条**已验证**技巧物化成 `SKILL.md`（confidential 拒绝导出） |
-| `technique_save` | 手工写入一条技巧草稿（与自动提炼走同一条脱敏 + 去标识化管线），或按 `id` **就地更新**已有技巧：只替换显式给出的字段，`successes`/状态/验收记录与适用栈全部保留（改措辞不该把信任清零）；`kind: 'code-logic'` 写**代码逻辑卡**：`subject`（代码单元主键，按它精确命中）、`location`（抽象锚点）、`steps`（逻辑顺序）、`invariants`（不变量）、`reuse`（新增业务时怎么接上去）、`appliesTo`（版本/模块范围） |
+| `technique_save` | 手工写入一条技巧草稿（与自动提炼走同一条脱敏 + 去标识化管线），或按 `id` **就地更新**已有技巧：只替换显式给出的字段，`successes`/状态/验收记录与适用栈全部保留（改措辞不该把信任清零）；`kind: 'code-logic'` 写**代码逻辑卡**：`subject`（代码单元主键，按它精确命中）、`location`（抽象锚点）、`steps`（逻辑顺序）、`invariants`（不变量）、`reuse`（新增业务时怎么接上去）、`appliesTo`（版本/模块范围）。0.2.9 起说明里**禁止在散文类字段的值里写 ASCII 双引号**（改用 `「」` 或反引号；`example` 是代码，例外）：实测成功调用里 0/23 出现过转义引号、失败的 4/4 都含引号，而一次坏 payload 会**报废整轮** |
 | `technique_apply` | 回报采用结果**与可证伪的验收证据**，驱动置信度与状态迁移（**采用回报的唯一通道**）；`updates[]` 可一次回报多条，合并成一次写入。回报同时决定**将来的排序**：被证实的卡带着 `✓N` 排在前面。0.2.8（L3）：**已有回执就能当证据**（例如「见 npm test：240/240 通过」），不必为回报再跑一遍检查 —— 门槛拒的只是「空洞结论」，不是「短」 |
 | `technique_forget` | 按 id 删除；`*` 清空需显式 `confirm: true` |
 | `failure_list` | 列出反复犯的错（按重复次数排序）；`includeResolved` 可看已解决记录及其触发方式、解决后复发次数 |
@@ -688,7 +688,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 构建 + node --test（373 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
+npm test            # 构建 + node --test（374 个用例：存储 / 召回 / 提炼 / 脱敏 / 加密 / 技术栈画像 /
                     #   去标识化 / 技巧层 / 失败经验层 / 代码挖掘 / 导出 / 配置 / 集成 / Cordis 加载）
 ```
 
@@ -710,9 +710,9 @@ v3 校验要求 `source: { kind: 'plugin', plugin: <名> }`，而 v4 的 `source
 因此**同一套用例能在另一条版本线上真跑**、也不需要启动第二个实例。
 
 ```sh
-npm test                                  # 0.1.5 线：373/373
+npm test                                  # 0.1.5 线：374/374
 npx tsc -p .verify/compat/tsconfig-020.json   # 对 0.2.0-rc.1 的 .d.ts 做类型检查：0 错误
-node --import ./.verify/compat/redirect.mjs --test lib/test/   # 0.2.0 线：373/373
+node --import ./.verify/compat/redirect.mjs --test lib/test/   # 0.2.0 线：374/374
 ```
 
 > 后两条依赖本机的 0.2.0-rc.1 安装；换机器时按 `paths.json` 里的键改成对应路径即可。

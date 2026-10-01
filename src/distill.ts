@@ -15,7 +15,7 @@
 
 import { ADVISORY_MARKER, HOST_CONTEXT_MARKERS, INJECTION_BLOCKS } from './injection.js'
 import { redactMemory } from './redact.js'
-import { MAX_SUMMARY_CHARS } from './store.js'
+import { MAX_SUMMARY_CHARS, normalizeDomain } from './store.js'
 import { TECHNIQUE_KINDS } from './types.js'
 import type {
   ApiSurface,
@@ -289,7 +289,9 @@ export function normalizeTechniqueDrafts(input: unknown, stack: StackProfile | u
     const gist = clip(string(record.gist), 120)
     const api = apiSurfaces(record.api)
     const example = techniqueExample(record.example)
-    const domain = clip(string(record.domain), 48)
+    // 领域名在**入口**归一化（0.2.10）：这里与 `manualDraft` 是领域名的全部写入口，
+    // 在出口归一化会漏掉就地更新与手动保存，写入口归一化才堵得住新分裂。
+    const domain = normalizeDomain(clip(string(record.domain), 48))
     out.push({
       kind: techniqueKind(record.kind),
       name,
@@ -307,7 +309,7 @@ export function normalizeTechniqueDrafts(input: unknown, stack: StackProfile | u
       pitfalls: strings(record.pitfalls, FIELD_LIMITS.techniqueSteps, FIELD_LIMITS.item),
       verify: strings(record.verify, FIELD_LIMITS.techniqueSteps, FIELD_LIMITS.item),
       stack: stack ?? { languages: [] },
-      ...(domain.length === 0 ? {} : { domain }),
+      ...(domain === undefined ? {} : { domain }),
       tags: strings(record.tags, FIELD_LIMITS.tags, 48).map(tag => tag.toLowerCase()),
       // 证据由提炼管线补上会话来源，不采信模型自述。
       evidence: [],

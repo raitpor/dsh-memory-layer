@@ -272,6 +272,9 @@ export function applyOutcome(record: TechniqueRecord, verification: TechniqueVer
     verifications: [verification, ...(record.verifications ?? [])].slice(0, MAX_VERIFICATIONS),
   }
   if (outcome === 'success') updated.lastVerifiedAt = at
+  // 被归档的卡一旦**真的用成功了**就不再是死重：撤掉归档，让它重新参与注入与排序。
+  // 只认成功不认失败 —— 失败可能只是这次不适用，不足以证明它活过来了。
+  if (outcome === 'success' && updated.archivedAt !== undefined) delete updated.archivedAt
 
   if (failures >= DEPRECATE_AFTER_FAILURES && failures > successes) {
     updated.status = 'deprecated'
@@ -549,10 +552,54 @@ export function resolveTechniqueId(needle: unknown, records: readonly TechniqueR
 }
 
 /**
- * 判断一条技巧是否可以参与**自动注入**：草稿与废弃都不参与。
+ * 判断一条技巧是否可以参与**自动注入**：草稿、废弃与归档都不参与。
+ *
+ * 归档是一条独立的否决位（见 {@link TechniqueRecord.archivedAt}）：一条已验证的卡也可能因为
+ * 长期没人用而被归档，而 `status` 仍然记着它「曾经被验证过」这件事 —— 两者语义不同，
+ * 不能互相顶替。显式检索不看这个函数（`technique_search` 仍然要能取回归档卡）。
+ *
  * @param record - 技巧记录。
  * @returns 可注入时为 `true`。
  */
 export function injectable(record: TechniqueRecord): boolean {
+  if (record.archivedAt !== undefined) return false
   return record.status === 'validated' || record.status === 'canonical'
+}
+
+/**
+ * 归档的**触发判据**：这条卡是不是「死重」——占着位置，却从未产生过任何使用信号。
+ *
+ * 四个条件缺一不可：
+ *  - `status === 'draft'`：已验证/权威卡是库的价值本体，绝不自动归档（`successes === 0` 其实
+ *    已经蕴含这一点，但写成显式条件，读的人不必去推 `promotedStatus` 的规则）；
+ *  - `retrieveCount === 0`：从来没被显式检索过 → 没人想知道它；
+ *  - `referenced === 0`：它的符号从来没出现在模型的动作里 → 没被用上；
+ *  - `successes === 0`：从来没被验证成功过。
+ *
+ * 再加两道豁免：`kind === 'pitfall'`（讲踩坑的知识，价值不在「被检索」而在「别重蹈」）与
+ * **当前活跃领域**（默认 `dsh-` / `sdo`，见配置 `archiveKeepDomains`）—— 正在开发的领域里，
+ * 今天没人查的卡明天就要用。
+ *
+ * @param record - 技巧记录。
+ * @param now - 当前时间（Unix 毫秒）。
+ * @param options - 最小年龄（天）与豁免领域前缀。
+ * @returns 该归档时为 `true`。
+ */
+export function isArchivable(
+  record: TechniqueRecord,
+  now: number,
+  options: { afterDays: number; keepDomains: readonly string[] },
+): boolean {
+  if (record.archivedAt !== undefined) return false
+  if (record.status !== 'draft') return false
+  if (record.kind === 'pitfall') return false
+  if ((record.retrieveCount ?? 0) > 0) return false
+  if ((record.referenced ?? 0) > 0) return false
+  if (record.successes > 0) return false
+  if (options.afterDays > 0 && now - record.ts < options.afterDays * 24 * 60 * 60 * 1000) return false
+  const domain = record.domain?.trim().toLowerCase() ?? ''
+  if (domain.length > 0 && options.keepDomains.some(prefix => domain === prefix || domain.startsWith(prefix))) {
+    return false
+  }
+  return true
 }

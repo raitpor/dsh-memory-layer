@@ -170,6 +170,7 @@ export function toTechniqueDocs(records: readonly TechniqueRecord[], scope?: Mem
       tags: record.tags,
       ...(record.domain === undefined ? {} : { domain: record.domain }),
       ...(record.appliesTo === undefined ? {} : { appliesTo: record.appliesTo }),
+      ...(record.archivedAt === undefined ? {} : { archived: true }),
       ...(scope === undefined ? {} : { scope }),
     },
   }))
@@ -389,6 +390,10 @@ const ADVISORY_NOISE: ReadonlySet<string> = new Set([
   // 泛化英文词：与 `code`/`data` 同类，作为「你正在动的东西」没有任何指向性。
   // 实测 `dsh-software-dev-office设计初稿.md` 的文件名让 `software` 推出 3 条无关技巧。
   'software', 'design',
+  // 项目名片段（0.2.10）：`AsterChat` / `hotelSystem` 这类**产品名**切出来的词不是「你正在
+  // 动的技术」，但它们会出现在请求与路径里，于是把无关技巧推给会话。实测正是它们让首触
+  // 顾问跑题（`chat` ← AsterChat、`system` ← hotelSystem）。
+  'chat', 'system', 'progress',
   // 扩展名同样不是知识证据。实测：`src/newmodule.ts` 仅因库里某条技巧出现过词元 `ts`
   // 就被判成「库已覆盖」，于是 0.2.6 的「新领域」放行判据对最常见的源码文件整体失效。
   'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'rb', 'go', 'rs', 'kt', 'kts', 'cs', 'php',
@@ -398,6 +403,32 @@ const ADVISORY_NOISE: ReadonlySet<string> = new Set([
 
 /** 门槛同款通用词（这里再用于顾问：`make`/`turn`/`per` 这类英文填充词不是实体名）。 */
 const GATE_STOPWORDS_SET: ReadonlySet<string> = new Set(GATE_STOPWORDS)
+
+/**
+ * 顾问证据词的**最小长度**（只对拉丁词元生效）：4 个字符以下的拉丁词不构成证据。
+ *
+ * 为什么是 5：实测有效命中的短词（`token`、`meter`）正好 5 个字符，而下限设 4 时
+ * `AsterChat` / `hotelSystem` 这类**项目名片段**会漏进来（`chat`）。中文二字词（`插件`、
+ * `召回`）虽然只有 2 个字符却是有指向性的实体，所以下限不能一刀切到长度上。
+ */
+const ADVISORY_MIN_LATIN_CHARS = 5
+
+/**
+ * 一个词元能不能当「这条知识讲的就是你现在动的东西」的证据。
+ *
+ * 三道闸：泛化噪声表 → 门槛通用词 → 拉丁词长度下限。**宁可漏，不可噪** —— 顾问出现在模型
+ * 正要动手的那一刻，错一条就是打断它。
+ *
+ * 导出是为了让**回放度量**（`.verify/measure/first-contact-audit.mjs`）用真规则判定历史顾问
+ * 里的命中词还活不活着，而不是在脚本里复刻一份会漂移的副本。
+ *
+ * @param term - 待判定的词元（小写）。
+ * @returns 可以当证据时为 `true`。
+ */
+export function isAdvisoryEvidence(term: string): boolean {
+  if (ADVISORY_NOISE.has(term) || GATE_STOPWORDS_SET.has(term)) return false
+  return /^[a-z0-9_]+$/u.test(term) ? term.length >= ADVISORY_MIN_LATIN_CHARS : true
+}
 
 /** 一条「动作点顾问」命中：给把手、命中依据与要点，正文仍可交给 `technique_get`。 */
 export interface AdvisoryHit {
@@ -415,8 +446,9 @@ export interface AdvisoryHit {
  * 为一次**工具调用**找「可能相关、且本会话还没看过」的技巧（动作点顾问）。
  *
  * 判据是**证据词交集**：卡片正文/符号 切出的词元 ∩ 本次动作的证据词（见 `advisoryTerms`），
- * 再剔除 {@link ADVISORY_NOISE} 与通用词。因此它的精度完全取决于**输入侧的证据词干不干净** ——
- * 0.2.8 修的就是这一侧（枚举值、目录名、纯数字不能再当证据）。
+ * 再逐词过 {@link isAdvisoryEvidence}（噪声表 / 通用词 / 拉丁词长度下限）。因此它的精度完全
+ * 取决于**输入侧的证据词干不干净** —— 0.2.8 修的是这一侧（枚举值、目录名、纯数字不能再当证据），
+ * 0.2.10 补上长度下限与项目名片段（`chat`/`system`）。
  *
  * 调用方按「每轮最多一条」节流，所以 `limit` 一般传 1。
  *
@@ -435,6 +467,8 @@ export function advisoryMatches(
   const hits: (AdvisoryHit & { ts: number })[] = []
   for (const doc of docs) {
     if (doc.layer !== 'technique') continue
+    // 归档卡退出顾问通道：顾问出现在模型正要动手的那一刻，死重在这里只可能打断它。
+    if (doc.meta?.archived === true) continue
     if (options.seen?.has(doc.id) === true) continue
     // 证据只取**正文与符号**，不取 tags/domain：标签天生是泛化的（`java`、`command`、
     // `content`），拿它当证据会让「改任何 Java 文件」都推出 Java 类技巧、「跑条命令」
@@ -443,8 +477,7 @@ export function advisoryMatches(
       ...tokenize(doc.text),
       ...(doc.meta?.symbols ?? []).flatMap(symbol => tokenize(symbol)),
     ])
-    const shared = actionTerms.filter(term =>
-      evidence.has(term) && !ADVISORY_NOISE.has(term) && !GATE_STOPWORDS_SET.has(term))
+    const shared = actionTerms.filter(term => evidence.has(term) && isAdvisoryEvidence(term))
     if (shared.length === 0) continue
     hits.push({
       id: doc.id,
@@ -612,6 +645,13 @@ export interface TechniqueRecallOptions {
   partition?: string
   /** 是否包含草稿；工具显式检索时为 `true`，自动注入时为 `false`。 */
   includeDrafts?: boolean
+  /**
+   * 是否包含**已归档**的技巧；默认 `false`（自动注入必须先排除死重）。
+   *
+   * 与 `includeDrafts` 同构，但默认值相反：草稿默认不可注入、显式检索要看见；
+   * 归档两者都要显式开口，因为「归档」的语义就是退出自动通道。
+   */
+  includeArchived?: boolean
   /** 当前上下文中出现的调用名，命中则显著加权。 */
   symbols?: readonly string[]
   /** 相关性门槛（非通用词命中数 + 强字段命中 + 可选分数）。记忆层与技巧层共用同一口径。 */
@@ -652,6 +692,7 @@ export function recallTechniques(
     if (meta === undefined) return false
     if (!includeDrafts && meta.status !== 'validated' && meta.status !== 'canonical') return false
     if (meta.status === 'deprecated') return false
+    if (options.includeArchived !== true && meta.archived === true) return false
     if (options.partition !== undefined && meta.partition !== undefined && meta.partition !== options.partition) {
       return false
     }

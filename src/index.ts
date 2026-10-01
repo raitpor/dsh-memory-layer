@@ -46,6 +46,7 @@ import {
   MINE_CACHE_FILE,
   SQLITE_INDEX_FILE,
   emptyMetrics,
+  normalizeDomain,
   techniqueText,
 } from './store.js'
 import { facetQueries, isStandingRule, recallDocsFacets, recallFacets, toDocs, toTechniqueDocs, tokenize } from './recall.js'
@@ -73,6 +74,7 @@ import {
   confidenceOf,
   gistOf,
   injectable,
+  isArchivable,
   mentionsNeedle,
   referenceNeedles,
   resolveTechniqueId,
@@ -111,6 +113,7 @@ import {
   RECALL_BLOCK,
   TECHNIQUE_BLOCK,
   compactEntryText,
+  compactStandingText,
   advisoryText,
 } from './injection.js'
 import type { InjectionBlock } from './injection.js'
@@ -263,6 +266,44 @@ export interface Config {
   /** 首触顾问：未检索的会话在动作点直接收到最相关的一条技巧（含要点）。默认 `true`。 */
   firstContactAdvisory?: boolean
   /**
+   * **每个会话最多推几条首触顾问**。默认 `1`；`0` 等于关掉这条通道。
+   *
+   * 为什么必须有这个上限：首触顾问原先只靠「本会话还没查过库」这一条退出条件，而实测
+   * 49 个会话里只有 18 个查过库 —— 其余 31 个**每轮各收一条**（首触占了顾问总量的 62%：
+   * 179 条 / 26,367 字符，主 sdo 会话一条会话就收了 89 条）。可见限制它的不是轮数而是次数：
+   * 第 1 条已经把「这里有现成经验」这件事讲清楚了，之后每多推一条都只是重复付费。
+   *
+   * 为什么不按轮节流（如每 10 轮一条）：149 轮的会话按此仍会推约 15 条，与不节流相差不大。
+   */
+  firstContactAdvisoryMax?: number
+  /**
+   * 死重维护（0.2.10）：每次刷新时检查一次「领域名归一化 + 归档死重草稿」，有新可归档项才写盘。
+   *
+   * 只做可逆操作：领域名折叠大小写与别名，死重草稿打 `archivedAt`（退出自动注入与排序，
+   * 但 `technique_search` 仍可见）。关掉它则历史遗留的两种领域写法与死重都保持原样。
+   */
+  techniqueMaintenance?: boolean
+  /**
+   * 死重归档的最小年龄（天）。默认 `14`；`0` = 不等年龄。
+   *
+   * ⚠️ 实测：本机真库最老的记录才 8.5 天，所以默认值**当前不会归档任何一条**。这是刻意的 ——
+   * 年轻库里「还没人查」说明不了「是死重」；收益要等库变老才显现出来。
+   */
+  archiveAfterDays?: number
+  /** 归档豁免的领域（等于该项或以该项开头）。默认 `['dsh-', 'sdo']`：活跃领域里的卡明天还要用。 */
+  archiveKeepDomains?: string[]
+  /**
+   * **单个领域**允许保留的活跃草稿数上限（0 = 不限）。默认 `150`。
+   *
+   * ③c 的动机是「防再生」：归档只清一次存量，而挖掘/反思仍在按同样速度产出新草稿
+   * （实测约 +14 条/4 小时）。所以除了年龄判据，再加一道**按领域**的护栏 —— 某个领域饱和时，
+   * 先归档该领域里**最老且从未被检索/引用/成功**的草稿，再让新的进来。
+   *
+   * 与 `archiveAfterDays` 的分工：年龄判据拦「没人查的旧卡」，这条拦「同一个领域堆太多」——
+   * 后者不看年龄（饱和本身就是信号），但**只动从未被用过的**，且豁免领域不参与计数。
+   */
+  maxActiveDraftsPerDomain?: number
+  /**
    * 追加到内置**通用词表**的词：命中这些词不算「相关」，因此不能单独触发注入。默认 `[]`。
    *
    * 内置表已覆盖对话套话（继续/开始/可以）、交付元话题（技巧/文档/输出/中文/库里）与通用
@@ -273,6 +314,13 @@ export interface Config {
    * 那会把这个库自己的领域压制掉。表只作用于门槛，不进分词器，不影响排序。
    */
   injectStopwords?: string[]
+  /**
+   * 常驻规则每隔几轮重发一次**全文**；`0` = 只在规则集变化时重发。默认 `10`。
+   *
+   * 规则集不变时，常驻条目改发紧凑形态（保一句可执行的话，默认 60 字符）—— 它们是召回段里
+   * 唯一每轮必然重复的部分。定期重发全文是保险：万一压缩削掉了关键限定语，10 轮内会恢复一次。
+   */
+  standingRuleFullEveryTurns?: number
   /**
    * 注入侧的绝对 BM25 分数下限（`0` = 关闭，默认关闭）。
    *
@@ -597,11 +645,47 @@ export const Config: z<Config> = z.object({
   }),
   partition: z.string().default('default'),
   techniques: z.boolean().default(true),
+  /**
+   * 死重维护（0.2.10）：每次刷新时检查一次「领域归一化 + 归档死重」，有新可归档项才写盘。
+   *
+   * 只做**可逆**的事：领域名折叠大小写/别名，以及给死重草稿打 `archivedAt`。归档卡退出自动注入
+   * 与排序，但 `technique_search` 仍然看得到、仍然能按 id 展开 —— 删掉就找不回来了。
+   */
+  techniqueMaintenance: z.boolean().default(true),
+  /**
+   * 死重归档的最小年龄（天）。默认 `14`；`0` = 不等年龄（只要满足「从未检索/引用/成功」就归档）。
+   *
+   * ⚠️ 实测提醒：本机真库最老的记录才 8.5 天，因此默认 14 天**当前一条都不会归档** —— 这是
+   * 有意为之（年轻库里「还没人查」不等于「死重」），代价是这项收益要等库变老才显现。
+   */
+  archiveAfterDays: z.natural().min(0).max(3650).default(14),
+  /**
+   * 归档豁免的领域前缀：正在开发的领域里，今天没人查的卡明天就要用。默认 `dsh-` / `sdo`。
+   *
+   * 匹配规则是「等于该项或以该项开头」，因此 `dsh-` 覆盖 `dsh-plugin`、`dsh-memory-layer`。
+   */
+  archiveKeepDomains: z.array(z.string()).default(['dsh-', 'sdo']),
+  /**
+   * 单个领域允许保留的活跃草稿数上限（`0` = 不限）。默认 `150`。
+   *
+   * 归档只能清一次存量，而挖掘/反思还在按同样速度产出（实测约 +14 条/4 小时）—— 没有这道
+   * 护栏，死重会以同样的速度长回来。超限时按「最老且从未被检索/引用/成功」先出局。
+   */
+  maxActiveDraftsPerDomain: z.natural().min(0).max(10_000).default(150),
   techniqueLimit: z.natural().min(1).max(10).default(3),
   techniqueChars: z.natural().min(200).max(20_000).default(3000),
   techniquePromptOrder: z.number().default(260),
   injectMinMatched: z.natural().min(0).max(20).default(2),
   injectStandingRules: z.natural().min(0).max(20).default(4),
+  /**
+   * 常驻规则**每隔几轮重发一次全文**（默认 `10`；`0` = 只在规则集变化时重发）。
+   *
+   * 规则集不变时，常驻条目改发紧凑形态（见 `compactStandingText`）：实测真库里
+   * preference/constraint 正文中位数 57 字符，而它们**每轮**都要印一遍，是召回段里唯一必然
+   * 重复的部分。定期重发全文是一道保险：压缩若把某条规则的关键限定语削掉，最多 10 轮后
+   * 会恢复一次完整表述。
+   */
+  standingRuleFullEveryTurns: z.natural().min(0).max(1000).default(10),
   injectStopwords: z.array(z.string()).default([]),
   techniqueAdvisory: z.boolean().default(true),
   /**
@@ -616,6 +700,9 @@ export const Config: z<Config> = z.object({
   // 只靠「本会话还没查过库」那句提醒实测无效（提醒 145 次、主动查询率仍 1%），所以换成
   // 走已验证有效的顾问通道把真东西递过去。
   firstContactAdvisory: z.boolean().default(true),
+  // 首触顾问的**每会话条数上限**（0 = 关闭）。只靠「查过库就闭嘴」实测让 31/49 个会话
+  // 每轮各收一条（占顾问总量 62%），所以次数必须可配且有硬上限。
+  firstContactAdvisoryMax: z.natural().min(0).max(20).default(1),
   injectMinScore: z.number().min(0).max(1000).default(0),
   guidancePromptOrder: z.number().default(265),
   guidance: z.boolean().default(true),
@@ -717,6 +804,7 @@ interface Settings {
   techniquePromptOrder: number
   injectMinMatched: number
   injectStandingRules: number
+  standingRuleFullEveryTurns: number
   injectMinScore: number
   injectionGate: RelevanceGate
   guidancePromptOrder: number
@@ -726,6 +814,11 @@ interface Settings {
   techniqueAdvisoryDrafts: boolean
   techniqueAdvisoryMax: number
   firstContactAdvisory: boolean
+  firstContactAdvisoryMax: number
+  techniqueMaintenance: boolean
+  archiveAfterDays: number
+  archiveKeepDomains: string[]
+  maxActiveDraftsPerDomain: number
   exampleMaxLines: number
   exampleMaxChars: number
   allowConfidentialGlobal: boolean
@@ -881,10 +974,102 @@ export function apply(ctx: Context, config: Config): void {
    */
   let techniqueHitCache: { query: string; hits: readonly RecalledMemory[] } | undefined
 
+  /**
+   * 死重维护：领域名归一化 + 归档「从未被检索/引用/成功」的旧草稿。
+   *
+   * 为什么放在 `refresh` 里而不是 `apply`：真源是按**桶**（工作目录）分文件的，`apply` 时刻
+   * 还没有工作目录；而 `refresh` 手里正好有这一桶的全部技巧记录。
+   *
+   * 返回是否真的写盘了（调用方据此重读一次，让索引与语料基于新状态）。
+   *
+   * @param directory - 当前桶的工作目录（project 作用域的记录落在这里）；未知时为 `undefined`。
+   * @param records - 该桶已加载的技巧记录（project + global 去重后）。
+   * @returns 写盘了返回 `true`。
+   */
+  const maintainTechniques = async (
+    directory: string | undefined,
+    records: readonly TechniqueRecord[],
+  ): Promise<boolean> => {
+    if (!settings.techniqueMaintenance || records.length === 0) return false
+    const now = Date.now()
+    // 补丁按 id 收敛（而不是数组追加）：年龄判据与领域上限可能命中同一条记录，用 Map 就天然幂等。
+    const patchById = new Map<string, TechniqueRecord>()
+    let archived = 0
+    let renamed = 0
+    for (const record of records) {
+      const domain = normalizeDomain(record.domain)
+      const domainChanged = domain !== record.domain
+      const archivable = isArchivable(record, now, {
+        afterDays: settings.archiveAfterDays,
+        keepDomains: settings.archiveKeepDomains,
+      })
+      if (!domainChanged && !archivable) continue
+      if (domainChanged) renamed += 1
+      if (archivable) archived += 1
+      // 逐字段条件构造（而不是 `domain: undefined`）：`exactOptionalPropertyTypes` 下，
+      // 「显式写 undefined」与「没有这个字段」不是一回事，后者才是「没有领域」。
+      const patch: TechniqueRecord = { ...record, ...(archivable ? { archivedAt: now } : {}) }
+      if (domainChanged) {
+        if (domain === undefined) delete patch.domain
+        else patch.domain = domain
+      }
+      patchById.set(record.id, patch)
+    }
+    // ③c：按领域设**活跃草稿上限**，超限时先归档该领域里最老且从未被用过的草稿。
+    // 为什么要另设一道（年龄判据已经存在）：归档只能清一次存量，而挖掘/反思仍在按同样速度产出
+    // 新草稿（实测约 +14 条/4 小时）；没有这道护栏，死重会以同样的速度长回来。
+    // 与年龄判据的分工：这里**不看年龄**（领域饱和本身就是信号），但只动从未被用过的卡，
+    // 且豁免领域完全不参与（正在开发的领域里，今天没人查的卡明天就要用）。
+    let capped = 0
+    const cap = settings.maxActiveDraftsPerDomain
+    if (cap > 0) {
+      // 计数看**补丁生效后**的状态：被年龄判据归档的卡已经不算活跃，只改了领域名的那条仍然算。
+      const effective = records.map(record => patchById.get(record.id) ?? record)
+      const byDomain = new Map<string, TechniqueRecord[]>()
+      for (const record of effective) {
+        if (record.status !== 'draft' || record.archivedAt !== undefined) continue
+        const domain = normalizeDomain(record.domain)
+        if (domain === undefined) continue
+        if (settings.archiveKeepDomains.some(prefix => domain === prefix || domain.startsWith(prefix))) continue
+        byDomain.set(domain, [...(byDomain.get(domain) ?? []), record])
+      }
+      for (const group of byDomain.values()) {
+        const excess = group.length - cap
+        if (excess <= 0) continue
+        const evict = group
+          .filter(record => isArchivable(record, now, { afterDays: 0, keepDomains: settings.archiveKeepDomains }))
+          .sort((left, right) => left.ts - right.ts)
+          .slice(0, excess)
+        for (const record of evict) {
+          patchById.set(record.id, { ...record, archivedAt: now })
+          archived += 1
+          capped += 1
+        }
+      }
+    }
+    const patches = [...patchById.values()]
+    if (patches.length === 0) return false
+    try {
+      const applied = await store.updateTechniques(patches, directory)
+      if (applied > 0) {
+        logger.info(
+          `memory: technique maintenance on ${directory ?? '(unknown cwd)'} — ${applied} record(s) rewritten `
+          + `(${archived} archived${capped === 0 ? '' : `, ${capped} over per-domain cap`}, `
+          + `${renamed} domain name(s) normalized)`,
+        )
+      }
+      return applied > 0
+    } catch (error) {
+      // 维护是增益：失败只记日志，绝不让它影响正常的读取与检索。
+      logger.warn(`memory: technique maintenance failed: ${describe(error)}`)
+      return false
+    }
+  }
+
   const refresh = async (cwd?: string): Promise<void> => {
     const directory = resolveCwd(cwd)
     const key = bucketKey(directory)
-    const [
+    let [
       episodic,
       semantic,
       globalEpisodic,
@@ -903,6 +1088,17 @@ export function apply(ctx: Context, config: Config): void {
       store.readFailures('project', directory, settings.partition),
       store.readFailures('global', undefined, settings.partition),
     ])
+    // 死重维护（0.2.10）：领域归一化 + 归档死重。**每次刷新都检查**，但不为空才写盘 ——
+    // 检查是纯内存的 O(n) 比较（几百条），而写盘只会在真出现新死重时发生一次，
+    // 归档之后条件不再成立，所以不存在写风暴。写盘后**必须重读**，否则索引与语料仍基于
+    // 维护前的状态，归档卡会在本次刷新后继续留在注入候选里（直到下一次刷新才消失）。
+    const maintained = await maintainTechniques(directory, dedupeById([...projectTech, ...globalTech]))
+    if (maintained) {
+      ;[projectTech, globalTech] = await Promise.all([
+        store.readTechniques('project', directory, settings.partition),
+        store.readTechniques('global', undefined, settings.partition),
+      ])
+    }
     // DEF-28：这两张表必须**先清空再重建**。只 `set` 不 `clear` 时，被删除的记录会永远留在
     // 内存索引里 —— `failure_list` / `failure_resolve` / `failure_forgive` / `technique_get`
     // 读的都是这张表，于是「删掉了但还看得见、还能展开」。（`clear` 与下面的重建循环之间
@@ -1764,6 +1960,23 @@ export function apply(ctx: Context, config: Config): void {
    */
   const advisoryLastTurn = new Map<string, number>()
 
+  /**
+   * 每个会话已投递的**首触顾问条数**（上限 `firstContactAdvisoryMax`）。
+   *
+   * 与 `advisorySeen` 的区别：那份是「同一条 id 只推一次」的去重，挡不住**每轮推不同的一条** ——
+   * 未检索会话正是这样在 149 轮里收下 89 条首触顾问。这里按会话计**总次数**，与推的是哪条无关。
+   */
+  const firstContactPushed = new Map<string, number>()
+
+  /**
+   * 每个会话**上次以全文形态注入常驻规则**时的规则集签名与轮号（0.2.10 的 ②a）。
+   *
+   * 常驻规则每轮都在，是召回段里唯一必然重复的部分：真库里 preference/constraint 正文中位数
+   * 57 字符，而它们每轮都按全文重印一遍（实测 5522 次条目出现里只有 425 条不同 = 92% 是重复）。
+   * 规则集不变而且距上次全文没超过 `standingRuleFullEveryTurns` 轮时，改发紧凑形态。
+   */
+  const standingFullShown = new Map<string, { signature: string; turn: number | undefined }>()
+
   /** 动作点顾问：从工具调用里抽文件路径与调用名，只认强证据命中。 */
   const advisoryFor = (exec: { name: string; arguments: unknown }): string | undefined => {    if (!settings.techniques || !settings.techniqueAdvisory) return undefined
     const sessionId = current?.sessionId
@@ -1821,7 +2034,10 @@ export function apply(ctx: Context, config: Config): void {
    * 差别不在文字，在**出现的位置**：提醒躺在系统提示里，顾问出现在模型刚做完一次动作、
    * 正要决定下一步的那一刻。所以这里把提醒内容换成真东西，并走同一条已证明有效的通道。
    *
-   * 三条约束与 `advisoryFor` 完全一致（同一份 `seen` / `advisoryLastTurn` 预算）：
+   * 三条约束与 `advisoryFor` 完全一致（同一份 `seen` / `advisoryLastTurn` 预算），
+   * 外加一条它独有的约束：**每会话总数上限** `firstContactAdvisoryMax`（默认 1）。首触与
+   * 动作点不同 —— 动作点由「模型正在动某个东西」驱动，本身就稀有；首触只由「还没查过库」
+   * 驱动，而未检索会话可能连续几十轮都满足这个条件，所以它必须自己数次数。
    * 命中的是过门槛的检索结果（跑题不推）、每会话有总量上限、同一轮最多一条。
    *
    * @returns 顾问正文；不该推或没有过门槛的命中时 `undefined`。
@@ -1830,6 +2046,9 @@ export function apply(ctx: Context, config: Config): void {
     if (!settings.techniques || !settings.firstContactAdvisory) return undefined
     const sessionId = current?.sessionId
     if (sessionId === undefined || consultedSessions.has(sessionId)) return undefined
+    // 次数上限先于检索判断：它的目的是「这个会话别再为首触花钱」，与有没有命中无关。
+    const pushed = firstContactPushed.get(sessionId) ?? 0
+    if (pushed >= settings.firstContactAdvisoryMax) return undefined
     const seen = advisorySeen.get(sessionId) ?? new Set<string>()
     if (seen.size >= settings.techniqueAdvisoryMax) return undefined
     const liveTurn = current?.turns.at(-1)?.turn
@@ -1851,6 +2070,7 @@ export function apply(ctx: Context, config: Config): void {
     const label = top.label.slice(0, 120)
     seen.add(top.id)
     advisorySeen.set(sessionId, seen)
+    firstContactPushed.set(sessionId, pushed + 1)
     noteSurfaced([top.id])
     if (liveTurn !== undefined) advisoryLastTurn.set(sessionId, liveTurn)
     logger.debug(`memory: first-contact advisory → ${top.id.slice(0, 11)}`)
@@ -1961,11 +2181,43 @@ export function apply(ctx: Context, config: Config): void {
     }
     // L1：这一块推给本会话的技巧记下来，供引用检测用。
     noteSurfaced(kept.filter(hit => hit.layer === 'technique').map(hit => hit.id))
+    // ②a：常驻规则的全文/紧凑切换。全文的时机有四个：从没见过、规则集变了（增删改都会换签名）、
+    // **同一轮内重复渲染**（宿主的 `text()` 是惰性回调，一轮里可能被调多次，同一轮必须给同一个
+    // 形态，否则同一份上下文里出现两种写法）、以及距上次全文已过 `standingRuleFullEveryTurns` 轮。
+    const standingSignature = standing.map(doc => doc.id).join(',')
+    const standingSession = current?.sessionId
+    const standingTurn = current?.turns.at(-1)?.turn
+    const shownBefore = standingSession === undefined ? undefined : standingFullShown.get(standingSession)
+    const fullEvery = settings.standingRuleFullEveryTurns
+    const showFullStanding = shownBefore === undefined
+      || shownBefore.signature !== standingSignature
+      || (standingTurn !== undefined && shownBefore.turn === standingTurn)
+      || (fullEvery > 0 && standingTurn !== undefined && shownBefore.turn !== undefined
+        && standingTurn - shownBefore.turn >= fullEvery)
     const lines = kept.map((hit, index) => {
       const kind = recallLabel(hit.layer, hit.meta?.kind)
       // 逐条整形（去掉与正文重复的标题 + 封顶）：整块预算再砍尾巴时，至少不会出现半截条目。
-      return `${index + 1}. (${kind}) ${sanitizeForInjection(compactEntryText(hit.text))}`
+      // 常驻规则在非全文轮改走紧凑形态 —— 它保的仍是「一句可执行的话」，不是标题。
+      //
+      // ②c：**技巧层在召回段里也只给索引行**（名称 / 状态 / 做法要点 / 触发条件 / id），与技巧段
+      // 同构，不再把 400 字符的正文再印一遍。依据是实测：召回段里 569 条技巧条目平均 391 字符
+      // （基本顶到 `RECALL_ENTRY_CHARS`），而技巧段对同一条只花约 180 字符 —— 同一类知识两条通道
+      // 两种颗粒度，既不一致，又让技巧条目吃掉召回段 11.7% 的块成本。正文统一交给 `technique_get`。
+      // 注意这**不是**把技巧从召回段删掉：技巧段只放得下 `techniqueLimit` 条，第 4 条起仍由召回段
+      // 呈现（否则它们会彻底消失，见 DEF-29），只是改用同一个索引行形态。
+      const record = hit.layer === 'technique' ? techniqueById.get(hit.id) : undefined
+      const body = record !== undefined
+        ? techniqueInjectionLine(record)
+        : standingIds.has(hit.id) && !showFullStanding
+          ? compactStandingText(hit.text)
+          : compactEntryText(hit.text)
+      return `${index + 1}. (${kind}) ${sanitizeForInjection(body)}`
     })
+    // 状态只在**常驻行确实进入这一块**之后推进：`renderInjection` 有两条早退，且块可能被预算
+    // 裁到只剩常驻之前的部分 —— 先推进会把规则标记成「已全文」，之后再也不会展示全文。
+    if (standingSession !== undefined && standing.length > 0 && showFullStanding) {
+      standingFullShown.set(standingSession, { signature: standingSignature, turn: standingTurn })
+    }
     // 常驻规则与「本轮相关」的条目在同一个块里，必须让模型分清语气差别，否则它会把
     // 一条与本轮无关的偏好当成跑题的噪声而忽略掉。
     return renderBlock(RECALL_BLOCK, standing.length === 0 ? [] : STANDING_RULE_NOTICE, lines, settings.recallChars)
@@ -2139,7 +2391,7 @@ export function apply(ctx: Context, config: Config): void {
     const example = input.example === undefined
       ? base?.example
       : { language: input.exampleLanguage ?? 'text', kind: 'usage' as const, code: input.example }
-    const domain = input.domain ?? base?.domain
+    const domain = normalizeDomain(input.domain ?? base?.domain)
     const draft: TechniqueDraft = {
       kind: input.kind ?? base?.kind ?? 'procedure',
       name: (input.name ?? base?.name ?? '').trim(),
@@ -2196,6 +2448,16 @@ export function apply(ctx: Context, config: Config): void {
     ...(record.verifications === undefined ? {} : { verifications: record.verifications }),
     ...(record.lastVerifiedAt === undefined ? {} : { lastVerifiedAt: record.lastVerifiedAt }),
     ...(record.conflictsWith === undefined ? {} : { conflictsWith: record.conflictsWith }),
+    // 遥测字段同样**必须沿用**（0.2.10 修）：这张白名单以前漏了 `retrieveCount` / `referenced`，
+    // 于是一次「改措辞」就把「这条被检索过/被引用过」的记录清零 —— 归档判据正是读这两个字段，
+    // 被清零的活卡会被误判成死重归档掉。
+    ...(record.retrieveCount === undefined ? {} : { retrieveCount: record.retrieveCount }),
+    ...(record.lastRetrievedAt === undefined ? {} : { lastRetrievedAt: record.lastRetrievedAt }),
+    ...(record.referenced === undefined ? {} : { referenced: record.referenced }),
+    ...(record.lastReferencedAt === undefined ? {} : { lastReferencedAt: record.lastReferencedAt }),
+    // 归档位也沿用：`technique_save(id=…)` 是改内容，不该顺手把归档状态翻掉。
+    // 要复活一条归档卡，靠的是 `technique_apply` 成功（见 `applyOutcome`）。
+    ...(record.archivedAt === undefined ? {} : { archivedAt: record.archivedAt }),
     kind: draft.kind,
     name: draft.name.trim(),
     ...(draft.gist === undefined || draft.gist.trim().length === 0 ? {} : { gist: draft.gist.trim() }),
@@ -2517,8 +2779,10 @@ export function apply(ctx: Context, config: Config): void {
   const knownDomainsForMining = (limit = 24): string[] => {
     const counts = new Map<string, number>()
     for (const record of techniqueById.values()) {
-      const domain = record.domain?.trim()
-      if (domain === undefined || domain.length === 0) continue
+      // 归一化后再计数：迁移之前落盘的旧写法（`PlantUML`）也要与写入侧同口径，
+      // 否则「同一领域两种写法」会继续被当成两个词喂给模型。
+      const domain = normalizeDomain(record.domain)
+      if (domain === undefined) continue
       counts.set(domain, (counts.get(domain) ?? 0) + 1)
     }
     return [...counts.entries()]
@@ -2836,6 +3100,10 @@ export function apply(ctx: Context, config: Config): void {
         .map(doc => techniqueById.get(doc.id))
         .filter((record): record is TechniqueRecord => record !== undefined)
       const verified = techniques.filter(injectable).length
+      // 归档卡既不算 verified 也不算 draft：它们是第三类状态。以前那行算术
+      // （`length - verified`）会把归档的**已验证**卡算成草稿，读起来像库在退化。
+      const archived = techniques.filter(record => record.archivedAt !== undefined).length
+      const drafts = techniques.filter(record => record.status === 'draft' && record.archivedAt === undefined).length
       return [
         `Memory root: ${settings.dir}`,
         `Layer scopes: episodic=${settings.scopeEpisodic}, semantic=${settings.scopeSemantic}, technique=${settings.scopeTechnique}, failure=${settings.scopeFailure} (partition ${settings.partition})`,
@@ -2845,7 +3113,8 @@ export function apply(ctx: Context, config: Config): void {
           + ` → plugin message source kind '${PLUGIN_MESSAGE_SOURCE.kind}'`,
         `Episodic summaries: ${episodic} (this project) · ${episodicTotal} (all projects)`,
         `Semantic facts: ${semantic}${superseded === 0 ? '' : ` (${superseded} superseded, not injected)`}`,
-        `Techniques: ${verified} verified, ${techniques.length - verified} draft`,
+        `Techniques: ${verified} verified, ${drafts} draft`
+          + (archived === 0 ? '' : `, ${archived} archived (excluded from injection, still searchable)`),
         // M2：采用率与「检索过但未采用」——冷启动问题必须能被看见，否则任何"让模型更主动"的
         // 改动都无法判断是否有效。没有 retrieveCount 的历史记录按「从未被显式检索」计。
         (() => {
@@ -2977,13 +3246,15 @@ export function apply(ctx: Context, config: Config): void {
    * 或索引读取出错都走这条路。回退是**静默且自动**的，因为检索可用性不该依赖可选后端。
    *
    * @param includeDrafts - 是否包含草稿（工具显式检索时为 true）。
+   * @param includeArchived - 是否包含已归档的技巧（默认 false：注入通道必须先排除死重）。
    * @returns 打分器函数。
    */
-  const indexScorer = (includeDrafts: boolean): TechniqueScorer => (query, limit) => {
+  const indexScorer = (includeDrafts: boolean, includeArchived = false): TechniqueScorer => (query, limit) => {
     if (techniqueIndex === undefined) return undefined
     try {
       return techniqueIndex.search(query, limit, {
         includeDrafts,
+        includeArchived,
         partition: settings.partition,
         ...(current?.stack === undefined ? {} : { stack: current.stack }),
       })
@@ -2994,7 +3265,7 @@ export function apply(ctx: Context, config: Config): void {
 
   /** 技巧工具行为实现。 */
   const techniqueDeps = (): TechniqueToolDeps => ({
-    async search(query, limit, includeDrafts, verbose) {
+    async search(query, limit, includeDrafts, verbose, includeArchived = true) {
       if (current !== undefined) consultedSessions.add(current.sessionId)
       const cwd = current?.cwd
       await refresh(cwd)
@@ -3009,6 +3280,9 @@ export function apply(ctx: Context, config: Config): void {
         partition: settings.partition,
         symbols: symbolsInText(query),
         extra: extras,
+        // 显式检索默认**看得见归档卡**（它们是「退出竞争」，不是「删掉」）——
+        // 这正是归档相对删除的价值：错归档可逆，而且模型能靠 id 重新展开它。
+        includeArchived,
       }
       // 0.2.8：默认只看已验证时，若**库里的最佳答案其实是草稿**，就在同一次响应里把它带回来。
       //
@@ -3025,11 +3299,15 @@ export function apply(ctx: Context, config: Config): void {
         ...recallOptions,
         limit: scanLimit,
         includeDrafts: true,
-        scorer: indexScorer(true),
+        scorer: indexScorer(true, includeArchived),
       })
       const verifiedOnly = includeDrafts
         ? []
-        : recallFacets(query, docs, { ...recallOptions, includeDrafts: false, scorer: indexScorer(false) })
+        : recallFacets(query, docs, {
+          ...recallOptions,
+          includeDrafts: false,
+          scorer: indexScorer(false, includeArchived),
+        })
       const isDraftHit = (hit: { id: string }): boolean => techniqueById.get(hit.id)?.status === 'draft'
       const bestDraft = draftInclusive.find(isDraftHit)
       const bestVerified = draftInclusive.find(hit => !isDraftHit(hit))
@@ -3447,6 +3725,8 @@ export function apply(ctx: Context, config: Config): void {
           failuresBySession.delete(id)
           advisorySeen.delete(id)
           advisoryLastTurn.delete(id)
+          firstContactPushed.delete(id)
+          standingFullShown.delete(id)
           retrievedBySession.delete(id)
           consultedSessions.delete(id)
           if (state.turns.length > 0) logger.debug(`memory: session ${id} distilled`)
@@ -3670,6 +3950,7 @@ function resolveSettings(config: Config): Settings {
     techniquePromptOrder: config.techniquePromptOrder ?? 260,
     injectMinMatched: config.injectMinMatched ?? 2,
     injectStandingRules: config.injectStandingRules ?? 4,
+    standingRuleFullEveryTurns: config.standingRuleFullEveryTurns ?? 10,
     injectMinScore: config.injectMinScore ?? 0,
     injectionGate: {
       minMatched: config.injectMinMatched ?? 2,
@@ -3686,6 +3967,11 @@ function resolveSettings(config: Config): Settings {
     techniqueAdvisoryDrafts: config.techniqueAdvisoryDrafts ?? true,
     techniqueAdvisoryMax: config.techniqueAdvisoryMax ?? 12,
     firstContactAdvisory: config.firstContactAdvisory ?? true,
+    firstContactAdvisoryMax: config.firstContactAdvisoryMax ?? 1,
+    techniqueMaintenance: config.techniqueMaintenance ?? true,
+    archiveAfterDays: config.archiveAfterDays ?? 14,
+    archiveKeepDomains: config.archiveKeepDomains ?? ['dsh-', 'sdo'],
+    maxActiveDraftsPerDomain: config.maxActiveDraftsPerDomain ?? 150,
     exampleMaxLines: config.exampleMaxLines ?? 8,
     exampleMaxChars: config.exampleMaxChars ?? 480,
     allowConfidentialGlobal: config.allowConfidentialGlobal ?? false,

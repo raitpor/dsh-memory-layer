@@ -64,6 +64,11 @@ const CORPUS: TechniqueRecord[] = [
   tech('tq_other', 'Kotlin 项目的技巧', '在 kotlin 项目里', '语言不匹配就该被过滤。', {
     stack: { languages: ['kotlin'] },
   }),
+  // 归档卡（0.2.10）：status 仍是 validated，但 archivedAt 有值 —— 自动注入与默认检索必须排除。
+  // 这条卡专门防「归档过滤只落在内存路径」：SQL 少一句 `archived = '0'`，它就会从 FTS 通道漏回注入。
+  tech('tq_archived', '已归档的已验证技巧', '死重退役后', '归档卡退出竞争但仍可显式检索。', {
+    archivedAt: 1_700_000_000_001,
+  }),
 ]
 
 /** 每个用例一个临时索引文件。 */
@@ -109,6 +114,12 @@ test('SQLite 索引：状态 / 分区 / 语言三档过滤与内存路径同口�
 
     const wrongPartition = index.search('DiscountCalculator', 5, { stack: JAVA, partition: 'other' })
     assert.ok(!(wrongPartition ?? []).includes('tq_discount'), '分区不同不得串味')
+
+    // 归档（0.2.10）：默认排除，显式开启才可见 —— 与内存路径 `includeArchived` 同口径。
+    const defaultHits = index.search('归档', 20, { includeDrafts: true, stack: JAVA }) ?? []
+    assert.ok(!defaultHits.includes('tq_archived'), '默认不得返回归档卡（否则归档卡会绕进注入）')
+    const withArchived = index.search('归档', 20, { includeDrafts: true, includeArchived: true, stack: JAVA }) ?? []
+    assert.ok(withArchived.includes('tq_archived'), '显式检索时归档卡必须可见（归档是可逆的）')
   })
 })
 

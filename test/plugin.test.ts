@@ -1242,6 +1242,12 @@ test('召回与检索按层打标签：技巧不得被标成 episodic', async ()
     assert.match(injected, /\(technique\)/u, `召回段应标 technique：${injected}`)
     assert.match(injected, new RegExp(onlyInRecall[0]!.name, 'u'),
       `不在技巧段里的那条仍应由召回段呈现：${injected}`)
+    // ②c（0.2.10）：召回段呈现技巧时用**与技巧段同构的索引行**（含 id 句柄），不再印 400 字符正文。
+    // 依据：实测召回段里 569 条技巧条目平均 391 字符（顶到 `RECALL_ENTRY_CHARS`），而技巧段同一条
+    // 只花约 180 字符 —— 同一类知识两条通道两种颗粒度。正文统一交给 `technique_get`。
+    assert.match(injected, /— id tq_[0-9a-f]{8}/u,
+      `召回段的技巧条目也要给 id 句柄：${injected}`)
+    assert.match(injected, /做法:/u, `索引行要带做法要点：${injected}`)
 
     const found = String(await toolOf(fake, 'memory_search').execute(
       { query: 'authorize', scope: 'all' } as never, undefined as never,
@@ -2617,6 +2623,110 @@ test('技巧草稿不得经记忆召回段注入（DEF-12）', async () => {
   }
 })
 
+test('死重维护（0.2.10）：归档落盘、退出注入，但检索默认仍可见', async () => {
+  // 动机：251/459 条卡「从未被显式检索 + 从未被引用 + 从未成功」，全部是草稿 —— 它们进不了注入，
+  // 却把检索语料、领域词表与统计口径搅浑。删掉不可逆，所以改成**归档**：退出竞争，但仍可检索。
+  //
+  // `archiveAfterDays: 0` = 不等年龄。真库默认 14 天（最老记录才 8.5 天，所以今天一条都不归档），
+  // 这里把年龄闸门关掉，测的是**机制**：能不能识别死重、写盘、并在两条通道上表现不同。
+  const { fake, root, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    distillOnTurnEnd: false,
+    archiveAfterDays: 0,
+  })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat 归档样本',
+      when: '没人查它的时候',
+      summary: 'Zqblat 归档样本的正文。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    const short = id.slice(0, 8)
+
+    const s = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', s)
+    await fake.flush()
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', s, userMessage('Zqblat 归档样本怎么用'))
+    await fake.flush()
+
+    // 检索会先 `refresh` → 维护在这一次里跑：它必须真的写进真源。
+    const visible = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'Zqblat 归档样本' } as never, undefined as never,
+    ))
+    assert.match(visible, new RegExp(short), `归档卡必须仍可检索（归档是可逆的）：${visible}`)
+    const persisted = await new MemoryStore(root).readTechniques('global')
+    const record = persisted.find(item => item.id === id)
+    assert.ok(record !== undefined, '记录应已落盘')
+    assert.equal(typeof record.archivedAt, 'number', '维护必须把归档时间写进真源')
+
+    // 注入通道必须排除它（本用例里它还是草稿，另有一组单测覆盖「已验证但已归档」的情形）。
+    assert.doesNotMatch(sectionText(fake, 'memory-layer:techniques'), /Zqblat 归档样本/u, '归档卡不得注入')
+    assert.doesNotMatch(sectionText(fake, 'memory-layer:recall'), /Zqblat 归档样本/u, '归档卡不得经召回段注入')
+
+    // 显式关闭时看不见 —— 这是 `includeArchived` 的判别点。
+    const hidden = String(await toolOf(fake, 'technique_search').execute(
+      { query: 'Zqblat 归档样本', includeArchived: false } as never, undefined as never,
+    ))
+    assert.doesNotMatch(hidden, new RegExp(short), `includeArchived:false 应隐藏归档卡：${hidden}`)
+
+    // 归档必须有声音：否则「库怎么突然少了一半」只能靠考古。
+    const stats = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+    assert.match(stats, /1 archived/u, `memory_stats 必须报出归档条数：${stats}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('死重维护（0.2.10）：单领域活跃草稿上限把最老且没用过的先归档，豁免领域不参与', async () => {
+  // ③c 的动机是「防再生」：归档只清一次存量，而挖掘/反思仍在按同样速度产出新草稿
+  // （实测约 +14 条/4 小时）。所以另加一道**按领域**的护栏。
+  // 这里把年龄判据放到 3650 天（等于关掉），单独测上限这一条。
+  const { fake, root, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    distillOnTurnEnd: false,
+    archiveAfterDays: 3650,
+    maxActiveDraftsPerDomain: 2,
+  })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const save = async (name: string, domain: string): Promise<void> => {
+      await toolOf(fake, 'technique_save').execute({
+        name, when: `遇到 ${name} 时`, summary: `${name} 的正文。`, kind: 'procedure', domain,
+      } as never, undefined as never)
+      // 跨过同一个毫秒：`isArchivable` 的淘汰排序是「最老的先出局」，时间打平就变成赌 Map 顺序。
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    await save('Zqblat 领域样本 1', 'zqblat-domain')
+    await save('Zqblat 领域样本 2', 'zqblat-domain')
+    await save('Zqblat 领域样本 3', 'zqblat-domain')
+    // 豁免领域（`dsh-` 前缀）不参与计数：3 条也不该被归档。
+    await save('Zqblat 豁免样本 1', 'dsh-sample')
+    await save('Zqblat 豁免样本 2', 'dsh-sample')
+    await save('Zqblat 豁免样本 3', 'dsh-sample')
+
+    // 检索会先 `refresh` → 维护在这一步收敛。
+    await toolOf(fake, 'technique_search').execute({ query: 'Zqblat' } as never, undefined as never)
+    const records = await new MemoryStore(root).readTechniques('global')
+    const capped = records.filter(record => record.domain === 'zqblat-domain')
+    const evicted = capped.filter(record => record.archivedAt !== undefined)
+    assert.equal(capped.length, 3, '上限只归档，不删卡')
+    assert.equal(evicted.length, 1, `3 条 / 上限 2 应淘汰 1 条：${JSON.stringify(capped.map(r => r.name))}`)
+    assert.equal(evicted[0]?.name, 'Zqblat 领域样本 1', '淘汰的必须是最老的那条')
+    const exempt = records.filter(record => record.domain === 'dsh-sample')
+    assert.equal(exempt.filter(record => record.archivedAt !== undefined).length, 0, '豁免领域不参与上限')
+  } finally {
+    await dispose()
+  }
+})
+
 test('technique_learn 从真实代码库挖掘并落盘为草稿，且不泄露项目路径', async () => {
   const repo = await mkdtemp(join(tmpdir(), 'dsh-mine-repo-'))
   try {
@@ -3925,6 +4035,47 @@ test('常驻规则：不相关的轮次也注入长期偏好与约束', async ()
   }
 })
 
+test('常驻规则（0.2.10）：首轮全文、后续紧凑，规则集变化时重发全文', async () => {
+  // 动机：常驻规则是召回段里**唯一每轮必然重复**的部分 —— 实测 5522 次条目出现里只有 425 条
+  // 不同（92% 重复），而 preference/constraint 正文中位数 57 字符。规则集不变就没必要每轮重印。
+  // `standingRuleFullEveryTurns: 0` 关掉「每 N 轮重发一次」的保险，于是能单独测出切换逻辑。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, standingRuleFullEveryTurns: 0 })
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    await toolOf(fake, 'memory_save').execute({
+      text: '用户偏好：提交前必须跑完整门禁并把结果贴出来；'
+        + '如果门禁还没跑完，就不要讨论提交，也不要替用户打 tag，因为 CI 会因为 tag 触发发布流程。',
+      kind: 'preference',
+    } as never, undefined as never)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('写一个正则解析时间戳'))
+    const first = sectionText(fake, 'memory-layer:recall')
+    assert.match(first, /触发发布流程/u, '首轮必须是全文（含第一句之后的限定语）')
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('再写一个正则解析时间戳'))
+    const second = sectionText(fake, 'memory-layer:recall')
+    assert.match(second, /提交前必须跑完整门禁/u, '紧凑形态必须留下可执行的第一句')
+    assert.doesNotMatch(second, /触发发布流程/u, '规则集没变时不该再印全文')
+    assert.match(second, /STANDING RULES/u, '紧凑形态同样是常驻规则，说明行不能少')
+
+    // 规则集变化 → 重发全文。否则新加入的规则永远只有旧规则的紧凑形态可参照。
+    await toolOf(fake, 'memory_save').execute({
+      text: '用户偏好：交付文档用中文。', kind: 'preference',
+    } as never, undefined as never)
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    fake.emit('session/event', session, userMessage('继续写正则解析时间戳'))
+    const third = sectionText(fake, 'memory-layer:recall')
+    assert.match(third, /触发发布流程/u, '规则集变化后必须重发一次全文')
+    assert.match(third, /交付文档用中文/u, '新规则首轮也要有全文')
+  } finally {
+    await dispose()
+  }
+})
+
 test('常驻规则只限偏好与约束：不相关的事实与决定不得注入', async () => {
   // 事实/决定是「关于某件事的陈述」，只在相关时才有价值 —— 否则召回段会重新变成
   // 「把库里所有东西倒进上下文」，这正是本轮要治的病。
@@ -4216,10 +4367,11 @@ test('顾问证据词（0.2.8）：状态枚举、目录名、年份都不得当
     fake.emit('session/created', seed)
     await fake.flush()
     // 卡片正文故意带上这四个词：旧规则下它们正是被伪证据命中的东西。
+    // 末尾的 `enchantment` 是反例锚点：它既不在噪声表里，也不低于 0.2.10 的长度下限。
     const saved = String(await toolOf(fake, 'technique_save').execute({
       name: '阶段名与目录名样本',
       when: '进度条渲染时',
-      summary: '展示 in progress 进度、design 目录约定、software 归属与 2026 版本号。',
+      summary: '展示 in progress 进度、design 目录约定、software 归属与 2026 版本号，附魔表走 enchantment 注册。',
       kind: 'procedure',
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
@@ -4246,12 +4398,63 @@ test('顾问证据词（0.2.8）：状态枚举、目录名、年份都不得当
     )
     assert.equal(advisoryOf(pathNoise), '', '目录名与年份不得当证据')
     // 3) 反例：文件名里的标识符仍然必须命中 —— 收紧不能把真证据一起收掉。
-    //    `ProgressBar.md` 切出 `progress`，与卡片正文命中（这不是伪证据，是真的在动相关代码）。
+    //    `EnchantmentBar.java` 切出 `enchantment`，与卡片正文命中（这不是伪证据，是真的在动相关代码）。
+    //    0.2.10 起 `ProgressBar.md` 不再命中：`progress` 已被列为项目名片段（见下一条用例）。
     const real = await fake.postExecute(
-      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/ProgressBar.md' }) },
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/main/java/EnchantmentBar.java' }) },
       { isError: false },
     )
     assert.match(advisoryOf(real), /Knowledge library advisory/u, '文件名里的标识符必须仍然命中')
+  } finally {
+    await dispose()
+  }
+})
+
+test('顾问证据词（0.2.10）：4 字符拉丁词与项目名片段不得当证据', async () => {
+  // 实测动机：`AsterChat` / `hotelSystem` 这类**产品名**切出的 `chat` / `system` 出现在请求与
+  // 路径里，把无关技巧推给会话（首触顾问跑题的来源）。有效命中的短词（`token`）正好 5 个字符，
+  // 所以下限取 5：既能挡住项目名片段，又不误伤真证据。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: '证据词下限样本',
+      when: '渲染采样窗口时',
+      summary: '采样窗口处理 node token，并区分 chat system progress 这类项目名片段。',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+
+    // 1) 4 字符拉丁词（`node`）是唯一交集 → 不提：长度下限必须真的生效。
+    const shortOnly = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/NodeRunner.java' }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(shortOnly), '', '4 字符拉丁词不得单独构成证据')
+    // 2) 项目名片段：`chat` 靠长度下限挡住、`system`/`progress` 靠停用词挡住（唯一交集时不提）。
+    const projectName = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/components/AsterChatPanel.tsx' }) },
+      { isError: false },
+    )
+    assert.equal(advisoryOf(projectName), '', '项目名片段不得构成证据')
+    // 3) 反例：5 字符的 `token` 仍然命中 —— 下限不能把有效短词一起收掉。
+    const real = await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/TokenRunner.java' }) },
+      { isError: false },
+    )
+    assert.match(advisoryOf(real), /Knowledge library advisory/u, '5 字符标识符必须仍然命中')
+    assert.match(advisoryOf(real), /matched token/u, `命中依据应报出 token：${advisoryOf(real)}`)
   } finally {
     await dispose()
   }
@@ -4717,6 +4920,57 @@ test('首触顾问：未检索的会话在动作点收到最相关的一条（�
     assert.doesNotMatch(advisoryOf(after), /还没查过知识库/u, '查过库之后不该再推首触顾问')
   } finally {
     await dispose()
+  }
+})
+
+test('首触顾问每会话上限（0.2.10）：默认 1 条，可配到 N 条，之后闭嘴', async () => {
+  // 实测动机：首触只在「本会话还没查过库」时退场，而 49 个会话里只有 18 个查过库 —— 其余 31 个
+  // **每轮各收一条**（主 sdo 会话 89 条），首触因此占了顾问总量的 62%（179 条 / 26,367 字符）。
+  // 这里用「每次换一个不同的关键词（= 不同命中、不同 id）」把去重与轮节流都绕开，
+  // 于是能测到的只剩**每会话次数上限**这一条约束。
+  const markers = ['沙箱', '堡垒', '闸门', '砧板'] as const
+  const cases: { label: string; max?: number; expected: number }[] = [
+    { label: '默认', expected: 1 },
+    { label: '配置 2', max: 2, expected: 2 },
+  ]
+  for (const item of cases) {
+    const { fake, dispose } = await setup({
+      reflectOnSessionEnd: false,
+      distillOnTurnEnd: false,
+      ...(item.max === undefined ? {} : { firstContactAdvisoryMax: item.max }),
+    })
+    try {
+      const seed = fakeSession('seed', '/work/demo')
+      fake.emit('session/created', seed)
+      await fake.flush()
+      // 每个关键词单独一条卡：命中不同 id，所以「同一条只推一次」不会掩盖次数上限。
+      for (const marker of markers) {
+        await toolOf(fake, 'technique_save').execute({
+          name: `${marker}相关的技巧样本`,
+          when: `遇到${marker}时`,
+          summary: `${marker}相关的处理办法。`,
+          kind: 'procedure',
+        } as never, undefined as never)
+      }
+      const session = fakeSession('first-contact-cap', '/work/demo')
+      fake.emit('session/created', session)
+      await fake.flush()
+      let pushed = 0
+      for (const [index, marker] of markers.entries()) {
+        fake.emit('session/event', session, event('turn/start', { turn: index + 1 }))
+        fake.emit('session/event', session, userMessage(`请问${marker}问题`))
+        await fake.flush()
+        // 动作本身没有强证据（只有一条无害的 ls），所以命中的只能是首触通道。
+        const text = advisoryOf(await fake.postExecute(
+          { name: 'bash', arguments: JSON.stringify({ command: 'ls' }) },
+          { isError: false },
+        ))
+        if (text.length > 0) pushed += 1
+      }
+      assert.equal(pushed, item.expected, `${item.label}：每会话最多 ${item.expected} 条首触顾问，实际 ${pushed}`)
+    } finally {
+      await dispose()
+    }
   }
 })
 

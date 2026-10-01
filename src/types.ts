@@ -454,6 +454,15 @@ export interface TechniqueRecord {
   retrieveCount?: number
   /** 最近一次被显式检索的时间（Unix 毫秒）。 */
   lastRetrievedAt?: number
+  /**
+   * **归档时间**（Unix 毫秒）；未归档为 `undefined`。
+   *
+   * 归档解决的是「死重」而不是「错误」：库里大量草稿从未被显式检索、从未被引用、从未成功过，
+   * 它们既进不了注入（草稿默认不注入），又把检索语料、领域词表与统计口径搅浑。删掉不可逆，
+   * 而它们在某些任务上仍是资产（真库实测 459 条里有 174 条满足判据，其中相当一部分是 PlantUML），
+   * 所以选择**可逆的归档**：退出自动注入与排序，但 `technique_search` 仍然看得到。
+   */
+  archivedAt?: number
   /** 产出途径。 */
   provenance: 'model' | 'rule' | 'human'
 }
@@ -470,6 +479,13 @@ export interface RecallMeta {
   superseded?: boolean
   /** 技巧专用：信任状态。 */
   status?: TechniqueStatus
+  /**
+   * 技巧专用：这条已被**归档**（见 {@link TechniqueRecord.archivedAt}）。
+   *
+   * 自动注入与排序跳过它，显式检索（`technique_search` / `technique_get` / `memory_search`）
+   * 仍然看得到 —— 归档是「退出竞争」而不是「删除」。
+   */
+  archived?: boolean
   /** 技巧专用：敏感级别。 */
   sensitivity?: Sensitivity
   /** 技巧专用：分区。 */

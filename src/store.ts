@@ -183,6 +183,41 @@ export function techniqueKey(name: string, when: string, domain?: string): strin
   return semanticKey([name, when, domain ?? ''].join(' '))
 }
 
+/**
+ * 领域名表的**别名**：写法不同、指的是同一件事的领域归到一起。
+ *
+ * 为什么需要它（实测）：库里同一个领域曾同时存在 `PlantUML`(84) 与 `plantuml`(60) 两种写法，
+ * 于 141 个不同领域名里凭空多出一份重复 —— 它会顺着 `knownDomainsForMining` 喂回模型，
+ * 让模型继续在两个写法之间随机选，统计口径也跟着分裂。大小写折叠解决一半，别名表解决另一半。
+ *
+ * ⚠️ 加条目之前必须确认不会撞键：`techniqueKey` 用的就是这个归一化后的领域，两条本来不同的
+ * 记录归一化后同名同触发条件时，下一次 `upsertTechniques` 只会留下其中一条。因此这里**只收
+ * 明确的同义写法**，不收粒度不同的领域（如 `minecraft-modding` 与 `minecraft-forge-modding`）。
+ */
+const DOMAIN_ALIASES: ReadonlyMap<string, string> = new Map([
+  ['plant-uml', 'plantuml'],
+  ['plantuml-diagram', 'plantuml'],
+  ['puml', 'plantuml'],
+])
+
+/**
+ * 归一化业务领域名：去首尾空白、内部空白压成一个空格、转小写，再查 {@link DOMAIN_ALIASES}。
+ *
+ * 大小写折叠对**合并行为**是零风险的：`techniqueKey` 走的 `semanticKey` 早就转了小写，
+ * `PlantUML` 与 `plantuml` 本来就是同一个身份。它修的是**展示与词表**：`knownDomainsForMining`
+ * 把领域名喂给模型，两种写法会让模型继续分裂出新的写法。
+ *
+ * @param value - 原始领域名（可能为空/未定义）。
+ * @returns 归一化后的领域名；输入为空时 `undefined`（保持「没有领域」与「领域为空串」等价）。
+ */
+export function normalizeDomain(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const folded = value.trim().replace(/\s+/gu, ' ').toLowerCase()
+  if (folded.length === 0) return undefined
+  // 48 与产生侧的 `clip(record.domain, 48)` 同口径：迁移不制造比写入更长的值。
+  return (DOMAIN_ALIASES.get(folded) ?? folded).slice(0, 48)
+}
+
 /** 把一个字符串压成文件系统安全的短 slug，用于项目目录命名。 */export function slugify(input: string): string {
   const ascii = input
     .toLowerCase()

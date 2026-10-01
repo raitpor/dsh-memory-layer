@@ -21,6 +21,8 @@ import {
   semanticKey,
   slugify,
   scopeDirName,
+  normalizeDomain,
+  techniqueKey,
 } from '../src/store.js'
 import { createCodec } from '../src/crypto.js'
 import type { EpisodicRecord, TechniqueDraft } from '../src/types.js'
@@ -460,4 +462,21 @@ test('updateTechniques：一批更新合并成一次写入', async () => {
     assert.equal(await store.updateTechniques([ghost, { ...before[1]!, name: 'again' }]), 1, '未知 id 跳过')
     assert.equal((await store.readTechniques('global')).find(r => r.id === before[1]!.id)?.name, 'again')
   })
+})
+
+test('normalizeDomain（0.2.10）：折叠大小写与空白、查别名表、空值即「无领域」', () => {
+  // 动机（实测）：真库里 141 个领域名中，`PlantUML`(84) 与 `plantuml`(60) 是同一个词的两半 ——
+  // 它会顺着 knownDomainsForMining 喂回模型，让模型继续在两个写法之间随机选。
+  assert.equal(normalizeDomain('PlantUML'), 'plantuml')
+  assert.equal(normalizeDomain('  minecraft-modding  '), 'minecraft-modding')
+  assert.equal(normalizeDomain('SDO   门禁'), 'sdo 门禁', '内部空白压成一个空格')
+  assert.equal(normalizeDomain('puml'), 'plantuml', '别名表把同义写法归到一起')
+  assert.equal(normalizeDomain('plantuml-diagram'), 'plantuml')
+  // 空与空白等价于「没有领域」：返回 undefined 而不是空串，写入侧据此省略该字段。
+  assert.equal(normalizeDomain(undefined), undefined)
+  assert.equal(normalizeDomain('   '), undefined)
+  // 与产生侧 clip(48) 同口径：迁移不制造比写入更长的值。
+  assert.equal(normalizeDomain('x'.repeat(80))?.length, 48)
+  // 大小写折叠对**合并身份**是零风险的：techniqueKey 一直就转小写。
+  assert.equal(techniqueKey('n', 'w', 'PlantUML'), techniqueKey('n', 'w', 'plantuml'))
 })

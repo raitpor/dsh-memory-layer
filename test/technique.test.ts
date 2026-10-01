@@ -31,6 +31,7 @@ import {
   mentionsNeedle,
   referenceNeedles,
   injectable,
+  isArchivable,
   promotedStatus,
   resolveTechniqueId,
   shortTechniqueId,
@@ -450,6 +451,54 @@ test('调用面索引与索引行', () => {
   assert.equal(injectable(withApi), true)
   assert.equal(injectable(record({ status: 'draft' })), false)
   assert.equal(injectable(record({ status: 'deprecated' })), false)
+  // 归档是**独立的否决位**：status 仍是 validated 也不许注入（0.2.10）。
+  assert.equal(injectable(record({ status: 'validated', archivedAt: 1 })), false, '归档卡不得注入')
+})
+
+test('归档判据（0.2.10）：只有「从未检索/引用/成功」的旧草稿才是死重', () => {
+  const now = 2_000_000_000_000
+  const day = 24 * 60 * 60 * 1000
+  const old = now - 30 * day
+  const options = { afterDays: 14, keepDomains: ['dsh-', 'sdo'] }
+  const dead = record({ ts: old, status: 'draft' })
+
+  // 基线：正是一条典型的死重（旧草稿、四类使用信号全为零）。
+  assert.equal(isArchivable(dead, now, options), true)
+
+  // 使用信号各自都能把卡从死亡线上拉回来。
+  assert.equal(isArchivable(record({ ...dead, retrieveCount: 1 }), now, options), false, '被检索过就不是死重')
+  assert.equal(isArchivable(record({ ...dead, referenced: 1 }), now, options), false, '被引用过就不是死重')
+  assert.equal(isArchivable(record({ ...dead, successes: 1 }), now, options), false, '成功过就不是死重')
+  assert.equal(isArchivable(record({ ...dead, status: 'validated' }), now, options), false, '已验证卡绝不动')
+
+  // 两道豁免：踩坑知识（价值不在「被检索」）与活跃领域。
+  assert.equal(isArchivable(record({ ...dead, kind: 'pitfall' }), now, options), false, 'pitfall 卡不归档')
+  assert.equal(isArchivable(record({ ...dead, domain: 'dsh-plugin' }), now, options), false, '活跃领域前缀豁免')
+  assert.equal(isArchivable(record({ ...dead, domain: 'SDO' }), now, options), false, '豁免匹配忽略大小写')
+
+  // 年龄门槛：太年轻的不动（年轻库里「还没人查」说明不了什么）；`0` = 不等年龄。
+  assert.equal(isArchivable(record({ ...dead, ts: now - 3 * day }), now, options), false, '未到年龄不动')
+  assert.equal(isArchivable(record({ ...dead, ts: now - 3 * day }), now, { ...options, afterDays: 0 }), true)
+  // 已归档的不会再被归档一次（幂等，否则维护会反复写盘）。
+  assert.equal(isArchivable(record({ ...dead, archivedAt: 1 }), now, options), false, '已归档不再触发')
+})
+
+test('归档卡退出召回，但 includeArchived 能取回（0.2.10）', () => {
+  const docs = toTechniqueDocs([
+    record({ id: 'tq_live', name: '在用的技巧', when: '在用的时候', summary: '在用。', status: 'validated' }),
+    record({
+      id: 'tq_dead',
+      name: '归档的技巧',
+      when: '归档的时候',
+      summary: '归档。',
+      status: 'validated',
+      archivedAt: 1,
+    }),
+  ])
+  const injected = recallTechniques('技巧', docs, { stack: { languages: ['java'] } })
+  assert.deepEqual(injected.map(hit => hit.id), ['tq_live'], '归档卡不得进入自动注入')
+  const explicit = recallTechniques('归档', docs, { stack: { languages: ['java'] }, includeArchived: true })
+  assert.deepEqual(explicit.map(hit => hit.id), ['tq_dead'], '显式检索必须能取回归档卡')
 })
 
 // ---- 召回 -------------------------------------------------------------------

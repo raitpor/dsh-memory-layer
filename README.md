@@ -375,9 +375,10 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `recallLimit` | `5` | 单次召回条数上限（1–20） |
 | `injectMinMatched` / `injectMinScore` | `2` / `0` | 注入侧的**相关性门槛**：一条记忆/技巧要命中查询里几个不同的词（或达到多少 BM25 分）才允许进注入。不相关的轮次不再白付 token；`0` = 关闭对应判据 |
 | `injectStandingRules` | `4` | 每轮**强制注入**的常驻规则条数上限（`long-term preference` / `long-term constraint`）：这类记忆对任何任务都成立，因此不判相关性；`0` = 关闭 |
-| `techniqueAdvisory` / `techniqueAdvisoryDrafts` / `techniqueAdvisoryMax` / `firstContactAdvisory` / `referenceNudge` | `true` / `true` / `12` / `true` / `true` | **动作点顾问**：模型对某文件/符号动手时，若库里有证据命中的技巧且本会话还没推过，就在工具回执之后附一行 `· <技巧名> [id] matched <依据> — <要点> — technique_get for the full steps.`（走 `tools/post-execute` 的 `additionalContexts`，不阻断、不改写工具结果）。默认连**草稿**一起看并标 `(draft, unverified)`。同一条知识只推一次、**每轮最多一条**、每会话预算 `techniqueAdvisoryMax`（默认 12）。0.2.8 起**要点内联**（不再要模型为看一眼而多调一次 `technique_get`：实测 18 条顾问都写了 `technique_get`，其中 0 条被执行）。`firstContactAdvisory`（0.2.7）：**还没查过库**的会话，在动作点直接收到与本轮请求最相关的一条（带要点） | 证据只取**文件名（basename）与命名实体**（0.2.8）：路径键不再参与通用抽取，枚举/状态值（`status: "in_progress"`）与纯数字（年份）都不是证据 —— 实测这三类伪证据占了 18 条顾问里的 11 条。**L4**：`edit`/`write` 这类**改文件**的动作点**优先**推「符号逐字出现在这次编辑里」的那条（有精确命中就用精确的，否则回退证据词规则 —— 实测 52% 的卡没有可匹配的符号面，硬过滤会让一半库在编辑点失声）。**L2**（`referenceNudge`）：检测到模型引用了某条被推给它的技巧时附一行回报提示（只在真被引用时出现） |
+| `standingRuleFullEveryTurns` | `10` | 常驻规则**每隔几轮重发一次全文**（`0` = 只在规则集变化时重发）。规则集不变时改发**紧凑形态**（保一句可执行的话，默认 60 字符；见 `compactStandingText`）—— 常驻规则是召回段里唯一每轮必然重复的部分：实测 3867 条常驻行按全文注入占召回段 29%，压缩后省 28 万字符（-15%）；正文中位数 57 字符 / 首句中位数 47，所以 60 的封顶保得住绝大多数规则**完整的可执行句** |
+| `techniqueAdvisory` / `techniqueAdvisoryDrafts` / `techniqueAdvisoryMax` / `firstContactAdvisory` / `firstContactAdvisoryMax` / `referenceNudge` | `true` / `true` / `12` / `true` / `1` / `true` | **动作点顾问**：模型对某文件/符号动手时，若库里有证据命中的技巧且本会话还没推过，就在工具回执之后附一行 `· <技巧名> [id] matched <依据> — <要点> — technique_get for the full steps.`（走 `tools/post-execute` 的 `additionalContexts`，不阻断、不改写工具结果）。默认连**草稿**一起看并标 `(draft, unverified)`。同一条知识只推一次、**每轮最多一条**、每会话预算 `techniqueAdvisoryMax`（默认 12）。0.2.8 起**要点内联**（不再要模型为看一眼而多调一次 `technique_get`：实测 18 条顾问都写了 `technique_get`，其中 0 条被执行）。`firstContactAdvisory`（0.2.7）：**还没查过库**的会话，在动作点直接收到与本轮请求最相关的一条（带要点）；`firstContactAdvisoryMax`（0.2.10）限制**每个会话最多推几条**（默认 1，`0` = 关闭）—— 首触原先只靠「查过库就闭嘴」退场，实测 49 个会话里 31 个从未查库，于是每轮各收一条（占顾问总量 62%）；全量回放 57 个会话 189 条 → 上限 1 后 51 条（-73%） | 证据只取**文件名（basename）与命名实体**（0.2.8）：路径键不再参与通用抽取，枚举/状态值（`status: "in_progress"`）与纯数字（年份）都不是证据 —— 实测这三类伪证据占了 18 条顾问里的 11 条。0.2.10 再加**长度下限与项目名片段**：拉丁证据词必须 ≥5 字符（`chat`/`task`/`http` 这类项目名/泛化片段不能单独触发），且 `chat`/`system`/`progress` 进停用表 —— 回放中 24 条历史顾问的命中词因此全部失效。**L4**：`edit`/`write` 这类**改文件**的动作点**优先**推「符号逐字出现在这次编辑里」的那条（有精确命中就用精确的，否则回退证据词规则 —— 实测 52% 的卡没有可匹配的符号面，硬过滤会让一半库在编辑点失声）。**L2**（`referenceNudge`）：检测到模型引用了某条被推给它的技巧时附一行回报提示（只在真被引用时出现） |
 | `injectStopwords` | `[]` | 追加到内置**通用词表**的词：命中它们不算「相关」，不能单独触发注入。内置表覆盖对话套话（继续/开始/可以）、交付元话题（技巧/文档/输出/中文/库里）与通用工程词（配置/函数/文件/路径/代码/测试/config/file/test）。**加一个词 = 放弃靠它触发注入**，因此别加本领域词（如「模组」「插件」） |
-| `recallChars` | `4000` | **条目正文**的字符上限；块头（不可信声明）与 `BEGIN/END` 边界永不截断 —— 安全围栏不能被预算裁掉，因此上限小于块头开销时实际长度会略超上限 |
+| `recallChars` | `4000` | **条目正文**的字符上限；块头（不可信声明）与 `BEGIN/END` 边界永不截断 —— 安全围栏不能被预算裁掉，因此上限小于块头开销时实际长度会略超上限。0.2.10 起**技巧条目不在这里印正文**：召回段里的技巧与技巧段同构（索引行 + 短 id，正文交给 `technique_get`）。实测历史块里这些条目平均 391 字符（顶到 400 上限），统一后省 3.5% 的召回段字符 —— 技巧段只放得下 `techniqueLimit` 条，第 4 条起仍由召回段呈现，只是不再有两种颗粒度 |
 | `registerTools` | `true` | 是否注册记忆工具 |
 | `indexBackend` | `memory` | 检索索引后端：`memory`（默认，纯内存 BM25）或 `sqlite`（从真源派生的 FTS5 索引，可重建、可回退） |
 | `distillOnTurnEnd` | `true` | 每轮末用规则提炼兜底落盘 |
@@ -390,6 +391,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `layerScopes` | `episodic=project`，`semantic/technique/failure=global` | 按层设置作用域（**作用域的唯一入口**）：`project` 按会话工作目录隔离，`global` 跨项目共享 |
 | `partition` | `default` | 全局域分区（组织/租户） |
 | `techniques` | `true` | 是否启用技巧层 |
+| `techniqueMaintenance` / `archiveAfterDays` / `archiveKeepDomains` / `maxActiveDraftsPerDomain` | `true` / `14` / `['dsh-', 'sdo']` / `150` | **死重维护**（0.2.10）：每次刷新时检查一次 —— 领域名归一化（折叠大小写与别名，见下），并把「从未被显式检索 + 从未被引用 + 从未成功」的**旧草稿**打上 `archivedAt`。归档卡**退出自动注入与排序**，但 `technique_search` 默认仍返回、`technique_get` 仍能按 id 展开（删掉不可逆，归档可逆；被 `technique_apply` 成功即自动撤销归档）。`archiveAfterDays` 是最小年龄；**默认 14 天在当前真库上一条都不会归档**（最老记录才 8.5 天）—— 这是刻意的：年轻库里「还没人查」不等于死重。按真库实测：门槛 0 天归档 174/459、3 天 154、7 天 79、14 天 0。`maxActiveDraftsPerDomain` 是**防再生**的第二道护栏（归档只清一次存量，而挖掘/反思仍在产出新草稿）：某个领域活跃草稿超限时，先归档该领域里**最老且从未被用过**的；它**不看年龄**（饱和本身就是信号），但只动没用过的卡。实测最大领域 `plantuml` 129 条 → 上限 150 触发 0 条、100 触发 29 条、50 触发 79 条。`archiveKeepDomains` 是豁免领域前缀（正在开发的领域里今天没人查的卡明天要用，也不参与上限计数），`pitfall` 类知识永不自动归档 |
 | `techniqueLimit` / `techniqueChars` | `3` / `3000` | 技巧索引注入的条数与正文上限；块头、采用回报提示与边界同上一行，永不截断 |
 | `techniquePromptOrder` | `260` | 技巧注入 section 排序（排在 recall 之后） |
 | `guidance` / `guidancePromptOrder` | `true` / `265` | 是否注入「工作前先检索、用了就上报」的常驻指引（库非空且已注册工具时才出现） |
@@ -427,8 +429,8 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `memory_search` | 按关键词检索跨会话记忆（返回 id、**来源标签**、得分、时间；标签按层与语义 `kind` 细分，**技巧层另带信任状态** `(technique (draft))` / `(technique (validated))` —— 它不过滤草稿，状态是模型判断可信度的唯一依据）。`scope` 是**真过滤**：`project` 只查本项目桶、`global` 只查全局桶（含技巧层）、`all`（默认）两个桶都查 |
 | `memory_save` | 把一条长期事实/偏好写入语义层（立即去重合并）；用户**改口**时用 `supersedes: <旧事实 id>`：新事实照常写入，旧的那条**停止注入**但留在库里可追溯（检索时标 `superseded`） |
 | `memory_forget` | 按 id 删除，按前缀转交对应层：`sm_`/`ep_` 记在记忆层、`tq_` 转交技巧层、`fa_`（来自 `failure_list`）转交失败层 —— 误记的失败只能这样整条删掉，`failure_resolve` 只是标记「已解决」。**默认跨全部作用域**（id 全局唯一，而 `memory_save` 写的是语义层作用域）；`*` 清空某个作用域需显式 `confirm: true`，默认只清 `project`，且**只清情景/语义层** —— 技巧层与失败层要按 id 删 |
-| `memory_stats` | 查看各层条数、按层作用域与「经验复利」指标，并报**技巧采用率**（`Technique adoption: 已采用/总数、至少被检索过一次的条数、从未被检索过的草稿数` —— 冷启动问题必须能被看见）；存储不健康时额外给出 `Store integrity:` 行（整库不可读 / 跳过的坏行数） |
-| `technique_search` | 按当前技术栈检索技巧。默认以已验证条目为主；**当同一份排名里草稿的分数高于所有已验证命中时，草稿在同一次响应里一并给出**并标 `[draft]`（0.2.8：实测三种真实查询在默认参数下第一屏全是无关卡，带草稿后正好是三条对题的卡；旧行为「报数量 + 让模型再调一次」几乎不会被走）。其余情况下仍会明说「有 N 条草稿被隐藏，加 `includeDrafts: true`」。结果**分两档**：前 3 条给可执行要点（`gist`）+ 短 id，其余只给「还存在」的指针；`verbose: true` 退回完整索引行。行里带**采纳标记**（`✓N` / `✗N`，有记录时才出现，并在表头给一次图例）|
+| `memory_stats` | 查看各层条数、按层作用域与「经验复利」指标，并报**技巧采用率**（`Technique adoption: 已采用/总数、至少被检索过一次的条数、从未被检索过的草稿数` —— 冷启动问题必须能被看见）；有归档卡时报 `N archived (excluded from injection, still searchable)`（0.2.10）；存储不健康时额外给出 `Store integrity:` 行（整库不可读 / 跳过的坏行数） |
+| `technique_search` | 按当前技术栈检索技巧。默认以已验证条目为主；**当同一份排名里草稿的分数高于所有已验证命中时，草稿在同一次响应里一并给出**并标 `[draft]`（0.2.8：实测三种真实查询在默认参数下第一屏全是无关卡，带草稿后正好是三条对题的卡；旧行为「报数量 + 让模型再调一次」几乎不会被走）。其余情况下仍会明说「有 N 条草稿被隐藏，加 `includeDrafts: true`」。**归档卡默认仍然返回**（0.2.10：归档是「退出竞争」而不是删除），`includeArchived: false` 可隐藏。结果**分两档**：前 3 条给可执行要点（`gist`）+ 短 id，其余只给「还存在」的指针；`verbose: true` 退回完整索引行。行里带**采纳标记**（`✓N` / `✗N`，有记录时才出现，并在表头给一次图例）|
 | `technique_get` | 按 id（完整 id 或唯一前缀，如 `tq_f6233ebe`）展开完整正文：要点、步骤、调用面、示例、坑、验证判据与历次验收证据；`ids` 可一次展开多条。回执末尾附**采用回报入口**（`technique_apply`）—— 读完正文正是最可能真正采用的时刻 |
 | `technique_learn` | 从一个代码仓库挖掘技巧（显式、受限；产出为草稿）。回执会列出**本轮新建草稿的短 id 与名称**，模型当场就能 `technique_get` / `technique_apply`；结构观察（调用面普查）只进回执、默认不入库 |
 | `technique_export` | 把一条**已验证**技巧物化成 `SKILL.md`（confidential 拒绝导出） |
@@ -791,6 +793,13 @@ Session format: dsh-session 0.1.5-rc.2 → plugin message source kind 'plugin'
   标题不得以 `<Placeholder>` 开头、`domain` 复用已有词表**（同主题写出 28 种标签会让合并键失效，
   近重复条目因此全部新建）。即便如此，挖掘仍只是**草稿**来源：无人验收时它会持续积累低价值条目，
   定期用 `technique_search(includeDrafts: true)` 抽查并按 id 清理是必要的维护动作。
+  0.2.10 起 `domain` 在**写入口**归一化（`normalizeDomain`：去空白、转小写、查别名表），并由死重
+  维护对存量做一次迁移 —— 实测真库 141 个领域名里有 `PlantUML`(84) 与 `plantuml`(60) 这种同一个词
+  的两半，115 条记录因此被改写；喂给模型的词表（`knownDomainsForMining`）也按同一口径计数。
+  ⚠️ 别名表加条目要小心：`techniqueKey` 用的就是这个归一化后的领域，**两条本来不同的记录可能因此
+  撞键**（下一次 `upsertTechniques` 只会留下其中一条）。因此只收明确的同义写法（如
+  `puml`/`plant-uml` → `plantuml`），不收粒度不同的领域（`minecraft-modding` ≠
+  `minecraft-forge-modding`）。
 - **候选只在出现 ≥`mineMinOccurrences` 次时成形**：只调用一次的写法不会被提炼，
   这是刻意的噪声控制，代价是「孤例技巧」抓不到。
 - **`.gitignore` 只支持常用子集**：字符类、转义等复杂语法按字面处理；

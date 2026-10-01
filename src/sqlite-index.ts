@@ -87,9 +87,9 @@ export function matchExpression(query: string): string {
   return tokens.map(token => `"${token.replace(/"/gu, '""')}"`).join(' OR ')
 }
 
-/** 建表语句。`status`/`partition`/`langs` 是普通列，供 SQL 侧过滤。 */
+/** 建表语句。`status`/`partition`/`langs`/`archived` 是普通列，供 SQL 侧过滤。 */
 const CREATE_SQL = `CREATE VIRTUAL TABLE IF NOT EXISTS technique_index USING fts5(
-  id UNINDEXED, status UNINDEXED, partition UNINDEXED, langs UNINDEXED,
+  id UNINDEXED, status UNINDEXED, partition UNINDEXED, langs UNINDEXED, archived UNINDEXED,
   ${COLUMNS.join(', ')},
   tokenize = 'unicode61'
 )`
@@ -122,13 +122,17 @@ export class SqliteTechniqueIndex {
     if (next === this.signature) return false
     const db = this.open()
     db.exec('PRAGMA journal_mode = WAL')
+    // 先删表再建：`CREATE ... IF NOT EXISTS` 对**已存在的旧 schema** 什么都不做，新增列
+    // （0.2.10 的 `archived`）会一直缺，随后 INSERT 报错、被调用方当成「索引不可用」而永远
+    // 回退内存检索。全量重建本来就是这条路径的语义，所以这里直接重建表。
+    db.exec('DROP TABLE IF EXISTS technique_index')
     db.exec(CREATE_SQL)
     db.exec('BEGIN')
     try {
       db.exec('DELETE FROM technique_index')
       const insert = db.prepare(
-        `INSERT INTO technique_index (id, status, partition, langs, ${COLUMNS.join(', ')})
-         VALUES (?, ?, ?, ?, ${COLUMNS.map(() => '?').join(', ')})`,
+        `INSERT INTO technique_index (id, status, partition, langs, archived, ${COLUMNS.join(', ')})
+         VALUES (?, ?, ?, ?, ?, ${COLUMNS.map(() => '?').join(', ')})`,
       )
       for (const record of records) {
         const languages = record.stack.languages.join(',')
@@ -137,6 +141,7 @@ export class SqliteTechniqueIndex {
           record.status,
           record.partition,
           languages,
+          record.archivedAt === undefined ? '0' : '1',
           segment(record.name),
           segment(record.subject ?? ''),
           segment(record.when),
@@ -178,7 +183,7 @@ export class SqliteTechniqueIndex {
   search(
     query: string,
     limit: number,
-    options: { includeDrafts?: boolean; partition?: string; stack?: StackProfile } = {},
+    options: { includeDrafts?: boolean; includeArchived?: boolean; partition?: string; stack?: StackProfile } = {},
   ): string[] | undefined {
     if (limit <= 0) return []
     const match = matchExpression(query)
@@ -195,6 +200,9 @@ export class SqliteTechniqueIndex {
       clauses.push(`status IN ('validated', 'canonical')`)
     }
     clauses.push(`status <> 'deprecated'`)
+    // 归档过滤必须落在 SQL 里：调用方拿到 id 后只做门槛判定，不会再回查状态（见 `recallFacets`），
+    // 少这一句归档卡就会从 FTS 这条通道绕进注入。
+    if (options.includeArchived !== true) clauses.push(`archived = '0'`)
     if (options.partition !== undefined) {
       clauses.push('partition = ?')
       params.push(options.partition)
@@ -231,7 +239,11 @@ export class SqliteTechniqueIndex {
 }
 
 /**
- * 语料签名：条数 + 最近更新时间 + 状态分布，足以发现任何写入。
+ * 语料签名：schema 版本 + 条数 + 最近更新时间 + 状态分布，足以发现任何写入。
+ *
+ * `v2` 是 0.2.10 的分水岭：`archived` 列进了 schema，旧索引文件缺这一列，签名里带上版本号
+ * 才能强制重建一次（否则过滤条件会在旧表上抛错、静默退回内存路径）。
+ *
  * @param records - 技巧记录。
  * @returns 签名字符串。
  */
@@ -242,5 +254,5 @@ function signatureOf(records: readonly TechniqueRecord[]): string {
     latest = Math.max(latest, record.updatedAt)
     if (record.status === 'validated' || record.status === 'canonical') verified += 1
   }
-  return `${records.length}:${latest}:${verified}`
+  return `v2:${records.length}:${latest}:${verified}`
 }

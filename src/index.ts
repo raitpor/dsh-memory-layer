@@ -578,6 +578,19 @@ const SESSION_RESTATEMENT_RATIO = 0.5
 const RECALL_DUPLICATE_RATIO = 0.6
 
 /**
+ * 一个引用针要在**几张卡**上都成立才算「泛化针」（评审 F1）。
+ *
+ * 依据：引用针的语义是「这张卡的线索出现在模型的动作里」。若同一个符号在三张以上的卡上都成立，
+ * 它就不能说明是**哪一张**被用上了 —— 真库普查里 `dependsOn`(6 张)、`registerScreen`(5)、
+ * `Task.dependsOn`(4)、`SubscribeEvent`(4)、`technique_save`(3)、`OreDictionary.registerOre`(3)
+ * 都是这一类（框架/工具通用名），命中它们等于给一批无关卡同时记账。
+ *
+ * 阈值取 3 而不是 2：两张卡共享一个符号时，「两张都沾边」仍是有信息的观察；
+ * 到三张就退化成「这门框架里到处都是的名字」。
+ */
+const GENERIC_NEEDLE_CARDS = 3
+
+/**
  * 把一条技巧草稿压成用于复述比对的正文。
  *
  * 与存储用的 `techniqueText` 保持同源字段（名称/触发/正文/步骤/不变量/坑/判据），
@@ -670,6 +683,9 @@ export const Config: z<Config> = z.object({
    *
    * 归档只能清一次存量，而挖掘/反思还在按同样速度产出（实测约 +14 条/4 小时）—— 没有这道
    * 护栏，死重会以同样的速度长回来。超限时按「最老且从未被检索/引用/成功」先出局。
+   *
+   * ⚠️ 规模提示（评审 F4）：真库最大领域 `plantuml` 129 条，因此 **150 在当前规模下不会触发**
+   * （上限 100 → 淘汰 29 条、50 → 79 条）。它是「随增长才开火」的护栏，不是当下就生效的清库手段。
    */
   maxActiveDraftsPerDomain: z.natural().min(0).max(10_000).default(150),
   techniqueLimit: z.natural().min(1).max(10).default(3),
@@ -1047,6 +1063,19 @@ export function apply(ctx: Context, config: Config): void {
         }
       }
     }
+    // 评审 F1 的历史污染修正：针集里**只剩语言内置名**的卡，它的 `referenced` 全部来自误命中
+    // （真库实测 3 张卡 / 9 次引用：`readFileSync` 系 5、`assert.ok` 系 3、`Array.isArray` 系 1）。
+    // 只动「针集为空」的卡 —— 针集非空时无法区分哪几次是真引用，宁可留高也不误删。
+    let repairedReferences = 0
+    for (const record of records) {
+      if ((record.referenced ?? 0) === 0) continue
+      if (referenceNeedles(record).length > 0) continue
+      const base = patchById.get(record.id) ?? record
+      const fixed: TechniqueRecord = { ...base, referenced: 0 }
+      delete fixed.lastReferencedAt
+      patchById.set(record.id, fixed)
+      repairedReferences += 1
+    }
     const patches = [...patchById.values()]
     if (patches.length === 0) return false
     try {
@@ -1055,7 +1084,8 @@ export function apply(ctx: Context, config: Config): void {
         logger.info(
           `memory: technique maintenance on ${directory ?? '(unknown cwd)'} — ${applied} record(s) rewritten `
           + `(${archived} archived${capped === 0 ? '' : `, ${capped} over per-domain cap`}, `
-          + `${renamed} domain name(s) normalized)`,
+          + `${renamed} domain name(s) normalized`
+          + `${repairedReferences === 0 ? '' : `, ${repairedReferences} stale reference count(s) reset`})`,
         )
       }
       return applied > 0
@@ -1117,6 +1147,18 @@ export function apply(ctx: Context, config: Config): void {
     const techniqueScopes = new Map<string, MemoryScope>()
     for (const record of globalTech) techniqueScopes.set(record.id, 'global')
     for (const record of projectTech) techniqueScopes.set(record.id, 'project')
+    // 引用针缓存与泛化针表都从真源派生：记录内容可能被就地更新（`technique_save(id=…)`），
+    // 缓存必须跟着语料一起作废，否则会拿旧符号面去匹配。
+    needlesById.clear()
+    const needleCards = new Map<string, number>()
+    for (const record of techniques) {
+      for (const needle of new Set(referenceNeedles(record))) {
+        needleCards.set(needle, (needleCards.get(needle) ?? 0) + 1)
+      }
+    }
+    genericNeedles = new Set(
+      [...needleCards].filter(([, cards]) => cards >= GENERIC_NEEDLE_CARDS).map(([needle]) => needle),
+    )
     // 索引从真源派生：签名没变就跳过，变了就全量重建（几百条是毫秒级）。
     // 重建失败只记一条日志，检索随后自动走内存路径。
     try {
@@ -1937,6 +1979,12 @@ export function apply(ctx: Context, config: Config): void {
   const referencedBySession = new Map<string, Set<string>>()
   /** 引用针缓存：符号面在运行期不变，按卡算一次。 */
   const needlesById = new Map<string, string[]>()
+  /**
+   * **泛化针**：在 ≥{@link GENERIC_NEEDLE_CARDS} 张卡上都成立的符号（每次 `refresh` 重算）。
+   *
+   * 它们不能说明「是这张卡被用上了」，因此既不参与 L1 引用记账，也不参与 L4 的精确命中。
+   */
+  let genericNeedles: ReadonlySet<string> = new Set()
 
   /** 落盘前被判为复述而丢弃的候选（进程内计数，供 `memory_stats` 观测过滤是否在干活）。 */
   const restatementDrops: string[] = []
@@ -1967,6 +2015,14 @@ export function apply(ctx: Context, config: Config): void {
    * 未检索会话正是这样在 149 轮里收下 89 条首触顾问。这里按会话计**总次数**，与推的是哪条无关。
    */
   const firstContactPushed = new Map<string, number>()
+
+  /**
+   * 首触顾问的进程内计数（供 `memory_stats` 诊断，评审 F4）。
+   *
+   * 其它通道都有计数（门槛、去重、失败闸门），唯独首触没有 —— 于是「这个会话为什么没收到首触」
+   * 只能靠猜。这里记两件事：投递了几条，以及有多少会话**撞到过每会话上限**。
+   */
+  const firstContactTally = { pushed: 0, cappedSessions: new Set<string>() }
 
   /**
    * 每个会话**上次以全文形态注入常驻规则**时的规则集签名与轮号（0.2.10 的 ②a）。
@@ -2048,7 +2104,10 @@ export function apply(ctx: Context, config: Config): void {
     if (sessionId === undefined || consultedSessions.has(sessionId)) return undefined
     // 次数上限先于检索判断：它的目的是「这个会话别再为首触花钱」，与有没有命中无关。
     const pushed = firstContactPushed.get(sessionId) ?? 0
-    if (pushed >= settings.firstContactAdvisoryMax) return undefined
+    if (pushed >= settings.firstContactAdvisoryMax) {
+      firstContactTally.cappedSessions.add(sessionId)
+      return undefined
+    }
     const seen = advisorySeen.get(sessionId) ?? new Set<string>()
     if (seen.size >= settings.techniqueAdvisoryMax) return undefined
     const liveTurn = current?.turns.at(-1)?.turn
@@ -2071,6 +2130,7 @@ export function apply(ctx: Context, config: Config): void {
     seen.add(top.id)
     advisorySeen.set(sessionId, seen)
     firstContactPushed.set(sessionId, pushed + 1)
+    firstContactTally.pushed += 1
     noteSurfaced([top.id])
     if (liveTurn !== undefined) advisoryLastTurn.set(sessionId, liveTurn)
     logger.debug(`memory: first-contact advisory → ${top.id.slice(0, 11)}`)
@@ -2213,14 +2273,23 @@ export function apply(ctx: Context, config: Config): void {
           : compactEntryText(hit.text)
       return `${index + 1}. (${kind}) ${sanitizeForInjection(body)}`
     })
-    // 状态只在**常驻行确实进入这一块**之后推进：`renderInjection` 有两条早退，且块可能被预算
-    // 裁到只剩常驻之前的部分 —— 先推进会把规则标记成「已全文」，之后再也不会展示全文。
-    if (standingSession !== undefined && standing.length > 0 && showFullStanding) {
-      standingFullShown.set(standingSession, { signature: standingSignature, turn: standingTurn })
-    }
     // 常驻规则与「本轮相关」的条目在同一个块里，必须让模型分清语气差别，否则它会把
     // 一条与本轮无关的偏好当成跑题的噪声而忽略掉。
-    return renderBlock(RECALL_BLOCK, standing.length === 0 ? [] : STANDING_RULE_NOTICE, lines, settings.recallChars)
+    const rendered = renderBlock(
+      RECALL_BLOCK,
+      standing.length === 0 ? [] : STANDING_RULE_NOTICE,
+      lines,
+      settings.recallChars,
+    )
+    // 记账只在常驻**全文**真的落进这一块之后才推进。评审 F2：`clipHead` 保头截断，预算不足时
+    // 会把末尾的常驻规则截在句子中间；被截断却记成「已发全文」，这条规则在
+    // `standingRuleFullEveryTurns` 轮内就再也没机会完整出现过（下次只会给紧凑形态）。
+    // 判据是「渲染结果里确实含常驻那几行的完整文本」—— 早退与空 query 的情形自然也挡在外面。
+    if (standingSession !== undefined && standing.length > 0 && showFullStanding
+      && rendered.includes(lines.slice(0, standing.length).join('\n'))) {
+      standingFullShown.set(standingSession, { signature: standingSignature, turn: standingTurn })
+    }
+    return rendered
   }
 
   /**
@@ -2831,7 +2900,8 @@ export function apply(ctx: Context, config: Config): void {
       needles = referenceNeedles(record)
       needlesById.set(id, needles)
     }
-    return needles.some(needle => mentionsNeedle(raw, needle))
+    // 泛化针不算精确命中：它说明的是「这个框架里到处都是这个名字」，不是「这次改的就是这张卡」。
+    return needles.some(needle => !genericNeedles.has(needle) && mentionsNeedle(raw, needle))
   }
 
   /**
@@ -2892,7 +2962,7 @@ export function apply(ctx: Context, config: Config): void {
         needles = referenceNeedles(record)
         needlesById.set(id, needles)
       }
-      const needle = needles.find(item => mentionsNeedle(raw, item))
+      const needle = needles.find(item => !genericNeedles.has(item) && mentionsNeedle(raw, item))
       if (needle === undefined) continue
       hitIds.push(id)
       matched.push({ id, needle })
@@ -3136,6 +3206,11 @@ export function apply(ctx: Context, config: Config): void {
           const rate = total === 0 ? '0' : (100 * referenced / total).toFixed(1)
           return `Technique references: ${referenced}/${total} referenced at least once (${rate}%), ${events} event(s)`
         })(),
+        // 评审 F4：首触是唯一没有计数的通道 —— 加了上限之后，「这个会话为什么没收到首触」
+        // （是没命中、还是被每会话上限拦下）必须能从回执侧回答。
+        `First-contact advisories: ${firstContactTally.pushed} pushed this process, `
+          + `${firstContactTally.cappedSessions.size} session(s) hit the per-session cap `
+          + `(firstContactAdvisoryMax=${settings.firstContactAdvisoryMax}, ${settings.firstContactAdvisory ? 'on' : 'off'})`,
         // 门槛拦下多少条是**看不见的**（不注入就没有痕迹），因此单独报一行：排查
         // 「不相关技巧仍被注入」时，先看这里是不是 0 —— 0 说明门槛根本没在干活。
         `Injection gate: ${gateTally.dropped} dropped / ${gateTally.kept} kept since start `

@@ -309,13 +309,67 @@ export function techniqueSymbols(record: TechniqueRecord): string[] {
 const REFERENCE_NEEDLE_MIN_CHARS = 6
 
 /**
+ * **运行时/标准库**的根命名空间：它们出现在参数里只能说明「模型在用这门语言」，
+ * 不能说明「这张卡被用上了」。
+ *
+ * 依据（评审 F1，真库实证）：`tq_1c95a48f`（讲「从 manifest 解析依赖 ID」）的针是
+ * `readFileSync, JSON.parse, Array.isArray, isArray, semver.satisfies` —— 前四个是 Node 内置名，
+ * 于是任何一次 `readFileSync` 调用都会把它标成「被引用过」（实测 referenced=5）。代价不止是数字：
+ * 它抬高 `memory_stats` 的引用率、给 L5 排序 +10% 的永久加成、并让 L2 在无关上下文里打断模型
+ * （评审期间实际被打断两次）。真库普查（460 张卡 / 471 个针）里这类针共 18 个。
+ *
+ * 为什么不用「只认带命名空间限定的符号」这条更激进的规则：L4 的精确命中恰恰依赖**裸的项目标识符**
+ * （`zqblatWire`、`GTEnchantment`），全砍掉会让「改文件时优先推符号逐字命中」失效
+ * （`test/technique.test.ts` 的 L1 用例正钉这一点）。所以这里只砍**语言自带的名字**。
+ */
+const BUILTIN_NEEDLE_ROOTS: ReadonlySet<string> = new Set([
+  // JS/TS/Node 的全局与内置命名空间
+  'JSON', 'Object', 'Array', 'String', 'Number', 'Boolean', 'Math', 'Promise', 'RegExp',
+  'Error', 'TypeError', 'RangeError', 'Date', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Symbol',
+  'Reflect', 'Proxy', 'Intl', 'console', 'assert', 'process', 'Buffer', 'URL', 'URLSearchParams',
+  'Atomics', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'TextEncoder', 'TextDecoder',
+  'AbortController', 'AbortSignal', 'EventTarget', 'WeakRef', 'FinalizationRegistry',
+  // JVM 标准库（真库普查里出现过 `Map.computeIfAbsent`）
+  'System', 'Objects', 'Collections', 'Arrays', 'Stream', 'Collectors', 'Optional',
+  'StringBuilder', 'Integer', 'Long', 'Double', 'Float', 'Short', 'Byte', 'Character',
+  'Thread', 'Files', 'Paths', 'Path', 'File', 'IOException', 'RuntimeException',
+  'IllegalArgumentException', 'IllegalStateException', 'Objects.requireNonNull',
+])
+
+/** 裸内置函数/全局：单段名同样要砍（`readFileSync`、`randomUUID`…）。 */
+const BUILTIN_NEEDLES: ReadonlySet<string> = new Set([
+  'readFileSync', 'writeFileSync', 'appendFileSync', 'readdirSync', 'existsSync', 'statSync',
+  'mkdirSync', 'rmSync', 'unlinkSync', 'copyFileSync', 'renameSync',
+  'randomUUID', 'randomBytes', 'structuredClone', 'parseInt', 'parseFloat', 'isNaN', 'isFinite',
+  'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'setImmediate', 'queueMicrotask',
+  'encodeURIComponent', 'decodeURIComponent', 'globalThis', 'require', 'module', 'exports',
+])
+
+/**
+ * 这个符号是不是「语言自带的名字」（因而不能当某张卡专有的线索）。
+ *
+ * 判定看**符号的根**（第一个 `.`/`/`/`#`/`-` 之前的那段）与整串：`Array.isArray` 的根是 `Array`
+ * → 砍掉，连同它的末段针 `isArray` 一起（末段是在整串之后才拆的，所以不会被放出来）。
+ *
+ * @param symbol - 已去掉占位符的符号面。
+ * @returns 是内置名时为 `true`。
+ */
+function isBuiltinNeedle(symbol: string): boolean {
+  if (symbol.includes('.prototype.')) return true
+  if (BUILTIN_NEEDLES.has(symbol)) return true
+  return BUILTIN_NEEDLE_ROOTS.has(symbol.split(/[./#-]/u)[0] ?? '')
+}
+
+/**
  * 从一条技巧的符号面（`subject` + 调用名）提取**可匹配的引用针**（L1 引用检测）。
  *
- * 判据是"这个字符串出现在模型的工具调用参数里，就算它被用上了"，因此必须挡住两类伪符号：
+ * 判据是"这个字符串出现在模型的工具调用参数里，就算它被用上了"，因此必须挡住三类伪符号：
  *   1. **占位符**：`<Class1>.setPropertyOverride` 里的 `<Class1>` 是去标识化的产物，
  *      去掉后剩下的 `setPropertyOverride` 才是可匹配的实体名；
  *   2. **泛化词**：`apply` / `inject` / `requires` 这类小写单词，或 `Machine GUI screen class`
- *      这种散文 subject —— 只保留**含 `.`/`/`/`#`/`-` 的多段符号**，或**含大写/下划线且 ≥6 字符**的标识符。
+ *      这种散文 subject —— 只保留**含 `.`/`/`/`#`/`-` 的多段符号**，或**含大写/下划线且 ≥6 字符**的标识符；
+ *   3. **语言自带的名字**（{@link isBuiltinNeedle}）：`readFileSync` / `JSON.parse` / `Array.isArray`
+ *      只证明模型在用这门语言，不证明它用了这张卡。
  *
  * @param record - 技巧记录。
  * @returns 去重后的引用针（可能为空 —— 这条卡没有可匹配的符号面）。
@@ -325,6 +379,7 @@ export function referenceNeedles(record: TechniqueRecord): string[] {
   for (const raw of techniqueSymbols(record)) {
     const text = raw.replace(/<[^<>]*>/gu, ' ').trim()
     if (text.length === 0 || /[\u4e00-\u9fa5\s]/u.test(text)) continue
+    if (isBuiltinNeedle(text)) continue
     for (const part of text.split(/[^A-Za-z0-9_.$#/-]+/u)) {
       const needle = part.replace(/^[^A-Za-z]+/u, '').replace(/[^A-Za-z0-9_$]+$/u, '')
       if (needle.length < REFERENCE_NEEDLE_MIN_CHARS) continue

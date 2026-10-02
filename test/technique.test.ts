@@ -629,6 +629,32 @@ test('L1 引用针：只留可匹配的实体名，挡住占位符与泛化词',
   assert.equal(mentionsNeedle('{"old_string":"stack.getOrDefault(C, D)"}', 'getOrDefault'), true)
   assert.equal(mentionsNeedle('{"command":"grep tools.register src"}', 'tools.register'), true)
   assert.equal(mentionsNeedle('', 'getOrDefault'), false)
+
+  // 评审 F1：**语言内置名**不是「这张卡专有」的线索。真库里 `tq_1c95a48f`（讲从 manifest 解析
+  // 依赖 ID）的针是 `readFileSync, JSON.parse, Array.isArray, isArray, semver.satisfies` ——
+  // 于是任何一次 `readFileSync` 调用都把它标成「被引用过」（referenced=5），
+  // 抬高引用率、给 L5 排序 +10% 永久加成、并让 L2 在无关上下文里打断模型。
+  const mixed = referenceNeedles(record({
+    subject: 'readFileSync',
+    api: [
+      { symbol: 'JSON.parse' },
+      { symbol: 'Array.isArray' },
+      { symbol: 'String' },
+      { symbol: 'assert.ok' },
+      { symbol: 'RegExp.prototype.exec' },
+      // 反例（必须留下）：第三方包的限定名与项目类名都还是有效线索。
+      { symbol: 'semver.satisfies' },
+      { symbol: 'ItemStack.getOrDefault' },
+    ],
+  }))
+  for (const builtin of ['readFileSync', 'JSON.parse', 'Array.isArray', 'isArray', 'String', 'assert.ok',
+    'RegExp.prototype.exec', 'exec']) {
+    assert.ok(!mixed.includes(builtin), `内置名不得当针：${builtin} ∈ ${mixed}`)
+  }
+  assert.ok(mixed.includes('semver.satisfies'), `第三方包限定名要保留：${mixed}`)
+  assert.ok(mixed.includes('getOrDefault'), `项目类的末段仍要保留：${mixed}`)
+  // 内置符号的**末段**也不能漏出来：`Array.isArray` 的 `isArray` 是靠整串过滤才被一起挡住的。
+  assert.ok(!referenceNeedles(record({ api: [{ symbol: 'Array.isArray' }] })).includes('isArray'))
 })
 
 test('L5 引用加成：被引用过的卡排更前，但**不动置信度**，且加成有上限', () => {

@@ -4076,6 +4076,49 @@ test('常驻规则（0.2.10）：首轮全文、后续紧凑，规则集变化�
   }
 })
 
+test('常驻规则（评审 F2）：全文被预算截断时不得记账，下一轮仍给全文', async () => {
+  // 动机：`clipHead` 保头截断，预算不足时会把**末尾的常驻规则截在句子中间**。
+  // 旧代码在 `renderBlock` **之前**推进「已发全文」，于是这些规则在
+  // `standingRuleFullEveryTurns` 轮内只会收到紧凑形态 —— 完整表述从未真正出现过。
+  //
+  // 预算算式：`recallChars: 600` − 固定开销（块头 239 + 常驻说明 170 + 尾部 28 + 3 个换行）≈ 161。
+  // 第 1 条规则全文 111 字符（完整装得下），第 2 条把总量顶到 188 → 被截断。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    standingRuleFullEveryTurns: 0,
+    recallChars: 600,
+  })
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    // 常驻规则按 `ts` **倒序**（最新的在前）：把带标记的那条**最后**写，它才会排在块首、完整落地；
+    // 后写的那条把总量顶过预算，于是只有它被截断。
+    await toolOf(fake, 'memory_save').execute({
+      text: '用户偏好：交付文档一律用中文撰写，代码与命令保留原文；另外状态报告要写清验收证据，不要只给结论。',
+      kind: 'preference',
+    } as never, undefined as never)
+    await toolOf(fake, 'memory_save').execute({
+      text: '用户偏好：提交前必须跑完整门禁并把结果贴出来；另外若门禁未跑完就不要讨论提交，也不要替用户打 tag，因为 CI 会因为 tag 触发发布流程。',
+      kind: 'preference',
+    } as never, undefined as never)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('写一个正则解析时间戳'))
+    const first = sectionText(fake, 'memory-layer:recall')
+    assert.match(first, /触发发布流程/u, `第 1 条规则的全文应完整落地：${first}`)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('再写一个正则解析时间戳'))
+    const second = sectionText(fake, 'memory-layer:recall')
+    // 判别点：截断发生时不得记为「已发全文」，否则这里只会看到第 1 条规则的紧凑形态。
+    assert.match(second, /触发发布流程/u,
+      `常驻全文没完整落地就不许记账，第 2 轮必须仍是全文：${second}`)
+  } finally {
+    await dispose()
+  }
+})
+
 test('常驻规则只限偏好与约束：不相关的事实与决定不得注入', async () => {
   // 事实/决定是「关于某件事的陈述」，只在相关时才有价值 —— 否则召回段会重新变成
   // 「把库里所有东西倒进上下文」，这正是本轮要治的病。
@@ -4968,6 +5011,14 @@ test('首触顾问每会话上限（0.2.10）：默认 1 条，可配到 N 条�
         if (text.length > 0) pushed += 1
       }
       assert.equal(pushed, item.expected, `${item.label}：每会话最多 ${item.expected} 条首触顾问，实际 ${pushed}`)
+      // 评审 F4：首触是唯一没有计数的通道 —— 「这个会话为什么没收到首触」必须能从回执侧回答。
+      const stats = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
+      assert.match(stats, new RegExp(`First-contact advisories: ${item.expected} pushed this process`, 'u'),
+        `memory_stats 要报首触投递数：${stats}`)
+      assert.match(stats, /\d+ session\(s\) hit the per-session cap/u,
+        `memory_stats 要报撞上限的会话数：${stats}`)
+      assert.match(stats, /[1-9]\d* session\(s\) hit the per-session cap/u,
+        `本用例后面几轮都被上限拦下，必须计入：${stats}`)
     } finally {
       await dispose()
     }
@@ -5155,6 +5206,88 @@ test('L1 引用检测：模型在参数里用到卡片符号就记一次，且�
       { query: 'Zqblat 引用样本' } as never, undefined as never,
     ))
     assert.match(search, /\[validated\] ✓1 /u, `引用不得把成功计数 +1：${search}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('L1 引用检测（评审 F1）：同一个符号在 ≥3 张卡上都成立时不记引用', async () => {
+  // 动机：引用针的语义是「这张卡的线索出现在模型的动作里」。若同一个符号在三张以上卡上都成立，
+  // 它说明的是「这个框架/工具里到处都是这个名字」，落到哪张卡上是随机的 —— 真库普查里
+  // `dependsOn`(6 张)、`registerScreen`(5)、`Task.dependsOn`(4)、`SubscribeEvent`(4)、
+  // `technique_save`(3) 都属于这一类。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    for (const variant of [1, 2, 3]) {
+      const saved = String(await toolOf(fake, 'technique_save').execute({
+        name: `Zqblat 共享样本 ${variant}`,
+        when: '遇到共享主题时',
+        summary: `Zqblat 共享正文 ${variant}。`,
+        apiSymbols: ['zqblatShared'],
+      } as never, undefined as never))
+      const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+      assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+      await toolOf(fake, 'technique_apply').execute(
+        { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+      )
+    }
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('Zqblat 共享样本怎么用'))
+    await fake.flush()
+    // 技巧段限额 3：三张卡都被推给本会话（读一次注入文本即触发「已推给本会话」的记录）。
+    assert.match(sectionText(fake, 'memory-layer:techniques'), /Zqblat 共享样本/u, '三张卡都应被推给本会话')
+
+    // 反例面：符号确实出现在参数里，但它是三张卡共有的泛化针 → 一张都不记。
+    // 这里只断言**引用提示**不在（动作点顾问是另一条通道，它按证据词匹配，本来就可能附一行）。
+    const text = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/a.ts', new_string: 'zqblatShared(1)' }) },
+      { isError: false },
+    ))
+    assert.doesNotMatch(text, /你刚用到了/u, `泛化针不得触发引用提示：${text}`)
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Technique references: 0\/\d+ referenced at least once \(0\.0%\), 0 event\(s\)/u,
+      '泛化针不得给任何一张卡记账',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('死重维护（评审 F1）：针集只剩语言内置名的卡，其历史引用计数被清零', async () => {
+  // 历史污染修正：真库 3 张卡的 referenced 全部来自内置名误命中（合计 9 次）。
+  // 只清「针集为空」的卡 —— 针集非空时无法区分哪几次是真引用，宁可留高也不误删。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    for (const [name, symbol] of [['Zqblat 污染样本', 'readFileSync'], ['Zqblat 对照样本', 'zqblatWire']] as const) {
+      await toolOf(fake, 'technique_save').execute({
+        name, when: '遇到该主题时', summary: `${name} 的正文。`, apiSymbols: [symbol],
+      } as never, undefined as never)
+    }
+    // 直接把「历史污染」写进真源：两张卡都记 5 次引用，区别只在符号面。
+    const store = new MemoryStore(root)
+    const polluted = (await store.readTechniques('global'))
+      .filter(record => record.name.startsWith('Zqblat '))
+      .map(record => ({ ...record, referenced: 5, lastReferencedAt: 1_700_000_000_000 }))
+    await store.updateTechniques(polluted)
+
+    // 任意一次检索都会先 `refresh` → 维护在这一步收敛。
+    await toolOf(fake, 'technique_search').execute({ query: 'Zqblat' } as never, undefined as never)
+    const after = await new MemoryStore(root).readTechniques('global')
+    const poisoned = after.find(record => record.name === 'Zqblat 污染样本')
+    const control = after.find(record => record.name === 'Zqblat 对照样本')
+    assert.equal(poisoned?.referenced, 0, '只剩内置名针的卡，历史引用计数必须清零')
+    assert.equal(poisoned?.lastReferencedAt, undefined, '清零要连最近引用时间一起抹掉')
+    assert.equal(control?.referenced, 5, '针集非空的卡不得被误清（无法区分真引用）')
   } finally {
     await dispose()
   }

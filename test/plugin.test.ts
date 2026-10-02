@@ -4081,8 +4081,13 @@ test('常驻规则（评审 F2）：全文被预算截断时不得记账，下�
   // 旧代码在 `renderBlock` **之前**推进「已发全文」，于是这些规则在
   // `standingRuleFullEveryTurns` 轮内只会收到紧凑形态 —— 完整表述从未真正出现过。
   //
-  // 预算算式：`recallChars: 600` − 固定开销（块头 239 + 常驻说明 170 + 尾部 28 + 3 个换行）≈ 161。
-  // 第 1 条规则全文 111 字符（完整装得下），第 2 条把总量顶到 188 → 被截断。
+  // 预算算式：`recallChars: 600` − 固定开销（块头 + 常驻说明 + 尾部）≈ 160；
+  // 两条规则全文合计 240+，必然溢出 —— 块首那条完整、后面那条被截断。
+  //
+  // ⚠️ 断言刻意**与顺序无关**（2026-10-02 修 CI red）：常驻按 `ts` 倒序，两次 `memory_save`
+  // 若落在同一毫秒，时间戳打平、顺序退化成文件序 —— CI 跑得比本机快，正是这样红的。
+  // 所以这里用「块首常驻行的**长度**」判别全文/紧凑，而不是断言某条特定规则的内容；
+  // 同时在两次写入之间跨一个毫秒，让顺序本身也确定（既有用例注释里记过同一个坑）。
   const { fake, dispose } = await setup({
     reflectOnSessionEnd: false,
     standingRuleFullEveryTurns: 0,
@@ -4092,28 +4097,37 @@ test('常驻规则（评审 F2）：全文被预算截断时不得记账，下�
     const session = fakeSession('s1', '/work/demo')
     fake.emit('session/created', session)
     await fake.flush()
-    // 常驻规则按 `ts` **倒序**（最新的在前）：把带标记的那条**最后**写，它才会排在块首、完整落地；
-    // 后写的那条把总量顶过预算，于是只有它被截断。
-    await toolOf(fake, 'memory_save').execute({
-      text: '用户偏好：交付文档一律用中文撰写，代码与命令保留原文；另外状态报告要写清验收证据，不要只给结论。',
-      kind: 'preference',
-    } as never, undefined as never)
     await toolOf(fake, 'memory_save').execute({
       text: '用户偏好：提交前必须跑完整门禁并把结果贴出来；另外若门禁未跑完就不要讨论提交，也不要替用户打 tag，因为 CI 会因为 tag 触发发布流程。',
       kind: 'preference',
     } as never, undefined as never)
+    // 跨过同一个毫秒：时间戳打平会让「最新的在前」退化成文件序。
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await toolOf(fake, 'memory_save').execute({
+      text: '用户偏好：交付文档一律用中文撰写，代码与命令保留原文；另外状态报告要写清验收证据而不是只给结论，'
+        + '并且每条结论都要带可复核的锚点（命令、路径或数字），不要只写「通过」「已修」。',
+      kind: 'preference',
+    } as never, undefined as never)
+
+    /** 块首那条常驻行。 */
+    const firstStandingLine = (block: string): string =>
+      block.split('\n').find(line => /^\d+\. \(long-term preference\)/u.test(line)) ?? ''
+    // 全文形态 ≈ 序号与标签 26 + 正文 + ` manual`；紧凑形态只留首句（≤60），两者差得很开。
+    const FULL_MIN = 80
 
     fake.emit('session/event', session, event('turn/start', { turn: 1 }))
     fake.emit('session/event', session, userMessage('写一个正则解析时间戳'))
     const first = sectionText(fake, 'memory-layer:recall')
-    assert.match(first, /触发发布流程/u, `第 1 条规则的全文应完整落地：${first}`)
+    assert.ok(first.includes('…'), `本用例的前提是「确实被截断」，先确认预算够紧：${first}`)
+    assert.ok(firstStandingLine(first).length >= FULL_MIN,
+      `块首规则应以全文形态落地（${firstStandingLine(first).length} 字符）：${first}`)
 
     fake.emit('session/event', session, event('turn/start', { turn: 2 }))
     fake.emit('session/event', session, userMessage('再写一个正则解析时间戳'))
     const second = sectionText(fake, 'memory-layer:recall')
-    // 判别点：截断发生时不得记为「已发全文」，否则这里只会看到第 1 条规则的紧凑形态。
-    assert.match(second, /触发发布流程/u,
-      `常驻全文没完整落地就不许记账，第 2 轮必须仍是全文：${second}`)
+    // 判别点：截断发生时不得记为「已发全文」，否则第 2 轮所有常驻行都只剩紧凑形态。
+    assert.ok(firstStandingLine(second).length >= FULL_MIN,
+      `常驻全文没完整落地就不许记账，第 2 轮必须仍是全文（${firstStandingLine(second).length} 字符）：${second}`)
   } finally {
     await dispose()
   }

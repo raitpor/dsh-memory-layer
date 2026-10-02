@@ -429,6 +429,14 @@ export interface TechniqueRecord {
   referenced?: number
   /** 最近一次被引用的时间。 */
   lastReferencedAt?: number
+  /**
+   * `referenced` 的**口径版本**（见 `REFERENCE_EPOCH`）：这个计数是在哪一版引用针规则下攒起来的。
+   *
+   * 为什么要它：0.2.8 引入引用观测、0.2.14 才把「语言内置名」与「泛化针」清出针集 —— 中间那些
+   * 计数混着两种口径，既不能与之后的数比，也不该继续给 L5 排序加权。维护会把这些**旧口径**的
+   * 计数清零并盖上当前版本号（`referenceEpoch`），于是 `memory_stats` 的引用率前后可比。
+   */
+  referenceEpoch?: number
   /** 被实际采用次数。 */
   applied: number
   /** 采用成功次数。 */
@@ -622,6 +630,23 @@ export interface FailureRecord {
   resolvedAt?: number
   /** 解决时的累计次数，用于在提醒里说明「解决之后又被触发了几次」。 */
   occurrencesAtResolve?: number
+  /**
+   * 已被标记解决的记录**再次被观测到**的次数（未定义 = 从未复发）。
+   *
+   * 为什么必须重开而不是继续沉默：`shouldWarn` 见 `deprecated` 直接返回 false，而复发只累加
+   * `occurrences` —— 于是「当时那条修法不成立」这件事永远不会被告知。真库实测：4 条已解决记录里
+   * **3 条在复发**（69 / 22 / 1 次，最后一次就在当天），预警却一直是关着的。
+   */
+  relapses?: number
+  /** 最近一次复发的时间（Unix 毫秒）。 */
+  lastRelapseAt?: number
+  /**
+   * **本次复发回合**的起点计数：回合内次数 = `occurrences - occurrencesAtReopen`。
+   *
+   * 为什么升级强度要按回合算：一条 77 次的老记录一复发若继续沿用生命周期计数，会立刻跳到
+   * `ask`/`block`（`enforcementFor` 只看次数），「重开」就变成了误伤。再次 resolve 时清空。
+   */
+  occurrencesAtReopen?: number
   /** 可执行守卫条件（P2 使用）。 */
   guard?: GuardSpec
   /** 当前处置强度。 */

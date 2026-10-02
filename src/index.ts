@@ -76,6 +76,7 @@ import {
   injectable,
   isArchivable,
   mentionsNeedle,
+  REFERENCE_EPOCH,
   referenceNeedles,
   resolveTechniqueId,
   techniqueIndexLine,
@@ -88,6 +89,7 @@ import {
   DEFAULT_GUARD_TOOLS,
   deriveGuard,
   enforcementFor,
+  episodeOccurrences,
   deriveTrigger,
   failureApplies,
   failureDenialReason,
@@ -154,6 +156,19 @@ export interface Config {
   recallLimit?: number
   /** 召回注入的字符上限，超出即截断。 */
   recallChars?: number
+  /**
+   * ① 重复条目改发**指针形态**（默认 `true`）：本会话已经完整给过、且内容没变的召回条目，
+   * 不再逐轮重印全文，只留「可寻址的把手 + 首句」。
+   *
+   * 依据（真会话 3 天回放）：674 个不同条目 / **7,618 次出现**（平均每条发 11 次），
+   * **86.1% 的条目字符是重复**；模型手里本来就有上一轮那段文本（注入块就在对话历史里）。
+   *
+   * 为什么不是「只发一次」：长会话里早期注入会被宿主的 compaction 裁掉 —— 收到 compaction
+   * 事件时本插件的「已给过」记账整份作废，下一轮恢复全文（实现按 `compaction/` 前缀匹配，
+   * 覆盖 `compaction/start` / `end` / `prune` 等全部形态）。
+   * 重发全文的节奏与常驻规则共用 `standingRuleFullEveryTurns`。
+   */
+  recallRepeatCompact?: boolean
   /** 是否把召回结果注入 system prompt。 */
   injectPrompt?: boolean
   /** 注入 section 的排序值，越小越靠前。 */
@@ -350,6 +365,12 @@ export interface Config {
   reflectMaxTranscriptChars?: number
   /** 是否启用失败经验层（重复犯错的识别与预警）。默认 `true`。 */
   failures?: boolean
+  /**
+   * 是否在每次刷新时对失败层做一次维护（默认 `true`）：把「已标记解决、但计数证明之后又发生过」
+   * 的记录重新打开。关掉后，复发只由**实时观测**重开（`upsertFailures` 那一条路径），
+   * 存量记录不会被回溯迁移。
+   */
+  failureMaintenance?: boolean
   /** 第几次重复开始注入预警。 */
   failureWarnAfter?: number
   /** 第几次重复开始在派发前询问（P2 生效）。 */
@@ -578,6 +599,24 @@ const SESSION_RESTATEMENT_RATIO = 0.5
 const RECALL_DUPLICATE_RATIO = 0.6
 
 /**
+ * 条目内容的廉价指纹（FNV-1a 32 位，十六进制）。
+ *
+ * 用途只有一个：判断「本会话上次给过的那条，内容还是不是同一份」。条目正文只有几百字符、
+ * 每轮至多几条，因此不需要密码学哈希；`crypto` 那条路还要走密钥，成本与复杂度都不划算。
+ *
+ * @param text - 条目正文。
+ * @returns 8 位十六进制指纹。
+ */
+function contentHash(text: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, '0')
+}
+
+/**
  * 一个引用针要在**几张卡**上都成立才算「泛化针」（评审 F1）。
  *
  * 依据：引用针的语义是「这张卡的线索出现在模型的动作里」。若同一个符号在三张以上的卡上都成立，
@@ -589,6 +628,14 @@ const RECALL_DUPLICATE_RATIO = 0.6
  * 到三张就退化成「这门框架里到处都是的名字」。
  */
 const GENERIC_NEEDLE_CARDS = 3
+
+/**
+ * ③ 文件级精确命中：每个会话最多记多少个「针 + 文件」关联。
+ *
+ * 只是内存卫生的上限（超长会话里一个文件一个条目，不封顶会无界增长）；200 远超真实会话里
+ * 被符号点到的文件数（实测 3 天窗口内平均每会话十几个）。
+ */
+const NEEDLE_FILES_PER_SESSION = 200
 
 /**
  * 把一条技巧草稿压成用于复述比对的正文。
@@ -637,6 +684,8 @@ export const Config: z<Config> = z.object({
   dir: z.string(),
   recallLimit: z.natural().min(1).max(20).default(5),
   recallChars: z.natural().min(200).max(20_000).default(4000),
+  /** ① 已完整给过、内容未变的召回条目改发指针形态（见 Config 里的说明）。默认 `true`。 */
+  recallRepeatCompact: z.boolean().default(true),
   injectPrompt: z.boolean().default(true),
   promptOrder: z.number().default(250),
   registerTools: z.boolean().default(true),
@@ -732,6 +781,8 @@ export const Config: z<Config> = z.object({
   reflectBackoffAfterEmpty: z.natural().min(1).max(100).default(5),
   reflectMaxTranscriptChars: z.natural().min(1000).max(200_000).default(24_000),
   failures: z.boolean().default(true),
+  /** 失败层的存量维护（重开已复发但被标为已解决的记录）。默认 `true`。 */
+  failureMaintenance: z.boolean().default(true),
   failureWarnAfter: z.natural().min(1).max(50).default(2),
   failureAskAfter: z.natural().min(1).max(50).default(3),
   // 0 表示从不硬拦截：拦截会阻断正常工作，必须显式开启。
@@ -801,6 +852,7 @@ interface Settings {
   partition: string
   recallLimit: number
   recallChars: number
+  recallRepeatCompact: boolean
   injectPrompt: boolean
   promptOrder: number
   registerTools: boolean
@@ -844,6 +896,7 @@ interface Settings {
   reflectBackoffAfterEmpty: number
   reflectMaxTranscriptChars: number
   failures: boolean
+  failureMaintenance: boolean
   failureWarnAfter: number
   failureAskAfter: number
   failureBlockAfter: number
@@ -1085,17 +1138,20 @@ export function apply(ctx: Context, config: Config): void {
         }
       }
     }
-    // 评审 F1 的历史污染修正：**有效针集为空**的卡，它的 `referenced` 全部来自误命中
-    // （真库实测 3 张卡 / 9 次引用：`readFileSync` 系 5、`assert.ok` 系 3、`Array.isArray` 系 1）。
-    // 「有效」= 去掉泛化针之后剩下的针（内置名在 `referenceNeedles` 里就已经被剔除）——
-    // 复审指出：只按「针集为空」判会让「针集只剩泛化针」的卡留下虚高计数（当前真库 0 张，
-    // 但库长大后会再出现）。只动有效针集为空的卡：还有专有针时无法区分哪几次是真引用，宁可留高。
+    // ⑤ 引用口径修复（0.2.14）：把**旧口径**攒起来的 `referenced` 清零并盖上当前版本号。
+    //
+    // 为什么整批清、而不是只清「有效针集为空」的卡：0.2.8–0.2.13 的针集里混着语言内置名
+    // （`readFileSync`…）与框架泛化名（`dependsOn`…），那些计数**无法区分**哪一次是真引用 ——
+    // 于是 `memory_stats` 的引用率前后不可比，L5 排序也一直吃着这批不可信的历史值。
+    // `referenced` 只喂 L5 的排序加成（+10% 封顶），清零的代价是短期内少一点排序信号，
+    // 换来的是「引用率」这个观测从此可用。
+    // 幂等：盖过章的卡（`referenceEpoch >= REFERENCE_EPOCH`）下一轮不再命中。
     let repairedReferences = 0
     for (const record of records) {
       if ((record.referenced ?? 0) === 0) continue
-      if (referenceNeedles(record).some(needle => !genericNeedles.has(needle))) continue
+      if ((record.referenceEpoch ?? 0) >= REFERENCE_EPOCH) continue
       const base = patchById.get(record.id) ?? record
-      const fixed: TechniqueRecord = { ...base, referenced: 0 }
+      const fixed: TechniqueRecord = { ...base, referenced: 0, referenceEpoch: REFERENCE_EPOCH }
       delete fixed.lastReferencedAt
       patchById.set(record.id, fixed)
       repairedReferences += 1
@@ -1109,13 +1165,71 @@ export function apply(ctx: Context, config: Config): void {
           `memory: technique maintenance on ${directory ?? '(unknown cwd)'} — ${applied} record(s) rewritten `
           + `(${archived} archived${capped === 0 ? '' : `, ${capped} over per-domain cap`}, `
           + `${renamed} domain name(s) normalized`
-          + `${repairedReferences === 0 ? '' : `, ${repairedReferences} stale reference count(s) reset`})`,
+          + `${repairedReferences === 0 ? '' : `, ${repairedReferences} pre-epoch reference count(s) reset to 0 (epoch ${REFERENCE_EPOCH})`})`,
         )
       }
       return applied > 0
     } catch (error) {
       // 维护是增益：失败只记日志，绝不让它影响正常的读取与检索。
       logger.warn(`memory: technique maintenance failed: ${describe(error)}`)
+      return false
+    }
+  }
+
+  /**
+   * ④ 的**存量修复**：把「已被标记解决、但计数证明它之后又发生过」的失败记录重新打开。
+   *
+   * 为什么必须有这一步（而不是只改写入路径）：这些记录是旧语义下写的 —— `resolvedAt` 一直留着，
+   * 于是 `shouldWarn` 永远 false。真库 4 条已解决记录里 3 条属于这一类（69 / 22 / 1 次复发，
+   * 最后一次就在当天）。不迁移的话它们要等到**下一次**真的复发才会重开，而那正是最该被提前告知的
+   * 时刻（「你上次以为修好了，其实没有」）。
+   *
+   * 两个取值上的取舍：
+   *  - 历史复发次数进 `relapses`（可见、可统计）；
+   *  - `occurrencesAtReopen` 取**当前**计数，让升级强度从这个回合的 `warn` 重新起算 —— 直接把 69
+   *    次当回合会立刻跳到 ask/block，把「重开」变成误伤（这些记录都没有 guard，本就不该拦）。
+   * 幂等：写完 `resolvedAt` 就没了，下一次同一条件不再命中。
+   *
+   * @param records - 该桶已加载的失败记录（project + global 去重后）。
+   * @param directory - 当前桶的工作目录；未知时为 `undefined`。
+   * @returns 写盘了返回 `true`。
+   */
+  const maintainFailures = async (
+    records: readonly FailureRecord[],
+    directory: string | undefined,
+  ): Promise<boolean> => {
+    if (!settings.failureMaintenance) return false
+    const patches: FailureRecord[] = []
+    for (const record of records) {
+      if (record.resolvedAt === undefined || record.occurrencesAtResolve === undefined) continue
+      const relapsed = record.occurrences - record.occurrencesAtResolve
+      if (relapsed <= 0) continue
+      const patch: FailureRecord = {
+        ...record,
+        relapses: (record.relapses ?? 0) + relapsed,
+        lastRelapseAt: record.lastSeen,
+        // 与实时路径同一约定（见 `FailureRecord.occurrencesAtReopen`）：**已计入的最后一次发生**
+        // 就是本回合的第 1 次，于是回合起点 = 总数 − 1，`episodeOccurrences()` 两处同值。
+        occurrencesAtReopen: record.occurrences - 1,
+        status: 'validated',
+      }
+      delete patch.resolvedAt
+      // 强度也走同一个来源（`episodeOccurrences`），不再手写 `enforcementFor(1, …)`。
+      patch.enforcement = enforcementFor(episodeOccurrences(patch), escalation)
+      patches.push(patch)
+    }
+    if (patches.length === 0) return false
+    try {
+      const applied = await store.updateFailures(patches, directory)
+      if (applied > 0) {
+        logger.info(
+          `memory: failure maintenance — ${applied} resolved record(s) had relapsed and were re-opened`,
+        )
+      }
+      return applied > 0
+    } catch (error) {
+      // 维护是增益：失败只记日志，绝不让它影响正常的读取与预警。
+      logger.warn(`memory: failure maintenance failed: ${describe(error)}`)
       return false
     }
   }
@@ -1155,6 +1269,15 @@ export function apply(ctx: Context, config: Config): void {
       ;[projectTech, globalTech] = await Promise.all([
         store.readTechniques('project', directory, settings.partition),
         store.readTechniques('global', undefined, settings.partition),
+      ])
+    }
+    // ④ 的存量修复（0.2.14）：把「已标记解决、但计数证明之后又发生过」的失败记录重新打开。
+    // 与技巧维护同处一层：必须在重建 `failureById` **之前**跑，并重读。
+    const failuresMaintained = await maintainFailures(dedupeById([...projectFail, ...globalFail]), directory)
+    if (failuresMaintained) {
+      ;[projectFail, globalFail] = await Promise.all([
+        store.readFailures('project', directory, settings.partition),
+        store.readFailures('global', undefined, settings.partition),
       ])
     }
     // DEF-28：这两张表必须**先清空再重建**。只 `set` 不 `clear` 时，被删除的记录会永远留在
@@ -1419,7 +1542,9 @@ export function apply(ctx: Context, config: Config): void {
           ...(cwd === undefined ? {} : { cwd }),
           partition: settings.partition,
           sessionId: state.sessionId,
-          enforcement: occurrences => enforcementFor(occurrences, escalation),
+          // 回合内次数（`episodeOccurrences`）：未复发过时等于累计值，复发后从重开点重新起算 ——
+          // 一条 77 次的老记录复发不会直接跳到 ask / block。
+          enforcement: record => enforcementFor(episodeOccurrences(record), escalation),
         },
       )
       for (const record of records) {
@@ -1982,6 +2107,18 @@ export function apply(ctx: Context, config: Config): void {
    */
   const advisorySeen = new Map<string, Set<string>>()
 
+  /**
+   * ③ 文件级精确命中（0.2.14）：本会话「某张卡的针**已经在这个文件上**逐字命中过」的关联。
+   *
+   * 为什么需要它：L4 只看**这一次调用**的参数里有没有针 —— 而真实的改动常常落在同一个文件的
+   * 第二、第三处（补一个分支、改一行），那时参数里已经没有符号了，同一张卡就从「精确命中」掉回
+   * 「证据词」档，容易被别的卡挤掉。记下「针 + 文件」的关联，后续对该文件的改动仍按精确命中算。
+   *
+   * 会话级状态：这是本会话观测到的事实（`read`/`grep`/`edit` 哪个文件出现过这个符号），
+   * 会话结束即作废，不跨会话污染；每个会话最多记 {@link NEEDLE_FILES_PER_SESSION} 个文件。
+   */
+  const needleFiles = new Map<string, Map<string, Set<string>>>()
+
   /** 本会话**读过**（search/get/memory_search 命中）的技巧 id：用于拦「复述刚读到的条目」。 */
   const retrievedBySession = new Map<string, Set<string>>()
   /**
@@ -2049,6 +2186,18 @@ export function apply(ctx: Context, config: Config): void {
    */
   const standingFullShown = new Map<string, { signature: string; turn: number | undefined }>()
 
+  /**
+   * ① 每个会话「**已经完整投递过**的召回条目」→ `{ 内容指纹, 上次全文投递的轮号 }`。
+   *
+   * 为什么要它：实测 674 个不同条目 / 7,618 次出现（平均每条发 11 次），**86.1% 的条目字符是重复** ——
+   * 而注入块就躺在对话历史里，逐轮重印是纯付费。已给过且内容未变的条目改发指针形态。
+   *
+   * 为什么不能「只发一次」：长会话里早期注入会被宿主的 compaction 裁掉，那时「已经给过」不成立。
+   * 因此收到任何 `compaction/*` 事件就把本会话的记账整份作废（`standingFullShown` 同理 ——
+   * 它的全文也可能已经被裁掉）。只记当轮**真的完整落在块里**的条目（与 ②a 的 F2 判据同源）。
+   */
+  const repeatSent = new Map<string, Map<string, { hash: string; fullTurn: number | undefined }>>()
+
   /** 动作点顾问：从工具调用里抽文件路径与调用名，只认强证据命中。 */
   const advisoryFor = (exec: { name: string; arguments: unknown }): string | undefined => {    if (!settings.techniques || !settings.techniqueAdvisory) return undefined
     const sessionId = current?.sessionId
@@ -2074,12 +2223,37 @@ export function apply(ctx: Context, config: Config): void {
     // 没有 api），硬过滤等于在编辑点让一半库彻底失声 —— 而 0.2.8 的输入侧去伪（P0）之后，
     // 动作点的泛化证据词噪声已经从"18 行里 11 行"降到最近窗口的 0 行（2 条动作点顾问全部对题）。
     // 所以这里只做**排序偏好**：有精确命中就用精确的，没有才回退到证据词规则。
+    //
+    // ③ 文件级（0.2.14）：除了「这次参数里有针」，**本会话已经在这个文件上命中过针**的卡也算精确
+    // 命中 —— 同一文件的第二、第三处改动参数里往往已经没有符号了，那时不该掉回证据词档。
     const precise = ADVISORY_PRECISE_TOOLS.has(exec.name)
-      ? corpus.filter(doc => doc.layer !== 'technique' || needleInArgs(doc.id, raw))
+      ? corpus.filter(doc => doc.layer !== 'technique'
+        || needleInArgs(doc.id, raw)
+        || filePrecise(doc.id, raw))
       : []
-    const hits = precise.length === 0
-      ? advisoryMatches(corpus, terms, { limit: 1, seen })
-      : advisoryMatches(precise, terms, { limit: 1, seen })
+    // ③ 记下关联：本次调用里逐字命中针的卡与这次触及的文件绑定（供后续同文件的调用使用）。
+    // 无论这一轮有没有真的推出顾问都要记 —— 「命中过」是事实，与「推过」无关。
+    if (precise.length > 0) {
+      noteNeedleFiles(
+        precise.filter(doc => doc.layer === 'technique' && needleInArgs(doc.id, raw)).map(doc => doc.id),
+        raw,
+      )
+    }
+    // ③ 多符号优先（0.2.14）：精确层里**命中 ≥2 个针**的卡先成档 —— 一个针可能是巧合（项目里
+    // 同名符号、路径里撞上），两个针同时逐字命中基本就锁定是这张卡。用排序偏好而不是硬过滤：
+    // 没有卡到 2 个针时（`strong` 为空）整层照旧按证据词排，精确层不会空转。
+    const strong = new Set(precise.filter(doc => needleHitCount(doc.id, raw) >= 2).map(doc => doc.id))
+    const preciseHits = precise.length === 0
+      ? []
+      : advisoryMatches(precise, terms, {
+        limit: 1,
+        seen,
+        ...(strong.size === 0 ? {} : { prefer: strong }),
+      })
+    // 精确层里**没有可推的卡**（比如那张卡本轮已经推过、或被 `seen` 挡掉）时照旧回退证据词规则：
+    // 「有精确命中就用精确的」说的是**排序偏好**，不是「精确层一旦非空就闭嘴」—— 后者会让同一文件
+    // 第二次改动时，本来能命中的泛化卡（52% 的卡没有符号面）彻底失声。既有用例正是钉这一条。
+    const hits = preciseHits.length > 0 ? preciseHits : advisoryMatches(corpus, terms, { limit: 1, seen })
     if (hits.length === 0) return undefined
     for (const hit of hits) seen.add(hit.id)
     advisorySeen.set(sessionId, seen)
@@ -2270,6 +2444,21 @@ export function apply(ctx: Context, config: Config): void {
       || (standingTurn !== undefined && shownBefore.turn === standingTurn)
       || (fullEvery > 0 && standingTurn !== undefined && shownBefore.turn !== undefined
         && standingTurn - shownBefore.turn >= fullEvery)
+    // ① 重复条目的指针形态：可寻址的把手 + 首句（上限与常驻紧凑形态同口径，默认 60 字符）。
+    // 技巧给「id + 名称」（正文本来就要 `technique_get`），其余给「id + 首句」—— 有 id 才能被
+    // `memory_search` / `memory_forget` 这类工具对上。
+    const repeatPointerLine = (hit: { id: string; text: string }, record: TechniqueRecord | undefined): string =>
+      (record !== undefined
+        ? `${record.id.slice(0, 11)} ${record.name}`
+        : `${hit.id.slice(0, 11)} ${compactStandingText(hit.text)}`)
+      + ' — unchanged, full text delivered earlier in this session'
+    // ①：本会话已完整给过、内容未变的条目改发指针形态。注入块就在对话历史里，模型上一轮已经读过；
+    // 逐轮重印是纯付费（实测 674 个条目 / 7,618 次出现，**86.1% 的条目字符是重复**）。
+    const repeatSession = current?.sessionId
+    const sentForSession = settings.recallRepeatCompact && repeatSession !== undefined
+      ? repeatSent.get(repeatSession)
+      : undefined
+    const renderedEntries: { id: string; hash: string; line: string; full: boolean }[] = []
     const lines = kept.map((hit, index) => {
       const kind = recallLabel(hit.layer, hit.meta?.kind)
       // 逐条整形（去掉与正文重复的标题 + 封顶）：整块预算再砍尾巴时，至少不会出现半截条目。
@@ -2282,12 +2471,28 @@ export function apply(ctx: Context, config: Config): void {
       // 注意这**不是**把技巧从召回段删掉：技巧段只放得下 `techniqueLimit` 条，第 4 条起仍由召回段
       // 呈现（否则它们会彻底消失，见 DEF-29），只是改用同一个索引行形态。
       const record = hit.layer === 'technique' ? techniqueById.get(hit.id) : undefined
-      const body = record !== undefined
-        ? techniqueInjectionLine(record)
-        : standingIds.has(hit.id) && !showFullStanding
-          ? compactStandingText(hit.text)
-          : compactEntryText(hit.text)
-      return `${index + 1}. (${kind}) ${sanitizeForInjection(body)}`
+      const standingRule = standingIds.has(hit.id)
+      const hash = contentHash(hit.text)
+      const previous = sentForSession?.get(hit.id)
+      // 全文的时机：常驻规则走 ②a 自己的节奏（不参与 ①，否则「每轮在场」的语义会被指针吃掉）、
+      // 从没见过、**内容变了**、同一轮内重复渲染（保持同形态）、以及距上次全文已过 N 轮；
+      // 收到 compaction 事件时记账会被整份作废，于是这里自然回到「从没见过」。
+      const showFull = standingRule
+        || previous === undefined
+        || previous.hash !== hash
+        || (standingTurn !== undefined && previous.fullTurn === standingTurn)
+        || (fullEvery > 0 && standingTurn !== undefined && previous.fullTurn !== undefined
+          && standingTurn - previous.fullTurn >= fullEvery)
+      const body = showFull
+        ? (record !== undefined
+          ? techniqueInjectionLine(record)
+          : standingRule && !showFullStanding
+            ? compactStandingText(hit.text)
+            : compactEntryText(hit.text))
+        : repeatPointerLine(hit, record)
+      const line = `${index + 1}. (${kind}) ${sanitizeForInjection(body)}`
+      renderedEntries.push({ id: hit.id, hash, line, full: showFull })
+      return line
     })
     // 常驻规则与「本轮相关」的条目在同一个块里，必须让模型分清语气差别，否则它会把
     // 一条与本轮无关的偏好当成跑题的噪声而忽略掉。
@@ -2304,6 +2509,20 @@ export function apply(ctx: Context, config: Config): void {
     if (standingSession !== undefined && standing.length > 0 && showFullStanding
       && rendered.includes(lines.slice(0, standing.length).join('\n'))) {
       standingFullShown.set(standingSession, { signature: standingSignature, turn: standingTurn })
+    }
+    // ① 记账（同样只记**真的完整落在块里**的条目）：只有全文形态那一次才推进 `fullTurn` ——
+    // 指针形态若也推进，定期重发会被自己顶掉，「每 N 轮给一次全文」就永远不触发。
+    if (repeatSession !== undefined && renderedEntries.length > 0) {
+      const state = repeatSent.get(repeatSession) ?? new Map<string, { hash: string; fullTurn: number | undefined }>()
+      for (const entry of renderedEntries) {
+        if (!rendered.includes(entry.line)) continue
+        const previous = state.get(entry.id)
+        state.set(entry.id, {
+          hash: entry.hash,
+          fullTurn: entry.full ? standingTurn : previous?.fullTurn,
+        })
+      }
+      repeatSent.set(repeatSession, state)
     }
     return rendered
   }
@@ -2780,13 +2999,19 @@ export function apply(ctx: Context, config: Config): void {
         occurrencesAtResolve: record.occurrences,
         updatedAt: Date.now(),
       }
+      // 本次复发回合到此结束：下次复发会从零起算回合内次数（`relapses` 继续累加，不丢历史）。
+      delete updated.occurrencesAtReopen
       const ok = await runFailureWrite(async () =>
         store.updateFailure(updated, updated.scope === 'project' ? projectCwd() : undefined))
       await refresh(current?.cwd)
       if (!ok) return `Could not update failure "${id}".`
       const scene = cleanTrigger === undefined ? '' : ` Trigger scene: "${cleanTrigger}".`
+      const relapses = record.relapses ?? 0
       return `Marked resolved: "${record.symptom}"${clean.length > 0 ? ` with remedy "${clean}"` : ' (no remedy recorded)'}.${scene}`
         + ' It will stay silent unless a future session runs into the same trigger scene, where it resurfaces as a heads-up.'
+        + (relapses === 0
+          ? ''
+          : ` Note: it had already relapsed ${relapses} time(s) after an earlier resolve — if it happens again the record is re-opened and warned about immediately.`)
     },
     async forgive(id) {
       await refresh(current?.cwd)
@@ -2902,23 +3127,70 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * 本次调用的参数里逐字出现了这张卡的**几个**引用针（③ 多符号的证据强度）。
+   *
+   * 与 `needleInArgs` 同源：泛化针一律不计，内置名在 `referenceNeedles` 里就已经被剔除。
+   *
+   * @param id - 技巧 id。
+   * @param raw - 工具参数的原始文本。
+   * @returns 命中的针数（0 = 没有精确命中）。
+   */
+  const needleHitCount = (id: string, raw: string): number => {
+    const record = techniqueById.get(id)
+    if (record === undefined) return 0
+    let needles = needlesById.get(id)
+    if (needles === undefined) {
+      needles = referenceNeedles(record)
+      needlesById.set(id, needles)
+    }
+    return needles.filter(needle => !genericNeedles.has(needle) && mentionsNeedle(raw, needle)).length
+  }
+
+  /**
+   * ③ 记下「针 + 文件」的关联：这些卡在**这次调用触及的文件**上逐字命中过。
+   *
+   * @param ids - 本次调用里逐字命中针的技巧 id。
+   * @param raw - 工具参数的原始文本（用于取文件路径）。
+   */
+  const noteNeedleFiles = (ids: readonly string[], raw: string): void => {
+    const sessionId = current?.sessionId
+    if (sessionId === undefined || ids.length === 0) return
+    const files = filesFromArguments(raw)
+    if (files.length === 0) return
+    const byFile = needleFiles.get(sessionId) ?? new Map<string, Set<string>>()
+    for (const file of files) {
+      const existing = byFile.get(file)
+      if (existing === undefined && byFile.size >= NEEDLE_FILES_PER_SESSION) continue
+      const hit = existing ?? new Set<string>()
+      for (const id of ids) hit.add(id)
+      byFile.set(file, hit)
+    }
+    needleFiles.set(sessionId, byFile)
+  }
+
+  /**
+   * ③ 文件级精确命中：这张卡是否**已经在本会话的这个文件上**逐字命中过。
+   *
+   * @param id - 技巧 id。
+   * @param raw - 本次调用的参数（用于取当前文件）。
+   * @returns 是则为 `true`。
+   */
+  const filePrecise = (id: string, raw: string): boolean => {
+    const sessionId = current?.sessionId
+    if (sessionId === undefined) return false
+    const byFile = needleFiles.get(sessionId)
+    if (byFile === undefined) return false
+    return filesFromArguments(raw).some(file => byFile.get(file)?.has(id) === true)
+  }
+
+  /**
    * 这条卡的引用针是否**逐字**出现在本次调用的参数里（L1 与 L4 共用）。
    *
    * @param id - 技巧 id。
    * @param raw - 工具参数的原始文本。
    * @returns 命中时为 `true`。
    */
-  const needleInArgs = (id: string, raw: string): boolean => {
-    const record = techniqueById.get(id)
-    if (record === undefined) return false
-    let needles = needlesById.get(id)
-    if (needles === undefined) {
-      needles = referenceNeedles(record)
-      needlesById.set(id, needles)
-    }
-    // 泛化针不算精确命中：它说明的是「这个框架里到处都是这个名字」，不是「这次改的就是这张卡」。
-    return needles.some(needle => !genericNeedles.has(needle) && mentionsNeedle(raw, needle))
-  }
+  const needleInArgs = (id: string, raw: string): boolean => needleHitCount(id, raw) > 0
 
   /**
    * L1：把「模型在工具调用参数里引用了这条卡」记到记录上。
@@ -2934,7 +3206,13 @@ export function apply(ctx: Context, config: Config): void {
     for (const id of new Set(ids)) {
       const record = techniqueById.get(id)
       if (record === undefined) continue
-      patched.push({ ...record, referenced: (record.referenced ?? 0) + 1, lastReferencedAt: now })
+      patched.push({
+        ...record,
+        referenced: (record.referenced ?? 0) + 1,
+        lastReferencedAt: now,
+        // ⑤ 口径版本随计数一起写：维护据此判断「这个数是哪一版针规则攒的」。
+        referenceEpoch: REFERENCE_EPOCH,
+      })
     }
     if (patched.length === 0) return
     try {
@@ -2984,6 +3262,9 @@ export function apply(ctx: Context, config: Config): void {
       matched.push({ id, needle })
     }
     if (hitIds.length === 0) return []
+    // ③ 文件级：这次调用在**哪个文件**上逐字命中了这些卡 —— 后续对该文件的改动也算精确命中。
+    // 放在 L1 这一层是为了覆盖非改文件的工具（`read` / `grep` 也会点到符号与文件）。
+    noteNeedleFiles(hitIds, raw)
     for (const id of hitIds) done.add(id)
     referencedBySession.set(sessionId, done)
     logger.debug(`memory: technique referenced → ${hitIds.map(id => id.slice(0, 11)).join(', ')}`)
@@ -3220,7 +3501,8 @@ export function apply(ctx: Context, config: Config): void {
           const referenced = techniques.filter(record => (record.referenced ?? 0) > 0).length
           const events = techniques.reduce((sum, record) => sum + (record.referenced ?? 0), 0)
           const rate = total === 0 ? '0' : (100 * referenced / total).toFixed(1)
-          return `Technique references: ${referenced}/${total} referenced at least once (${rate}%), ${events} event(s)`
+          // ⑤ 口径版本必须可见：跨版本比较这个数没有意义（旧口径的计数已被维护清零）。
+          return `Technique references: ${referenced}/${total} referenced at least once (${rate}%), ${events} event(s) [counter epoch ${REFERENCE_EPOCH}]`
         })(),
         // 评审 F4：首触是唯一没有计数的通道 —— 加了上限之后，「这个会话为什么没收到首触」
         // （是没命中、还是被每会话上限拦下）必须能从回执侧回答。
@@ -3689,6 +3971,15 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
     const state = ensureLive(session)
+    // ① 的反例面（评审明确要求处理的那条）：宿主 compaction 之后，本会话「已经完整给过」的记账
+    // 必须整份作废 —— 被裁掉的全文再也不会出现在上下文里，继续发指针就是让模型去找一段不存在的
+    // 文本。`standingFullShown` 同理作废：常驻规则的全文也可能已经被裁掉，否则它会在接下来的
+    // N 轮里只收到紧凑形态。
+    if (event.type.startsWith('compaction/')) {
+      repeatSent.delete(state.sessionId)
+      standingFullShown.delete(state.sessionId)
+      return
+    }
     switch (event.type) {
       case 'turn/start':
         turnOf(state, event.data.turn)
@@ -3818,6 +4109,8 @@ export function apply(ctx: Context, config: Config): void {
           advisoryLastTurn.delete(id)
           firstContactPushed.delete(id)
           standingFullShown.delete(id)
+          repeatSent.delete(id)
+          needleFiles.delete(id)
           retrievedBySession.delete(id)
           consultedSessions.delete(id)
           if (state.turns.length > 0) logger.debug(`memory: session ${id} distilled`)
@@ -4022,6 +4315,7 @@ function resolveSettings(config: Config): Settings {
     partition: nonEmpty(config.partition) ?? 'default',
     recallLimit: config.recallLimit ?? 5,
     recallChars: config.recallChars ?? 4000,
+    recallRepeatCompact: config.recallRepeatCompact ?? true,
     injectPrompt: config.injectPrompt ?? true,
     promptOrder: config.promptOrder ?? 250,
     registerTools: config.registerTools ?? true,
@@ -4072,6 +4366,7 @@ function resolveSettings(config: Config): Settings {
     reflectBackoffAfterEmpty: config.reflectBackoffAfterEmpty ?? 5,
     reflectMaxTranscriptChars: config.reflectMaxTranscriptChars ?? 24_000,
     failures: config.failures ?? true,
+    failureMaintenance: config.failureMaintenance ?? true,
     failureWarnAfter: config.failureWarnAfter ?? 2,
     failureAskAfter: config.failureAskAfter ?? 3,
     failureBlockAfter: config.failureBlockAfter ?? 0,

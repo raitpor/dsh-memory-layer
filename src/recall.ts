@@ -460,7 +460,7 @@ export interface AdvisoryHit {
 export function advisoryMatches(
   docs: readonly RecallDoc[],
   actionTerms: readonly string[],
-  options: { limit?: number; seen?: ReadonlySet<string> } = {},
+  options: { limit?: number; seen?: ReadonlySet<string>; prefer?: ReadonlySet<string> } = {},
 ): AdvisoryHit[] {
   const limit = options.limit ?? 2
   if (limit <= 0 || actionTerms.length === 0) return []
@@ -487,10 +487,13 @@ export function advisoryMatches(
       ts: doc.ts,
     })
   }
-  // 排序：命中词多者优先 → 命中词更长者（更具体）优先 → 更新时间新者优先。
-  // 最后一条是刻意的：同样相关时，把最近学到/改过的知识推在前面。
+  // 排序：**多符号命中**的卡先成档（③，由调用方给出 `prefer`）→ 命中词多者优先 →
+  // 命中词更长者（更具体）优先 → 更新时间新者优先。最后一条是刻意的：同样相关时，
+  // 把最近学到/改过的知识推在前面。
   return hits
-    .sort((left, right) => right.strong.length - left.strong.length
+    .sort((left, right) => ((options.prefer?.has(right.id) === true ? 1 : 0)
+        - (options.prefer?.has(left.id) === true ? 1 : 0))
+      || right.strong.length - left.strong.length
       || right.strong.join('').length - left.strong.join('').length
       || right.ts - left.ts)
     .slice(0, limit)
@@ -719,9 +722,11 @@ export function recallTechniques(
     const symbolHit = (meta?.symbols ?? []).some(symbol => symbols.has(symbol))
     const symbolBonus = symbolHit ? 1.6 : 1
     const domainBonus = meta?.domain !== undefined && lowerQuery.includes(meta.domain.toLowerCase()) ? 1.2 : 1
-    // L5：引用（L1 观测到的"被模型碰过"）给一个**上限 +10% 的小加成**。刻意压得很小、且
-    // 与 `confidence` 分开：显式回报才是"被验证"，引用只是"被提及"，不能盖过相关性本身。
-    const referenceBonus = 1 + Math.min(meta?.referenced ?? 0, 5) * 0.02
+    // L5：引用（L1 观测到的"被模型碰过"）给一个**有上限的小加成**。刻意压得小、且与
+    // `confidence` 分开：显式回报才是"被验证"，引用只是"被提及"，不能盖过相关性本身。
+    // 0.2.14 起每条 +4%、上限 5 条（合计 +20%）—— ⑤ 清零了旧口径的历史计数、F1 又剔掉了
+    // 内置名与泛化针，这个观测现在可信，值得比原来（+2%/条、上限 +10%）多分一点排序权重。
+    const referenceBonus = 1 + Math.min(meta?.referenced ?? 0, 5) * 0.04
     const base = entry.score > 0 || emptyQuery ? (entry.score > 0 ? entry.score : 1) : 0
     const score = base * TECHNIQUE_WEIGHT * confidence * evidenceBonus * symbolBonus * domainBonus * referenceBonus
     if (score <= 0) continue

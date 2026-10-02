@@ -303,6 +303,19 @@ export function techniqueSymbols(record: TechniqueRecord): string[] {
 }
 
 /**
+ * 引用计数（`referenced`）的**口径版本**。
+ *
+ * 每次改动「什么算引用针」都要 +1：历史计数按旧口径攒的，与新口径不可比，也不该继续给 L5 排序
+ * 加权。维护会把版本低于当前的计数清零并盖章（见 `maintainTechniques`）。
+ *
+ * 版本史：
+ *  - 1（0.2.8–0.2.13）：初版针集 —— 语言内置名（`readFileSync`…）与框架泛化名（`dependsOn`…）
+ *    都在里面，误命中率高；
+ *  - 2（0.2.14）：剔除语言/运行时内置名与「≥3 张卡共享」的泛化针，并把 L4 精确命中一并收紧。
+ */
+export const REFERENCE_EPOCH = 2
+
+/**
  * 引用检测用的最小长度：`apply` / `inject` 这类短标识符在参数里到处都是，
  * 拿它们当"用了这条知识"的证据只会把计数变成噪声。
  */

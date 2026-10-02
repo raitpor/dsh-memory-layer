@@ -697,7 +697,8 @@ export class MemoryStore {
       cwd?: string
       partition?: string
       sessionId: string
-      enforcement: (occurrences: number) => FailureRecord['enforcement']
+      /** 由调用方按处置策略决定强度：存储层不关心阈值，也不做「回合内次数」这类口径算术。 */
+      enforcement: (record: FailureRecord) => FailureRecord['enforcement']
       now?: number
     },
   ): Promise<{ records: FailureRecord[]; touched: FailureRecord[] }> {
@@ -712,6 +713,20 @@ export class MemoryStore {
    */
   async updateFailure(record: FailureRecord, cwd?: string): Promise<boolean> {
     return this.exclusive(() => this.updateFailureInner(record, cwd))
+  }
+
+  /**
+   * 一次写入多条失败记录更新（加锁）。
+   *
+   * 与 {@link updateFailure} 同理，但**合并成一次读-改-写**：存量迁移（一次要重开若干条已复发
+   * 记录）逐个更新会让同一个文件被读、写 N 次。
+   *
+   * @param records - 更新后的失败记录（按 id 命中）。
+   * @param cwd - 项目工作目录（project 作用域需要）。
+   * @returns 实际写入的条数。
+   */
+  async updateFailures(records: readonly FailureRecord[], cwd?: string): Promise<number> {
+    return this.exclusive(() => this.updateFailuresInner(records, cwd))
   }
 
   /**
@@ -1271,7 +1286,8 @@ export class MemoryStore {
       partition?: string
       sessionId: string
       /** 由调用方按「升级阈值」决定处置强度；存储层不关心阈值策略。 */
-      enforcement: (occurrences: number) => FailureRecord['enforcement']
+      /** 由调用方按处置策略决定强度：存储层不关心阈值，也不做「回合内次数」这类口径算术。 */
+      enforcement: (record: FailureRecord) => FailureRecord['enforcement']
       now?: number
     },
   ): Promise<{ records: FailureRecord[]; touched: FailureRecord[] }> {
@@ -1289,7 +1305,19 @@ export class MemoryStore {
         existing.updatedAt = now
         existing.lastSeen = now
         existing.symptom = observation.symptom
-        existing.enforcement = enforcement(existing.occurrences)
+        // ④ 复发重开（0.2.14 修）：已解决的记录**再次真的发生**时，`resolvedAt` 一直留着、状态停在
+        // `deprecated`，于是 `shouldWarn` 永远 false —— 计数一路涨而预警永不出现（真库实测 3/4 条
+        // 已解决记录在复发，最多 69 次，最后一次就在当天）。这里把它重新打开：退回 `validated`、
+        // 清掉 `resolvedAt`，并开一个**复发回合**（`occurrencesAtReopen`）—— 回合内次数才决定升级
+        // 强度，否则 77 次的老记录一复发就直接跳到 ask/block，把「重开」变成误伤。
+        if (existing.resolvedAt !== undefined) {
+          existing.relapses = (existing.relapses ?? 0) + 1
+          existing.lastRelapseAt = now
+          existing.occurrencesAtReopen = existing.occurrences - 1
+          delete existing.resolvedAt
+          existing.status = 'validated'
+        }
+        existing.enforcement = enforcement(existing)
         if (observation.remedy !== undefined && existing.remedy.length === 0) {
           existing.remedy = observation.remedy
         }
@@ -1320,7 +1348,7 @@ export class MemoryStore {
         remedy: observation.remedy ?? '',
         ...(observation.trigger === undefined ? {} : { trigger: observation.trigger }),
         ...(observation.guard === undefined ? {} : { guard: observation.guard }),
-        enforcement: enforcement(1),
+        enforcement: 'warn',
         occurrences: 1,
         prevented: 0,
         sessions: [sessionId],
@@ -1331,6 +1359,8 @@ export class MemoryStore {
         status: 'draft',
         provenance: 'auto',
       }
+      // 新记录同样由调用方定强度：这里只提供「次数 = 1」的记录形态。
+      record.enforcement = enforcement(record)
       byKey.set(record.fingerprint.key, record)
       touched.push(record)
     }
@@ -1363,6 +1393,41 @@ export class MemoryStore {
       records.map(item => JSON.stringify(item)).join('\n') + '\n',
     )
     return true
+  }
+
+  /**
+   * 一次写入多条失败记录更新：按「作用域 + 分区」分组，每组只读-改-写一次。
+   * @param records - 更新后的失败记录（按 id 命中）。
+   * @param cwd - 项目工作目录（project 作用域需要）。
+   * @returns 实际写入的条数。
+   */
+  private async updateFailuresInner(records: readonly FailureRecord[], cwd?: string): Promise<number> {
+    if (records.length === 0) return 0
+    const groups = new Map<string, FailureRecord[]>()
+    for (const record of records) {
+      const key = `${record.scope}\u0000${record.partition}`
+      groups.set(key, [...(groups.get(key) ?? []), record])
+    }
+    let applied = 0
+    for (const group of groups.values()) {
+      const first = group[0]
+      if (first === undefined) continue
+      const all = await this.readFailures(first.scope, cwd, first.partition)
+      const byId = new Map(all.map(record => [record.id, record]))
+      let touched = 0
+      for (const record of group) {
+        if (!byId.has(record.id)) continue
+        byId.set(record.id, record)
+        touched += 1
+      }
+      if (touched === 0) continue
+      await this.writeAtomic(
+        join(this.scopeDir(first.scope, cwd, first.partition), FAILURE_FILE),
+        [...byId.values()].map(record => JSON.stringify(record)).join('\n') + '\n',
+      )
+      applied += touched
+    }
+    return applied
   }
 
   /**

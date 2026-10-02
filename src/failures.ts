@@ -241,9 +241,28 @@ export function enforcementFor(
 }
 
 /**
+ * **本次回合**内这条失败发生了多少次。
+ *
+ * 未复发过时回合 = 全生命周期（返回值与 `record.occurrences` 相同，既有行为不变）；
+ * 复发过的记录从 `occurrencesAtReopen` 重新起算 —— 升级强度与预警阈值都按回合算，
+ * 否则一条 77 次的老记录一复发就直接跳到 `ask`/`block`。
+ *
+ * @param record - 失败记录。
+ * @returns 回合内次数。
+ */
+export function episodeOccurrences(record: FailureRecord): number {
+  return Math.max(1, record.occurrences - (record.occurrencesAtReopen ?? 0))
+}
+
+/**
  * 判断一条失败记录是否该进入预警。
  *
  * 三个条件缺一不可：达到重复阈值、未被解决、技术栈适用。
+ *
+ * 两个细节（0.2.14 修 ④）：
+ *  - 阈值按**回合内**次数算（{@link episodeOccurrences}），复发不会因为历史计数高而立刻升级；
+ *  - 但**复发本身直接触发预警**：`resolvedAt` 被命中意味着「当时那条修法不成立」，这是比
+ *    「又重复了一次」更强的信号，不该再等它把回合累积到 `warn` 才吭声。
  *
  * @param record - 失败记录。
  * @param thresholds - 阈值。
@@ -251,7 +270,8 @@ export function enforcementFor(
  */
 export function shouldWarn(record: FailureRecord, thresholds: EscalationThresholds): boolean {
   if (record.status === 'deprecated') return false
-  return record.occurrences >= thresholds.warn
+  if ((record.relapses ?? 0) > 0) return true
+  return episodeOccurrences(record) >= thresholds.warn
 }
 
 /**
@@ -343,8 +363,13 @@ export function deriveGuard(
  * @returns 单行文本。
  */
 export function failureWarningLine(record: FailureRecord, recentFiles: readonly string[] = []): string {
+  const relapses = record.relapses ?? 0
   const parts = [
-    `[已重复 ${record.occurrences} 次] ${record.symptom}`,
+    // 复发过的记录不能再说「已重复 N 次」：那个 N 是历史累计，会把「当时修法没成立」这件事
+    // 藏在一个大数字后面。这里明说是复发、并只报**本回合**的次数。
+    relapses > 0
+      ? `[已解决后又复发（第 ${relapses} 次复发，本回合第 ${episodeOccurrences(record)} 次）] ${record.symptom}`
+      : `[已重复 ${record.occurrences} 次] ${record.symptom}`,
   ]
   if (record.remedy.length > 0) parts.push(`正确做法：${record.remedy}`)
   else parts.push('先定位根因再重试，不要原样重复上一次操作')
@@ -467,6 +492,12 @@ export function failureDetail(record: FailureRecord): string {
       ? 0
       : Math.max(0, record.occurrences - record.occurrencesAtResolve)
     lines.push(`Resolved at: ${new Date(record.resolvedAt).toISOString()}${relapsed > 0 ? `（解决后又触发 ${relapsed} 次）` : ''}`)
+  }
+  // 复发过（= 曾被解决、后来又真的发生）的记录：把「那条修法不成立」以及本次回合的次数摆出来。
+  // 只有这里能看见它 —— 记录一旦重开，`Resolved at` 那行就不再打印。
+  if ((record.relapses ?? 0) > 0) {
+    const last = record.lastRelapseAt === undefined ? '' : ` latest ${new Date(record.lastRelapseAt).toISOString()}`
+    lines.push(`Relapsed ${record.relapses} time(s) after being marked resolved; this episode: ${episodeOccurrences(record)} occurrence(s),${last}`)
   }
   if (record.fingerprint.template !== undefined) lines.push(`Template: ${record.fingerprint.template}`)
   if (record.sessions.length > 0) lines.push(`Sessions: ${record.sessions.join(', ')}`)

@@ -20,10 +20,13 @@ import { apply, messageSourceFor, isInjectedUserMessage, sessionFormatMinor } fr
 import { HOST_CONTEXT_MARKERS, INJECTION_BLOCKS, advisoryText } from '../src/injection.js'
 import { isInjectedContext } from '../src/distill.js'
 import type { Config } from '../src/index.js'
+import type { FailureRecord, TechniqueRecord } from '../src/types.js'
 import { MemoryStore, TECHNIQUE_FILE } from '../src/store.js'
 import { createCodec } from '../src/crypto.js'
 import { RECALL_ENTRY_CHARS } from '../src/injection.js'
-import { DETAILED_HITS, MAX_VERIFICATION_CHARS, checkVerificationEvidence } from '../src/technique.js'
+import {
+  DETAILED_HITS, MAX_VERIFICATION_CHARS, REFERENCE_EPOCH, checkVerificationEvidence,
+} from '../src/technique.js'
 import { parseSkillFrontmatter, verifySkill } from '../src/skill.js'
 
 /** 一段注入到 system prompt 的注册记录。 */
@@ -2207,6 +2210,344 @@ test('已解决的失败：触发场景命中时提前提醒，场景不符则�
   }
 })
 
+test('④ 复发重开：已解决的失败**再次真的发生**时重新打开并立刻预警', async () => {
+  // 缺陷（真库实测）：`upsertFailuresInner` 只把 `draft→validated`，从不碰 `resolvedAt`，而
+  // `shouldWarn` 见 `deprecated` 直接 false —— 于是「当时那条修法不成立」永远不会被告知。
+  // 真库 4 条已解决记录里 3 条在复发（69 / 22 / 1 次，最后一次就在当天），预警一直是关着的。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    // 1) 两个会话各犯一次同一个错 → 一条记录；2) 解决它。
+    await failSession(fake, fakeSession('f1', '/work/demo'), 'ENOENT: cannot write report.json')
+    await failSession(fake, fakeSession('f2', '/work/demo'), 'ENOENT: cannot write report.json')
+    const listed = String(await toolOf(fake, 'failure_list').execute({} as never, undefined as never))
+    const id = /fa_[0-9a-fA-F-]+/u.exec(listed)?.[0] ?? ''
+    assert.ok(id.length > 0, `failure_list 应给出 id：${listed}`)
+    await toolOf(fake, 'failure_resolve').execute({
+      id,
+      remedy: '先创建报告目录再写文件',
+      trigger: '写 report.json 之前忘了建目录',
+    } as never, undefined as never)
+    const readRecord = async (): Promise<FailureRecord | undefined> =>
+      (await new MemoryStore(root).readFailures('global')).find(record => record.id === id)
+    assert.equal((await readRecord())?.status, 'deprecated', '解决后进入沉默')
+
+    // 3) 反例面：**没有**复发的会话不该收到预警，也不该重新打开记录。
+    const quiet = fakeSession('q1', '/work/demo')
+    fake.emit('session/created', quiet)
+    fake.emit('session/event', quiet, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', quiet, userMessage('帮我看看 PlantUML 的泳道语法'))
+    assert.doesNotMatch(sectionText(fake, 'memory-layer:failures'), /复发|已重复/u, '没复发就不该预警')
+    assert.equal((await readRecord())?.status, 'deprecated', '没有复发时记录必须保持已解决')
+    assert.equal((await readRecord())?.relapses, undefined, '没有复发就不该记复发次数')
+
+    // 4) 正例：同一个错**真的**再发生一次 → 重新打开。
+    await failSession(fake, fakeSession('f3', '/work/demo'), 'ENOENT: cannot write report.json')
+    const reopened = await readRecord()
+    assert.equal(reopened?.status, 'validated', '复发必须把记录重新打开（否则 shouldWarn 永远 false）')
+    assert.equal(reopened?.resolvedAt, undefined, 'resolvedAt 必须清掉')
+    assert.equal(reopened?.relapses, 1, '复发次数要记一笔')
+    assert.equal(typeof reopened?.occurrencesAtReopen, 'number', '要记住本次回合的起点计数')
+    assert.equal(reopened?.enforcement, 'warn',
+      `升级强度按回合内次数算（本回合 1 次），历史 3 次不该顶到 ask：${reopened?.enforcement}`)
+
+    // 5) 预警真的回来了，而且带当时验证过的做法与「复发」措辞。
+    const warned = fakeSession('w1', '/work/demo')
+    fake.emit('session/created', warned)
+    fake.emit('session/event', warned, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', warned, userMessage('接着写 report.json，目录可能还不存在'))
+    const injected = sectionText(fake, 'memory-layer:failures')
+    assert.match(injected, /已解决后又复发/u, `复发必须恢复预警：${injected}`)
+    assert.match(injected, /第 1 次复发/u, `要说清这是第几次复发：${injected}`)
+    assert.match(injected, /先创建报告目录再写文件/u, '预警要带当时验证过的做法')
+  } finally {
+    await dispose()
+  }
+})
+
+test('③ 多符号优先：编辑点命中两个针的卡，胜过证据词更多但只命中一个针的卡', async () => {
+  // 复审 ③：L4 此前只看「有没有**一个**针命中」，命中之后按证据词多少排序 —— 于是一张在路径里
+  // 撞上一个通用名（因而证据词更多）的卡，会盖过真正被这次改动点到的卡。两个针同时逐字命中
+  // 基本就锁定是这张卡，所以给它一档优先。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    // 双针卡：两个针都在参数里逐字出现；但正文里只有一个证据词 `zqblat`。
+    await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat 双针卡',
+      when: '遇到该主题时',
+      summary: 'Zqblat 的双针正文。',
+      apiSymbols: ['zqblatAlpha', 'zqblatBeta'],
+    } as never, undefined as never)
+    // 单针卡：只命中一个针（`zqblatAlpha`），但正文同时含 `zqblat` 与 `alpha` 两个证据词。
+    await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat alpha 单针卡',
+      when: '遇到该主题时',
+      summary: 'Zqblat alpha 的正文。',
+      apiSymbols: ['zqblatAlpha'],
+    } as never, undefined as never)
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    const text = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({
+        file_path: 'src/ZqblatAlpha.ts',
+        new_string: 'zqblatAlpha(); zqblatBeta();',
+      }) },
+      { isError: false },
+    ))
+    assert.match(text, /Zqblat 双针卡/u, `两个针都命中的卡应胜出：${text}`)
+    assert.doesNotMatch(text, /单针卡/u, `只命中一个针的卡不该抢走（哪怕它的证据词更多）：${text}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('③ 文件级精确命中：同一文件的第二处改动仍算精确，且不跨文件泄漏', async () => {
+  // 复审 ③ 的另一半。L4 只看「**这一次**调用的参数里有没有针」—— 而真实改动常落在同一文件的
+  // 第二、第三处（补分支、改一行），那时参数里已经没有符号，同一张卡会掉回证据词档被别的卡挤掉。
+  // 这里钉三件事：首轮由更贴合的精确卡胜出（文件级卡不被推、于是不进 `seen`）、
+  // 第二轮同文件仍认文件级卡、**换一个文件就不认**（不跨文件泄漏）。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    // A：文件级卡 —— 命中一个针（`zqblatWidget`），正文只有 `zqblat` 一个证据词。
+    await toolOf(fake, 'technique_save').execute({
+      name: '文件级卡 Zqblat',
+      when: '遇到该主题时',
+      summary: 'Zqblat 的文件级正文。',
+      // 注意：针**不等于**文件名（`src/zqblatWidget.ts`）—— 否则第二次调用里光凭路径就逐字命中了，
+      // 这条用例会失去判别力（第一版正是栽在这个巧合上）。
+      apiSymbols: ['zqblatWidgetCore'],
+    } as never, undefined as never)
+    // C：精确卡 —— 也命中一个针（`zqblatCore`），但正文**两个**证据词都在，首轮该它胜出。
+    await toolOf(fake, 'technique_save').execute({
+      name: '精确卡 Zqblat Widget',
+      when: '遇到该主题时',
+      summary: 'Zqblat Widget 的精确正文。',
+      apiSymbols: ['zqblatCore'],
+    } as never, undefined as never)
+    // B：泛化卡 —— 没有符号面，只有两个证据词：没有文件级精确命中时它会赢（旧行为）。
+    await toolOf(fake, 'technique_save').execute({
+      name: '泛化卡 Zqblat Widget',
+      when: '遇到该主题时',
+      summary: 'Zqblat Widget 都只是正文里出现的词。',
+    } as never, undefined as never)
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    // 第 1 步：两个针都在参数里，文件被记进「针 + 文件」关联；C 证据更贴合，A 不该被推。
+    const first = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({
+        file_path: 'src/zqblatWidget.ts',
+        new_string: 'zqblatWidgetCore(); zqblatCore();',
+      }) },
+      { isError: false },
+    ))
+    assert.match(first, /精确卡 Zqblat Widget/u, `首轮应推证据更贴合的精确卡：${first}`)
+    assert.doesNotMatch(first, /文件级卡/u, `首轮不该抢推文件级卡：${first}`)
+
+    // 第 2 步：**同一文件**、参数里已经没有符号 —— 仍按精确命中算，A 该胜出（而不是泛化卡 B）。
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    const same = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/zqblatWidget.ts', new_string: 'x' }) },
+      { isError: false },
+    ))
+    assert.match(same, /文件级卡 Zqblat/u, `同一文件的第二处改动仍应认这张卡：${same}`)
+    assert.doesNotMatch(same, /泛化卡/u, `有文件级精确命中时不该推泛化卡：${same}`)
+
+    // 第 3 步：反例面 —— **换一个文件**就不认了，不得跨文件泄漏。
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    const other = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({ file_path: 'src/other.ts', new_string: 'x' }) },
+      { isError: false },
+    ))
+    assert.doesNotMatch(other, /文件级卡/u, `关联只属于那个文件，不得跨文件泄漏：${other}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('④ 实时重开（failureMaintenance: false）：复发即重开并预警，不靠维护兜底', async () => {
+  // 复审 F1：重开有两处实现（实时观测 + 失败维护），彼此互为兜底 —— 只破坏实时那处时
+  // 全部用例照绿，而「关掉维护」是受支持的配置，那时实时路径就是唯一路径。
+  // 这条用例把维护关掉，单独钉住实时路径。
+  const { fake, root, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    failureMaintenance: false,
+  })
+  try {
+    const readRecord = async (id: string): Promise<FailureRecord | undefined> =>
+      (await new MemoryStore(root).readFailures('global')).find(record => record.id === id)
+    await failSession(fake, fakeSession('f1', '/work/demo'), 'ENOENT: cannot write report.json')
+    await failSession(fake, fakeSession('f2', '/work/demo'), 'ENOENT: cannot write report.json')
+    const listed = String(await toolOf(fake, 'failure_list').execute({} as never, undefined as never))
+    const id = /fa_[0-9a-fA-F-]+/u.exec(listed)?.[0] ?? ''
+    assert.ok(id.length > 0, `failure_list 应给出 id：${listed}`)
+    await toolOf(fake, 'failure_resolve').execute({
+      id, remedy: '先创建报告目录再写文件', trigger: '写 report.json 之前忘了建目录',
+    } as never, undefined as never)
+    assert.equal((await readRecord(id))?.status, 'deprecated', '解决后进入沉默')
+
+    // 复发：维护已关，只有实时观测这条路径能重开。
+    await failSession(fake, fakeSession('f3', '/work/demo'), 'ENOENT: cannot write report.json')
+    const reopened = await readRecord(id)
+    assert.equal(reopened?.status, 'validated', '实时路径必须自己重开（维护已关，没有兜底）')
+    assert.equal(reopened?.resolvedAt, undefined, 'resolvedAt 必须清掉')
+    assert.equal(reopened?.relapses, 1, '复发次数要记一笔')
+    assert.equal(reopened?.occurrencesAtReopen, (reopened?.occurrences ?? 0) - 1,
+      '回合起点 = 总数 − 1（与维护路径同一约定）')
+    assert.equal(reopened?.enforcement, 'warn', `回合内 1 次 → warn：${reopened?.enforcement}`)
+
+    // 预警同样回来了。
+    const warned = fakeSession('w1', '/work/demo')
+    fake.emit('session/created', warned)
+    fake.emit('session/event', warned, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', warned, userMessage('接着写 report.json，目录可能还不存在'))
+    assert.match(sectionText(fake, 'memory-layer:failures'), /已解决后又复发/u, '复发必须恢复预警')
+  } finally {
+    await dispose()
+  }
+})
+
+test('① 内容变化必须恢复全文：改过正文的条目下一轮不再发指针', async () => {
+  // 复审 F2：`previous.hash !== hash` 这条分支没有用例 —— 一旦失效，条目正文已经更新，
+  // 模型却一直看到「unchanged, full text delivered earlier」，永远读不到新正文。
+  // 载体用技巧卡：语义层按 `semanticKey(text)` 合并，改文字就是新 id，只有技巧卡能原地改正文。
+  // `techniqueLimit: 1` 让「主卡」占住技巧段，目标卡因此落在召回段（① 只作用于召回条目）。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    distillOnTurnEnd: false,
+    techniqueLimit: 1,
+    standingRuleFullEveryTurns: 0,
+  })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const save = async (fields: Record<string, unknown>): Promise<string> => {
+      const saved = String(await toolOf(fake, 'technique_save').execute(fields as never, undefined as never))
+      const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+      assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+      await toolOf(fake, 'technique_apply').execute(
+        { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+      )
+      return id
+    }
+    // 主卡：与查询词高度贴合，稳定占住唯一的技巧段名额。
+    await save({
+      name: 'Zqblat 主卡',
+      when: 'Zqblat 用法',
+      summary: 'Zqblat 用法：Zqblat 的用法与 Zqblat 参数。',
+      apiSymbols: ['zqblatMain'],
+    })
+    const targetId = await save({
+      name: 'Zqblat 指针卡',
+      when: '遇到该主题时',
+      summary: 'Zqblat 指针卡的旧正文。',
+      apiSymbols: ['zqblatPointer'],
+    })
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('Zqblat 用法是什么'))
+    const first = sectionText(fake, 'memory-layer:recall')
+    assert.match(first, /旧正文/u, `首轮应该是全文：${first}`)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('再说一遍 Zqblat 用法'))
+    assert.match(sectionText(fake, 'memory-layer:recall'), /unchanged, full text delivered earlier/u,
+      '第二轮应改发指针形态')
+
+    // 原地改这条卡的正文（id 不变）→ 下一轮必须恢复全文，而不是继续发「内容没变」的指针。
+    await toolOf(fake, 'technique_save').execute({
+      id: targetId,
+      summary: 'Zqblat 指针卡的 ZqblatNewText 新正文。',
+    } as never, undefined as never)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    fake.emit('session/event', session, userMessage('Zqblat 用法再确认'))
+    const seen = `${sectionText(fake, 'memory-layer:recall')}${sectionText(fake, 'memory-layer:techniques')}`
+    assert.match(seen, /ZqblatNewText/u, `改过的正文必须能被看到（不能只给指针）：${seen}`)
+    assert.doesNotMatch(sectionText(fake, 'memory-layer:recall'), /unchanged, full text delivered earlier/u,
+      `内容变了就不该再说 unchanged：${sectionText(fake, 'memory-layer:recall')}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('④ 存量修复：旧语义下「已解决但已复发」的记录在维护时被重新打开（且幂等）', async () => {
+  // 只改写入路径不够：真库那 3 条已复发记录是**旧语义**下写的（字段都不存在），不迁移就要等到
+  // 下一次真的复发才重开 —— 而那正是最该提前告知的时刻。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    const readRecord = async (id: string): Promise<FailureRecord | undefined> =>
+      (await new MemoryStore(root).readFailures('global')).find(record => record.id === id)
+    const listFirstId = async (): Promise<string> => {
+      const listed = String(await toolOf(fake, 'failure_list').execute({} as never, undefined as never))
+      const id = /fa_[0-9a-fA-F-]+/u.exec(listed)?.[0] ?? ''
+      assert.ok(id.length > 0, `failure_list 应给出 id：${listed}`)
+      return id
+    }
+
+    // 旧语义存量：已解决，但计数证明之后又发生过 3 次（写入路径当时不会重开它）。
+    await failSession(fake, fakeSession('f1', '/work/demo'), 'ENOENT: cannot write report.json')
+    await failSession(fake, fakeSession('f2', '/work/demo'), 'ENOENT: cannot write report.json')
+    const legacyId = await listFirstId()
+    const store = new MemoryStore(root)
+    const legacy = (await store.readFailures('global')).find(record => record.id === legacyId)
+    assert.ok(legacy !== undefined)
+    await store.updateFailure({
+      ...legacy,
+      status: 'deprecated',
+      resolvedAt: 1,
+      occurrencesAtResolve: legacy.occurrences,
+      occurrences: legacy.occurrences + 3,
+      lastSeen: 1_700_000_000_000,
+    })
+    assert.equal((await readRecord(legacyId))?.status, 'deprecated')
+
+    // 任意一次检索都会先 `refresh` → 存量修复在这一步收敛。
+    await toolOf(fake, 'technique_search').execute({ query: '随便看看' } as never, undefined as never)
+    const repaired = await readRecord(legacyId)
+    assert.equal(repaired?.status, 'validated', '存量复发记录必须被重新打开')
+    assert.equal(repaired?.resolvedAt, undefined, 'resolvedAt 必须清掉')
+    assert.equal(repaired?.relapses, 3, '历史复发次数要折算进 relapses')
+    assert.equal(repaired?.occurrencesAtReopen, (repaired?.occurrences ?? 0) - 1,
+      '回合起点 = 总数 − 1（与实时路径同一约定）')
+    assert.equal(repaired?.enforcement, 'warn', `升级按回合算，历史 5 次不该顶到 ask：${repaired?.enforcement}`)
+
+    // 幂等：条件在写完 `resolvedAt` 之后不再成立，重复 refresh 不得把次数翻倍。
+    await toolOf(fake, 'technique_search').execute({ query: '随便看看' } as never, undefined as never)
+    assert.equal((await readRecord(legacyId))?.relapses, 3, '维护必须幂等')
+
+    // 反例面：**没有**复发过的已解决记录不得被重开。
+    await failSession(fake, fakeSession('g1', '/work/demo'), 'EACCES: permission denied on /work/x')
+    await failSession(fake, fakeSession('g2', '/work/demo'), 'EACCES: permission denied on /work/x')
+    // 按症状从真源取 id（列表首条仍是上面那条已重开的记录，不能用「第一条」来认）。
+    const quietId = (await new MemoryStore(root).readFailures('global'))
+      .find(record => record.symptom.includes('permission denied'))?.id ?? ''
+    assert.ok(quietId.length > 0 && quietId !== legacyId, `应能按症状认出另一条记录：${quietId}`)
+    await toolOf(fake, 'failure_resolve').execute({
+      id: quietId, remedy: '改用可写目录',
+    } as never, undefined as never)
+    await toolOf(fake, 'technique_search').execute({ query: '随便看看' } as never, undefined as never)
+    const kept = await readRecord(quietId)
+    assert.equal(kept?.status, 'deprecated', '没有复发过的已解决记录必须保持沉默')
+    assert.equal(kept?.relapses, undefined, '不该给它记复发')
+  } finally {
+    await dispose()
+  }
+})
+
 test('安全策略覆盖失败层：纠偏落盘前过脱敏 + 去标识化', async () => {
   const counter = { calls: 0 }
   // 走**模型认定**的主路径：本地初筛命中后由模型给出纠偏语义。
@@ -2618,6 +2959,79 @@ test('技巧草稿不得经记忆召回段注入（DEF-12）', async () => {
     await fake.flush()
     fake.emit('session/event', s, userMessage('检查草稿泄露时'))
     assert.match(sectionText(fake, 'memory-layer:techniques'), /草稿不得漏进召回段/u, '验证后应注入')
+  } finally {
+    await dispose()
+  }
+})
+
+test('① 重复条目改发指针：首轮全文、次轮指针，compaction 之后恢复全文', async () => {
+  // 依据：674 个不同条目 / 7,618 次出现（平均每条发 11 次），86.1% 的条目字符是重复；
+  // 注入块本来就在对话历史里，逐轮重印是纯付费。
+  // 必须同时处理的反例（评审明确要求）：长会话里早期注入会被宿主 compaction 裁掉 ——
+  // 那时「已经给过」不成立，继续发指针就是让模型去找一段不存在的文本。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    standingRuleFullEveryTurns: 0, // 关掉「每 N 轮重发」，单独测「已给过 → 指针」
+  })
+  const memory = 'Zqblat 构建流水线一共三步：先跑门禁；再打包；最后核对产物清单与校验和，'
+    + '并把清单贴进交付报告里，缺一项都不算完成，也不要把未验证的清单当成已交付内容。'
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    await toolOf(fake, 'memory_save').execute({ text: memory, kind: 'fact' } as never, undefined as never)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('Zqblat 构建流水线怎么走'))
+    const first = sectionText(fake, 'memory-layer:recall')
+    assert.match(first, /核对产物清单与校验和/u, `首轮必须是全文：${first}`)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('再讲一遍 Zqblat 构建流水线'))
+    const second = sectionText(fake, 'memory-layer:recall')
+    assert.match(second, /unchanged, full text delivered earlier in this session/u,
+      `第二轮应改发指针形态：${second}`)
+    assert.match(second, /sm_[0-9a-f]{8}/u, `指针要带可寻址的把手：${second}`)
+    assert.doesNotMatch(second, /核对产物清单与校验和/u, `第二轮不该再印全文：${second}`)
+
+    // 反例面：宿主 compaction 之后记账必须整份作废 → 回到全文。
+    fake.emit('session/event', session, event('compaction/end', {}))
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    fake.emit('session/event', session, userMessage('Zqblat 构建流水线再确认一次'))
+    const third = sectionText(fake, 'memory-layer:recall')
+    assert.match(third, /核对产物清单与校验和/u,
+      `compaction 之后必须回到全文（否则指针指向一段已被裁掉的文本）：${third}`)
+    assert.doesNotMatch(third, /unchanged, full text delivered earlier/u, '这时不能再是指针')
+  } finally {
+    await dispose()
+  }
+})
+
+test('① 反例面：被预算截断的条目不算「已给过」，下一轮不得只发指针', async () => {
+  // 没有常驻规则时块头固定开销 ≈ 270 字符，所以 `recallChars: 500` → 正文预算 ≈ 230：
+  // 下面这条长记忆的**全文行**（≈390）放不下、**指针形态**（≈110）放得下 —— 于是
+  // 「截断后仍然记账」这个 bug 会在第 2 轮露出指针，正好被抓。
+  // 这条是评审给的「必须同时给的反例」之外的第二个反例面：不能把没真正交付的东西记成交付过。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, recallChars: 500 })
+  try {
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    await toolOf(fake, 'memory_save').execute({
+      text: `Zqblat 归档策略：${'先归一化领域名再按年龄归档；'.repeat(24)}没有被检索过的旧草稿优先出局。`,
+      kind: 'fact',
+    } as never, undefined as never)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('Zqblat 归档策略是什么'))
+    const first = sectionText(fake, 'memory-layer:recall')
+    assert.doesNotMatch(first, /unchanged, full text delivered earlier/u, '首轮不可能是指针形态')
+    assert.doesNotMatch(first, /优先出局/u, `本用例的前提是「全文放不下、确实被截断」：${first}`)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('Zqblat 归档策略再讲一遍'))
+    const second = sectionText(fake, 'memory-layer:recall')
+    assert.doesNotMatch(second, /unchanged, full text delivered earlier/u,
+      `被截断的条目不许记为「已给过」，否则模型只拿到一个指向不存在文本的指针：${second}`)
   } finally {
     await dispose()
   }
@@ -5274,23 +5688,25 @@ test('L1 引用检测（评审 F1）：同一个符号在 ≥3 张卡上都成�
   }
 })
 
-test('死重维护（评审 F1）：有效针集为空的卡，其历史引用计数被清零', async () => {
-  // 历史污染修正：真库 3 张卡的 referenced 全部来自内置名误命中（合计 9 次）。
-  // 判据是**有效针集为空**（有效 = 去掉泛化针后剩下的针）：
-  //  - 只剩语言内置名（`readFileSync` 系）→ 有效针集空 → 清零；
-  //  - 只剩泛化针（≥3 张卡共享，复审指出的那一类）→ 有效针集同样空 → 一并清零；
-  //  - 还有专有针时无法区分哪几次是真引用，宁可留高也不误删。
+test('⑤ 引用口径修复：旧口径的计数整批清零并盖章，新口径的计数不动', async () => {
+  // 评审 ⑤：0.2.8–0.2.13 的针集混着语言内置名（`readFileSync`…）与框架泛化名（`dependsOn`…），
+  // 那些 `referenced` **无法区分**哪一次是真引用 —— 于是引用率前后不可比、L5 排序也一直吃着它们。
+  // 处置：旧口径的计数整批清零并盖上当前口径版本（它只喂 L5 的 +10% 加成，代价有限）。
   const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
   try {
     const seed = fakeSession('seed', '/work/demo')
     fake.emit('session/created', seed)
     await fake.flush()
-    for (const [name, symbol] of [['Zqblat 污染样本', 'readFileSync'], ['Zqblat 对照样本', 'zqblatWire']] as const) {
+    for (const [name, symbol] of [
+      ['Zqblat 污染样本', 'readFileSync'],
+      ['Zqblat 对照样本', 'zqblatWire'],
+      ['Zqblat 新口径样本', 'zqblatFresh'],
+    ] as const) {
       await toolOf(fake, 'technique_save').execute({
         name, when: '遇到该主题时', summary: `${name} 的正文。`, apiSymbols: [symbol],
       } as never, undefined as never)
     }
-    // 三张卡共享一个符号 ⇒ 它是泛化针；它们的针集因此「只剩泛化针」。
+    // 三张卡共享一个符号 ⇒ 泛化针；它们的针集因此「只剩泛化针」。
     for (const variant of [1, 2, 3]) {
       await toolOf(fake, 'technique_save').execute({
         name: `Zqblat 泛化样本 ${variant}`,
@@ -5299,23 +5715,34 @@ test('死重维护（评审 F1）：有效针集为空的卡，其历史引用�
         apiSymbols: ['zqblatGenericPin'],
       } as never, undefined as never)
     }
-    // 直接把「历史污染」写进真源：每张卡都记 5 次引用，区别只在符号面。
+    // 真源里造出两种口径：只有「新口径样本」盖了当前版本号。
     const store = new MemoryStore(root)
-    const polluted = (await store.readTechniques('global'))
+    const seeded = (await store.readTechniques('global'))
       .filter(record => record.name.startsWith('Zqblat '))
-      .map(record => ({ ...record, referenced: 5, lastReferencedAt: 1_700_000_000_000 }))
-    await store.updateTechniques(polluted)
+      .map(record => (record.name === 'Zqblat 新口径样本'
+        ? { ...record, referenced: 5, lastReferencedAt: 1_700_000_000_000, referenceEpoch: REFERENCE_EPOCH }
+        : { ...record, referenced: 5, lastReferencedAt: 1_700_000_000_000 }))
+    await store.updateTechniques(seeded)
+    const read = async (name: string): Promise<TechniqueRecord | undefined> =>
+      (await new MemoryStore(root).readTechniques('global')).find(record => record.name === name)
 
     // 任意一次检索都会先 `refresh` → 维护在这一步收敛。
     await toolOf(fake, 'technique_search').execute({ query: 'Zqblat' } as never, undefined as never)
-    const after = await new MemoryStore(root).readTechniques('global')
-    const poisoned = after.find(record => record.name === 'Zqblat 污染样本')
-    const generic = after.find(record => record.name === 'Zqblat 泛化样本 1')
-    const control = after.find(record => record.name === 'Zqblat 对照样本')
-    assert.equal(poisoned?.referenced, 0, '只剩内置名针的卡，历史引用计数必须清零')
-    assert.equal(poisoned?.lastReferencedAt, undefined, '清零要连最近引用时间一起抹掉')
-    assert.equal(generic?.referenced, 0, '只剩泛化针（≥3 张卡共享）的卡同样要清零')
-    assert.equal(control?.referenced, 5, '还有专有针的卡不得被误清（无法区分真引用）')
+    for (const name of ['Zqblat 污染样本', 'Zqblat 泛化样本 1', 'Zqblat 对照样本']) {
+      assert.equal((await read(name))?.referenced, 0, `旧口径计数必须清零：${name}`)
+      assert.equal((await read(name))?.lastReferencedAt, undefined, `清零要连最近引用时间一起抹掉：${name}`)
+      assert.equal((await read(name))?.referenceEpoch, REFERENCE_EPOCH, `清零后要盖上当前口径版本：${name}`)
+    }
+    assert.equal((await read('Zqblat 新口径样本'))?.referenced, 5, '已经是当前口径的计数不得被误清')
+    // 幂等：再 refresh 一次不得把新口径那条也清掉。
+    await toolOf(fake, 'technique_search').execute({ query: 'Zqblat' } as never, undefined as never)
+    assert.equal((await read('Zqblat 新口径样本'))?.referenced, 5, '维护必须幂等')
+    // 口径版本必须可见 —— 跨版本比较这个数没有意义。
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      new RegExp(`counter epoch ${REFERENCE_EPOCH}`, 'u'),
+      'memory_stats 要标出引用计数的口径版本',
+    )
   } finally {
     await dispose()
   }

@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import {
   deriveTrigger,
   enforcementFor,
+  episodeOccurrences,
   failureApplies,
   failureDetail,
   failureLessonLine,
@@ -137,6 +138,51 @@ test('已解决的记录不再预警', () => {
   assert.equal(shouldWarn(record({ occurrences: 9 }), { warn: 2, ask: 3, block: 0 }), true)
   assert.equal(shouldWarn(record({ occurrences: 9, status: 'deprecated' }), { warn: 2, ask: 3, block: 0 }), false)
   assert.equal(shouldWarn(record({ occurrences: 1 }), { warn: 2, ask: 3, block: 0 }), false)
+})
+
+test('④ 复发重开：已解决的记录再次发生就立刻预警，且升级按「回合内」次数算', () => {
+  const thresholds = { warn: 2, ask: 3, block: 0 }
+  // 复发过的记录（重开后 status=validated、relapses>0）：不等阈值就预警 —— 「当时那条修法不成立」
+  // 比「又重复了一次」是更强的信号。
+  const relapsed = record({
+    status: 'validated',
+    occurrences: 78,
+    relapses: 1,
+    occurrencesAtReopen: 77,
+  })
+  assert.equal(shouldWarn(relapsed, thresholds), true, '复发必须立刻恢复预警')
+  // 回合内次数：升级强度只看本回合，77 次的历史不会把它顶到 ask/block。
+  assert.equal(episodeOccurrences(relapsed), 1)
+  assert.equal(enforcementFor(episodeOccurrences(relapsed), thresholds), 'warn')
+  // 未复发过的记录：回合 = 全生命周期，既有行为一字不变。
+  const plain = record({ occurrences: 9 })
+  assert.equal(episodeOccurrences(plain), 9)
+  assert.equal(shouldWarn(plain, thresholds), true)
+  assert.equal(shouldWarn(record({ occurrences: 1 }), thresholds), false)
+  // 已解决（还没复发）仍然沉默：这是「已解决不再预警」那条既有语义。
+  assert.equal(shouldWarn(record({ occurrences: 78, status: 'deprecated', resolvedAt: 5 }), thresholds), false)
+})
+
+test('④ 复发在文案里可见：预警行与详情行都不把它藏进历史大数字', () => {
+  const relapsed = record({
+    symptom: 'file has not been read',
+    remedy: '改前先 read',
+    occurrences: 78,
+    relapses: 2,
+    lastRelapseAt: 1_700_000_000_000,
+    occurrencesAtReopen: 74,
+  })
+  const warning = failureWarningLine(relapsed)
+  assert.match(warning, /已解决后又复发/u, `预警要明说复发：${warning}`)
+  assert.match(warning, /第 2 次复发/u, `要报复发次数：${warning}`)
+  assert.match(warning, /本回合第 4 次/u, `回合内次数：${warning}`)
+  assert.doesNotMatch(warning, /已重复 78 次/u, '不能把复发藏在历史累计里')
+
+  const detail = failureDetail(relapsed)
+  assert.match(detail, /Relapsed 2 time\(s\)/u, `详情要报复发次数：${detail}`)
+  assert.match(detail, /this episode: 4 occurrence\(s\)/u, `详情要报回合内次数：${detail}`)
+  // 反例面：没有复发过的记录文案一个字都不变。
+  assert.match(failureWarningLine(record({ occurrences: 3 })), /\[已重复 3 次\]/u)
 })
 
 test('自身拒绝被识别，避免自我强化循环', () => {

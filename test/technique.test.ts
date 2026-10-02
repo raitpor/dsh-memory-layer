@@ -672,8 +672,11 @@ test('L5 引用加成：被引用过的卡排更前，但**不动置信度**，�
   // 被引用过的排在未引用之前（five 与 huge 触顶后同分，稳定排序决定二者次序，不断言谁先）。
   assert.equal(hits.at(-1)?.id, 'tq_zero', `未引用的应排最后：${JSON.stringify(hits.map(h => h.id))}`)
   assert.deepEqual(hits.slice(0, 2).map(hit => hit.id).sort(), ['tq_five', 'tq_huge'], '被引用的应在前两位')
-  // 加成上限 +10%：再多引用也不会无限加权（否则排序会被字符串巧合主导）。
+  // 加成上限：每条 +4%、最多算 5 条（0.2.14 起合计 +20%）—— 再多引用也不会无限加权
+  // （否则排序会被字符串巧合主导）。
   assert.ok(scoreOf('tq_five') > scoreOf('tq_zero'), '引用为正应高过引用为 0')
+  const ratio = scoreOf('tq_five') / scoreOf('tq_zero')
+  assert.ok(ratio > 1.15 && ratio < 1.25, `引用加成应约为 +20% 且有上限：ratio=${ratio}`)
   assert.ok(
     Math.abs(scoreOf('tq_huge') - scoreOf('tq_five')) < 1e-9,
     `超过上限后不应再涨：huge=${scoreOf('tq_huge')} five=${scoreOf('tq_five')}`,

@@ -5274,9 +5274,12 @@ test('L1 引用检测（评审 F1）：同一个符号在 ≥3 张卡上都成�
   }
 })
 
-test('死重维护（评审 F1）：针集只剩语言内置名的卡，其历史引用计数被清零', async () => {
+test('死重维护（评审 F1）：有效针集为空的卡，其历史引用计数被清零', async () => {
   // 历史污染修正：真库 3 张卡的 referenced 全部来自内置名误命中（合计 9 次）。
-  // 只清「针集为空」的卡 —— 针集非空时无法区分哪几次是真引用，宁可留高也不误删。
+  // 判据是**有效针集为空**（有效 = 去掉泛化针后剩下的针）：
+  //  - 只剩语言内置名（`readFileSync` 系）→ 有效针集空 → 清零；
+  //  - 只剩泛化针（≥3 张卡共享，复审指出的那一类）→ 有效针集同样空 → 一并清零；
+  //  - 还有专有针时无法区分哪几次是真引用，宁可留高也不误删。
   const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
   try {
     const seed = fakeSession('seed', '/work/demo')
@@ -5287,7 +5290,16 @@ test('死重维护（评审 F1）：针集只剩语言内置名的卡，其历�
         name, when: '遇到该主题时', summary: `${name} 的正文。`, apiSymbols: [symbol],
       } as never, undefined as never)
     }
-    // 直接把「历史污染」写进真源：两张卡都记 5 次引用，区别只在符号面。
+    // 三张卡共享一个符号 ⇒ 它是泛化针；它们的针集因此「只剩泛化针」。
+    for (const variant of [1, 2, 3]) {
+      await toolOf(fake, 'technique_save').execute({
+        name: `Zqblat 泛化样本 ${variant}`,
+        when: '遇到该主题时',
+        summary: `Zqblat 泛化正文 ${variant}。`,
+        apiSymbols: ['zqblatGenericPin'],
+      } as never, undefined as never)
+    }
+    // 直接把「历史污染」写进真源：每张卡都记 5 次引用，区别只在符号面。
     const store = new MemoryStore(root)
     const polluted = (await store.readTechniques('global'))
       .filter(record => record.name.startsWith('Zqblat '))
@@ -5298,10 +5310,61 @@ test('死重维护（评审 F1）：针集只剩语言内置名的卡，其历�
     await toolOf(fake, 'technique_search').execute({ query: 'Zqblat' } as never, undefined as never)
     const after = await new MemoryStore(root).readTechniques('global')
     const poisoned = after.find(record => record.name === 'Zqblat 污染样本')
+    const generic = after.find(record => record.name === 'Zqblat 泛化样本 1')
     const control = after.find(record => record.name === 'Zqblat 对照样本')
     assert.equal(poisoned?.referenced, 0, '只剩内置名针的卡，历史引用计数必须清零')
     assert.equal(poisoned?.lastReferencedAt, undefined, '清零要连最近引用时间一起抹掉')
-    assert.equal(control?.referenced, 5, '针集非空的卡不得被误清（无法区分真引用）')
+    assert.equal(generic?.referenced, 0, '只剩泛化针（≥3 张卡共享）的卡同样要清零')
+    assert.equal(control?.referenced, 5, '还有专有针的卡不得被误清（无法区分真引用）')
+  } finally {
+    await dispose()
+  }
+})
+
+test('L4 精确命中（复审）：泛化针不得让无关卡在编辑点抢到顾问', async () => {
+  // 复审指出：F1 的过滤接在两个站点上，但只有 L1 记账那半有用例兜住 —— 把 L4 的
+  // `!genericNeedles.has(needle)` 去掉，387 项全过。这条补上另一半。
+  //
+  // 构造：三张卡共享泛化针 `zqblatShared`，且它们的**正文里没有 `shared` 词元**
+  // （针只在符号面里）→ 证据词规则（fallback）认不出它们，只有「符号逐字命中」那条路会选中。
+  // 对照卡的正文同时含 `zqblat` 与 `shared`，但符号面是另一个名字。
+  // 去掉 L4 过滤 → 精确命中把三张无关卡送上来；保留过滤 → 回退证据词，选中对照卡。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    for (const variant of [1, 2, 3]) {
+      await toolOf(fake, 'technique_save').execute({
+        name: `Zqblat 共享写法样本 ${variant}`,
+        when: '遇到该主题时',
+        summary: `Zqblat 关键词的第 ${variant} 种写法。`,
+        apiSymbols: ['zqblatShared'],
+      } as never, undefined as never)
+    }
+    await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat shared 对照样本',
+      when: '遇到该主题时',
+      summary: 'Zqblat shared 的正文。',
+      apiSymbols: ['zqblatWire'],
+    } as never, undefined as never)
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    const text = advisoryOf(await fake.postExecute(
+      { name: 'edit', arguments: JSON.stringify({
+        // 路径只用来给**证据词**（`zqblat` / `shared`）—— 对照卡两个都中，三张共享卡只中一个。
+        file_path: 'src/ZqblatShared.ts',
+        // `new_string` 是代码正文（不算证据词），但引用针是在**整串参数**上匹配的，
+        // 所以这里必须原样写出符号，且大小写与卡片一致（`zqblatShared`，小写 z）。
+        new_string: 'zqblatShared(1)',
+      }) },
+      { isError: false },
+    ))
+    assert.match(text, /Zqblat shared 对照样本/u, `证据更贴合的那张应胜出：${text}`)
+    assert.doesNotMatch(text, /共享写法样本/u, `泛化针不得让无关卡抢到精确命中：${text}`)
   } finally {
     await dispose()
   }

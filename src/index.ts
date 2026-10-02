@@ -991,6 +991,28 @@ export function apply(ctx: Context, config: Config): void {
   let techniqueHitCache: { query: string; hits: readonly RecalledMemory[] } | undefined
 
   /**
+   * 重算「引用针缓存 + 泛化针表」。
+   *
+   * 两者都从真源派生：记录内容可能被就地更新（`technique_save(id=…)`），缓存必须跟着语料一起
+   * 作废，否则会拿旧符号面去匹配。**必须在死重维护之前调用** —— 维护里的「历史引用清零」要判
+   * 「有效针集是否为空」，而有效针集 = 去掉泛化针之后剩下的针。
+   *
+   * @param records - 当前桶的全部技巧记录（已按 id 去重）。
+   */
+  const refreshNeedleIndex = (records: readonly TechniqueRecord[]): void => {
+    needlesById.clear()
+    const needleCards = new Map<string, number>()
+    for (const record of records) {
+      for (const needle of new Set(referenceNeedles(record))) {
+        needleCards.set(needle, (needleCards.get(needle) ?? 0) + 1)
+      }
+    }
+    genericNeedles = new Set(
+      [...needleCards].filter(([, cards]) => cards >= GENERIC_NEEDLE_CARDS).map(([needle]) => needle),
+    )
+  }
+
+  /**
    * 死重维护：领域名归一化 + 归档「从未被检索/引用/成功」的旧草稿。
    *
    * 为什么放在 `refresh` 里而不是 `apply`：真源是按**桶**（工作目录）分文件的，`apply` 时刻
@@ -1063,13 +1085,15 @@ export function apply(ctx: Context, config: Config): void {
         }
       }
     }
-    // 评审 F1 的历史污染修正：针集里**只剩语言内置名**的卡，它的 `referenced` 全部来自误命中
+    // 评审 F1 的历史污染修正：**有效针集为空**的卡，它的 `referenced` 全部来自误命中
     // （真库实测 3 张卡 / 9 次引用：`readFileSync` 系 5、`assert.ok` 系 3、`Array.isArray` 系 1）。
-    // 只动「针集为空」的卡 —— 针集非空时无法区分哪几次是真引用，宁可留高也不误删。
+    // 「有效」= 去掉泛化针之后剩下的针（内置名在 `referenceNeedles` 里就已经被剔除）——
+    // 复审指出：只按「针集为空」判会让「针集只剩泛化针」的卡留下虚高计数（当前真库 0 张，
+    // 但库长大后会再出现）。只动有效针集为空的卡：还有专有针时无法区分哪几次是真引用，宁可留高。
     let repairedReferences = 0
     for (const record of records) {
       if ((record.referenced ?? 0) === 0) continue
-      if (referenceNeedles(record).length > 0) continue
+      if (referenceNeedles(record).some(needle => !genericNeedles.has(needle))) continue
       const base = patchById.get(record.id) ?? record
       const fixed: TechniqueRecord = { ...base, referenced: 0 }
       delete fixed.lastReferencedAt
@@ -1118,6 +1142,10 @@ export function apply(ctx: Context, config: Config): void {
       store.readFailures('project', directory, settings.partition),
       store.readFailures('global', undefined, settings.partition),
     ])
+    // 引用针缓存与泛化针表**先于维护**重算：维护里的「历史引用清零」判据要用到泛化针集
+    // （有效针集 = 去掉泛化针后剩下的针），而针只看符号面（subject / 调用名），
+    // 不受维护要写的 `archivedAt`、`domain` 影响，所以提前算不会读到陈旧口径。
+    refreshNeedleIndex(dedupeById([...projectTech, ...globalTech]))
     // 死重维护（0.2.10）：领域归一化 + 归档死重。**每次刷新都检查**，但不为空才写盘 ——
     // 检查是纯内存的 O(n) 比较（几百条），而写盘只会在真出现新死重时发生一次，
     // 归档之后条件不再成立，所以不存在写风暴。写盘后**必须重读**，否则索引与语料仍基于
@@ -1147,18 +1175,6 @@ export function apply(ctx: Context, config: Config): void {
     const techniqueScopes = new Map<string, MemoryScope>()
     for (const record of globalTech) techniqueScopes.set(record.id, 'global')
     for (const record of projectTech) techniqueScopes.set(record.id, 'project')
-    // 引用针缓存与泛化针表都从真源派生：记录内容可能被就地更新（`technique_save(id=…)`），
-    // 缓存必须跟着语料一起作废，否则会拿旧符号面去匹配。
-    needlesById.clear()
-    const needleCards = new Map<string, number>()
-    for (const record of techniques) {
-      for (const needle of new Set(referenceNeedles(record))) {
-        needleCards.set(needle, (needleCards.get(needle) ?? 0) + 1)
-      }
-    }
-    genericNeedles = new Set(
-      [...needleCards].filter(([, cards]) => cards >= GENERIC_NEEDLE_CARDS).map(([needle]) => needle),
-    )
     // 索引从真源派生：签名没变就跳过，变了就全量重建（几百条是毫秒级）。
     // 重建失败只记一条日志，检索随后自动走内存路径。
     try {

@@ -116,10 +116,22 @@
 `Array.isArray`、`String`、`assert.ok`…）：它们只证明模型在用这门语言，不证明用了这张卡；
 ③**泛化针**：同一个符号在 **≥3 张卡**上都成立时（`dependsOn` 6 张、`registerScreen` 5、
 `Task.dependsOn` 4、`SubscribeEvent` 4、`technique_save` 3…）说明不了是**哪一张**被用上。
+②③两道闸都接在**两条使用路径**上：L1 记账（`detectReferences`）与 L4 精确命中（`needleInArgs`）——
+后者是用户可见的那一半：`dependsOn` 这类名字若算精确命中，编辑点就会推出无关卡打断模型。
+两条路径各有一条判别用例钉住（`test/plugin.test.ts` 的「同一个符号在 ≥3 张卡上都成立时不记引用」
+与「L4 精确命中（复审）」，都已登记进 `.verify/revert-check.mjs` 的回退锚点）。
+
 真库实测：针 471 → 436 个；`tq_1c95a48f`（讲从 manifest 解析依赖 ID）那 5 次引用全部来自
-`readFileSync` 系内置名，已随维护清零（只清「针集为空」的卡，共 3 张 / 9 次；
-针集非空时无法区分哪几次是真引用，宁可留高也不误删）。为什么不用「只认带命名空间限定的符号」
-这条更激进的规则：L4 的精确命中恰好依赖**裸的项目标识符**（`zqblatWire`、`GTEnchantment`）。
+`readFileSync` 系内置名。**历史引用清零**的判据是「**有效针集**为空」—— 有效 = 去掉泛化针之后
+剩下的针（内置名在 `referenceNeedles` 里就已经被剔除），因此「只剩内置名」与「只剩泛化针」
+两类卡都会被清（真库当前命中 3 张 / 9 次；复审时「只剩泛化针且 referenced>0」为 0 张，
+清零判据改为有效针集后这类残留不会再积累）。还有专有针时**不清**：无法区分哪几次是真引用，
+宁可留高也不误删。为什么不用「只认带命名空间限定的符号」这条更激进的规则：L4 的精确命中恰好
+依赖**裸的项目标识符**（`zqblatWire`、`GTEnchantment`）。
+
+⚠️ **存量清零要等一次重载**：它在死重维护（`techniqueMaintenance`）里跑，所以升级后需重启 dsh
+加载新版本、并保持 `techniqueMaintenance: true`，那批虚高的 `referenced` 才会落盘归零；
+在此之前 `memory_stats` 的 `Technique references` 仍会显示旧数字。
 
 为什么必须有后者：实测一个 21 轮 / 868 次工具调用的真实开发会话里 `technique_apply` 是 **0**，
 于是"推给它的知识到底有没有被用上"完全不可测、任何改进都无法验收。真会话回放给出的基线是

@@ -62,7 +62,8 @@ Technique adoption: 72/466 adopted (15.5%), 207 searched at least once, 259 neve
 Technique references: 13/466 referenced at least once (2.8%), 60 event(s) [counter epoch 2]
 Recurring failures: 61 active, 4 resolved, 108 prevented
 Experience compounding: reflections=… skipped=… new=… duplicates=… backoff=…
-Injection gate: N dropped / M kept
+Injection gate: N dropped / M kept since install (this process A dropped / B kept; last request …)
+Telemetry (persisted): injections=…, advisories=…, this process +… injection(s) /+… advisory message(s)
 Session format: dsh-session 0.2.0-rc.1 → plugin message source kind 'plugin:dsh-memory-layer'
 ```
 
@@ -75,7 +76,8 @@ Session format: dsh-session 0.2.0-rc.1 → plugin message source kind 'plugin:ds
 | `Recurring failures` | 活跃失败记录、已解决记录、「预警后未复现」计数 |
 | `Experience compounding` | 反思触发次数、被闸门跳过次数、新增记录数、重复合并数、是否处于退避 |
 | `Reflection gate` | 最近一次「学不学」的判定理由（如 `new ground` / `novelty 0.02` / `no learning signal`） |
-| `Injection gate` | 上一轮注入门槛拦下 / 放行的候选数 |
+| `Injection gate` | 注入门槛拦下 / 放行的候选数。`since install` 是落盘累计（跨重启，见 `metrics.json`），`this process` 与 `last request` 是本次进程 / 最近一次请求的口径 —— 三者分开报，免得「同一进程攒的数」被读成「累计」 |
+| `Telemetry (persisted)` | 累计渲染过的非空注入块、发出的顾问消息条数，以及本次进程的增量 |
 | `Recall dedupe` / `Restatement filter` | 近重复召回被丢弃数、复述候选被丢弃数 |
 | `Store integrity` | 存储不健康时出现：整库不可读 / 跳过的坏行数 |
 
@@ -156,11 +158,12 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | 置信度 | 由回报的成功 / 失败计数驱动（`(successes+1)/(successes+failures+2)`），直接参与排序 |
 | 验收证据 | 回报必须附**可证伪**的证据（说清判据与观察结果）；只有结论词会被拒绝，且拒绝时不记账 |
 | 采用标记 | 检索行与注入行带 `✓N`（N 次被证实的采用）/ `✗N`（有失败记录时） |
+| 自证 | 写这条卡的会话自己回报的 success **不计入** `successes`（回报照记、证据照校验）：真库 88 条「被采用过」的卡里 23 条（26%）从未被显式检索过，而这条闭环会把未经验证的猜测直接推成**有注入权**的 `validated`。同一个会话先 `technique_search` / `technique_get` 读过它再回报，就按独立验收计 |
 
 | 计数 | 来源 | 进不进置信度 | 回答什么问题 |
 |---|---|---|---|
 | `applied` / `successes` / `failures` | 模型**显式回报**（`technique_apply`） | ✅ 进 | 这条知识被**验证**过吗 |
-| `referenced` | 插件观测工具参数里是否出现该卡符号 | ❌ 不进 | 这条知识**被碰过**吗 |
+| `referenced` | 插件观测工具参数里是否出现该卡符号（**只在未报错的调用里**：失败调用整条跳过，既不记账也不发回报提示） | ❌ 不进 | 这条知识**被碰过**吗 |
 
 `referenced` 只给排序一个**有上限的小加成**：`1 + min(referenced, 5) × 0.04`（最多 +20%）。
 引用计数带**口径版本**（`[counter epoch N]`）：口径变更时旧计数会被清零并盖章，跨版本不可直接比较。
@@ -197,10 +200,13 @@ dsh plugin --profile <name> install --offline                       #    重装�
 - **空查询不注入**：注入路径拿不到可核对的意图时什么都不给。显式 `memory_search` 空查询保留「取最近」语义。
 - **判定只认用户原话**：当轮文件路径与工具名可以参与排序，但不参与「算不算相关」的判定。
 - **召回去重**：命中彼此近重复（开头 80 字符相同**且**包含度 ≥0.6）时只留一条。
-- **重复条目改发指针**（`recallRepeatCompact`）：本会话已完整给过、内容未变的条目改发
-  `[sm_1a2b3c4d] <首句> — unchanged, full text delivered earlier in this session`
-  （技巧条目给 `[tq_xxxxxxxx] <名称>`）。全文会在首见、内容变化、同一轮内重复渲染、
-  以及距上次全文过 `standingRuleFullEveryTurns` 轮时重发；收到 `compaction/*` 事件时本会话记账整份作废。
+- **重复条目改发指针**（`recallRepeatCompact`，**召回段与技巧段同一条规则**）：本会话已完整给过、
+  内容未变的条目改发 `[sm_1a2b3c4d] <首句> — unchanged, full text delivered earlier in this session`；
+  技巧条目给 `[tq_xxxxxxxx] <名称> — unchanged, index line given earlier in this session
+  (technique_get for the full card)`（**不管它由哪一段渲染**：技巧条目也会从召回段进来，而两段都只发
+  索引行、从没给过正文 —— 说成「全文已给」会让模型以为手里已有 `pitfalls` / `verify` 并放弃展开）。
+  全文/完整索引行会在首见、内容变化、同一轮内重复渲染、以及距上次全文过
+  `standingRuleFullEveryTurns` 轮时重发；收到 `compaction/*` 事件时本会话记账整份作废。
 - 以上规则只作用于**自动注入**：模型显式 `memory_search` / `technique_search` 一条不少。
 
 ### 动作点顾问
@@ -288,6 +294,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | `failureInjectChars` | `1500` | 失败段字符上限 |
 | `failureInjectRelevantOnly` | `true` | 只注入与当前动作相关的预警（本会话确实犯过的指纹永远放行） |
 | `failureInjectPerSession` | `5` | 每会话失败注入总量（`0` 不限） |
+| `failureRepeatEscalate` | `true` | 本会话预警之后**又犯同一个错**时再讲一次（口吻换成「刚刚又犯」） |
 | `failurePromptOrder` | `255` | 失败段排序值 |
 | `failurePreventWindowTurns` | `3` | 判定「防住了」的观察窗口（轮次） |
 | `guidance` | `true` | 是否注入常驻指引段 |
@@ -327,13 +334,18 @@ dsh plugin --profile <name> install --offline                       #    重装�
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `techniques` | `true` | 是否启用技巧层 |
-| `techniqueMaintenance` | `true` | 是否在每次刷新时做领域名归一化、归档死重、口径迁移 |
+| `techniqueMaintenance` | `true` | 是否在每次刷新时做领域名归一化、**领域回填**、归档死重、口径迁移 |
 | `archiveAfterDays` | `14` | 归档「从未被检索 / 引用 / 成功」的旧草稿所需的最小年龄（天） |
 | `archiveKeepDomains` | `['dsh-', 'sdo']` | 豁免归档的领域前缀（也不参与领域上限计数） |
 | `maxActiveDraftsPerDomain` | `150` | 单个领域活跃草稿上限；超限时归档该领域最老且从未被用过的 |
 
 归档卡退出自动注入与排序，但 `technique_search` 默认仍返回、`technique_get` 仍能按 id 展开；
-被 `technique_apply` 成功即自动撤销归档。`pitfall` 类知识永不自动归档。
+被 `technique_apply` **独立**成功即自动撤销归档（自证不算，见上文「自证」）。`pitfall` 类知识永不自动归档。
+
+**领域回填**：没写 `domain` 的卡，维护时会从它的标签里认一个**库里已经在用的领域名**补上
+（认不出来就留空）。领域是分领域草稿上限、活跃领域豁免与挖掘词表的主键，没有领域的卡对这些机制是隐形的。
+实测真库 500 条里 125 条没有领域，能这样认出来的是 33 条（26%）—— 其余 92 条的标签是技术栈与版本
+（`minecraft` / `porting` / `1.21.1`），拿它们当领域只会凭空多出几十个一次性名字。
 
 ### 失败经验层
 
@@ -379,7 +391,7 @@ dsh plugin --profile <name> install --offline                       #    重装�
 <dir>/global/techniques.jsonl
 <dir>/global/failures.jsonl
 <dir>/global/<分区>/...            # 非 default 分区落在 global/<分区>/ 下
-<dir>/metrics.json                 # 反思（经验复利）指标
+<dir>/metrics.json                 # 反思（经验复利）指标 + 跨重启的注入遥测
 <dir>/mine-cache.json              # 代码挖掘的增量缓存（文件哈希 + 提示版本 + 模型）
 <dir>/index.sqlite                 # 可选：sqlite 索引后端
 ```
@@ -387,6 +399,10 @@ dsh plugin --profile <name> install --offline                       #    重装�
 - 情景层与技巧 / 失败层是 **JSONL**（可人工阅读、坏行被跳过），语义层是 **JSON 数组**。
   写入是**整体重写**：读全量 → 改 → 原子 `rename`，进程中断不会留下半截文件。
 - 四层都有**每作用域 500 条**上限；语义层按「命中次数优先、再看新旧」淘汰。
+- **技巧层的淘汰按价值，不按年龄**：先丢**已归档**的，再丢从未被检索 / 引用 / 采用过的
+  （同档内先丢被独立观测次数少的、最后才按年龄），保住用过的那批。旧口径是「时间先进先出」——
+  实测 3 天窗口里每天挤掉约 33 条，而近 3 天**注入过**的 100 个卡 id 已有 13 个不在真源里。
+  本次写入的新卡优先豁免（库满不等于停止生长）。
 - **同一记忆库同一时刻只允许一个写入者**：`<dir>/.writer.lock` 是跨进程写者锁，
   持锁者还活着时其他实例的写入当场失败并告警（`StoreLockedError`），不排队也不覆盖。
   锁只在本地文件系统上可靠（依赖 `O_EXCL`），网络盘需另配锁服务。
@@ -500,6 +516,16 @@ dsh plugin --profile <name> install --offline                       #    重装�
   正确做法：改前先 read — id fa_…
   ```
 
+- **同一会话内预警之后又犯**：历史预警原本每会话每指纹只讲一次，复发只更新计数、不再出声 ——
+  实测头部两个指纹在回合内复发过 47 / 29 次，而模型一个字都没再收到提醒。现在会再讲一次，口吻更直接：
+
+  ```
+  [预警之后又犯·本会话第 2 次] TypeError: undefined is not a function — 不要再原样重试：先定位根因，
+  换一种做法再试 — 同类调用已升级为派发前询问 — 工具：bash — id fa_…
+  ```
+
+  只在**真的又犯了一次**之后才讲（自己重渲染不算），讲完推进基线，不会每轮重发。
+  `failureRepeatEscalate: false` 可关掉，回到「每会话每指纹只讲一次」。
 - 升级强度按**回合内**次数算（`occurrencesAtReopen` 之后的增量），再次 `failure_resolve` 时回合基线清空。
 - 旧版本写下的「已解决但计数证明之后又发生过」的记录会在 `techniqueMaintenance` 里自动重开
   （**重启加载新版本后**生效）。

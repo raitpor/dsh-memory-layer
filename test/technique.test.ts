@@ -280,6 +280,30 @@ test('canonical 额外要求至少一条带证据的验收记录', () => {
   assert.equal(verified.status, 'canonical', '补上带证据的验收后应可提升')
 })
 
+test('P0.2 自证的成功不计数、不提升状态、不撤销归档', () => {
+  // 依据（真库实测）：88 条「被采用过」的卡里有 23 条（26%）从未被显式检索过 —— 那条回报
+  // 来自刚写完这张卡的会话。自证会直接推动 draft → validated，而 validated 是**有注入权**的
+  // 那一档，于是「作者喜欢自己刚写的东西」可以一路变成注入权威。
+  const archived = record({ archivedAt: 99, status: 'validated' })
+  const selfReported = applyOutcome(archived, verification({ at: 10, selfReported: true }))
+  assert.equal(selfReported.successes, 0, '自证不加 successes')
+  assert.equal(selfReported.status, 'validated', '自证不改变状态，也不得被算成又一次成功')
+  assert.equal(selfReported.archivedAt, 99, '自证不得撤销归档')
+  assert.equal(selfReported.applied, 1, '回报本身照记：applied 是「报过几次」的流水')
+  assert.equal(selfReported.lastVerifiedAt, 10, '验收确实发生过（证据也校验过），时间照记')
+  assert.equal(selfReported.verifications?.[0]?.selfReported, true, '验收记录要留下自证标记')
+  assert.equal(confidenceOf(selfReported), 0.5, '置信度不得被自证抬高')
+
+  const draft = applyOutcome(record(), verification({ at: 20, selfReported: true }))
+  assert.equal(draft.status, 'draft', '自证不得把草稿推成 validated')
+
+  // 反方向：独立验收（没有 `selfReported`）照旧计数、提升、撤归档。
+  const independent = applyOutcome(archived, verification({ at: 30 }))
+  assert.equal(independent.successes, 1)
+  assert.equal(independent.archivedAt, undefined, '独立成功才把归档卡救回来')
+  assert.equal(independent.status, 'validated')
+})
+
 test('验收记录最新在前并封顶', () => {
   let current = record()
   for (let index = 0; index < MAX_VERIFICATIONS + 2; index += 1) {

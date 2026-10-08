@@ -4,5 +4,6 @@ lib/
 .dsh-test/
 .pnpm-store/
 .verify/
+.review/
 dist/
 .pack-cache/

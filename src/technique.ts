@@ -253,7 +253,9 @@ export function promotedStatus(record: TechniqueRecord): TechniqueStatus {
  * - 成功 → 计数 +1，刷新 `lastVerifiedAt`，可能提升状态；
  * - 失败 → 计数 +1，连续失败超过成功且达到阈值时标记 `deprecated`；
  * - 两种情况都把 {@link TechniqueVerification} 记入 `verifications`（最新在前、有上限）；
- * - `deprecated` 是粘性的，不会被自动提升。
+ * - `deprecated` 是粘性的，不会被自动提升；
+ * - **自证的成功**（`selfReported`，见该字段）：仍然记一条验收记录、仍然刷新 `lastVerifiedAt`，
+ *   但**不加 `successes`、不提升状态、不撤销归档** —— 独立验收才是信任的来源。
  *
  * @param record - 原记录。
  * @param verification - 本次采用的验收记录（含可证伪证据）。
@@ -261,7 +263,9 @@ export function promotedStatus(record: TechniqueRecord): TechniqueStatus {
  */
 export function applyOutcome(record: TechniqueRecord, verification: TechniqueVerification): TechniqueRecord {
   const { outcome, at } = verification
-  const successes = record.successes + (outcome === 'success' ? 1 : 0)
+  // 只有「作者会话给自己的卡报成功」被降级；失败与独立成功都照旧。
+  const selfCertified = outcome === 'success' && verification.selfReported === true
+  const successes = record.successes + (outcome === 'success' && !selfCertified ? 1 : 0)
   const failures = record.failures + (outcome === 'failure' ? 1 : 0)
   const updated: TechniqueRecord = {
     ...record,
@@ -274,7 +278,7 @@ export function applyOutcome(record: TechniqueRecord, verification: TechniqueVer
   if (outcome === 'success') updated.lastVerifiedAt = at
   // 被归档的卡一旦**真的用成功了**就不再是死重：撤掉归档，让它重新参与注入与排序。
   // 只认成功不认失败 —— 失败可能只是这次不适用，不足以证明它活过来了。
-  if (outcome === 'success' && updated.archivedAt !== undefined) delete updated.archivedAt
+  if (outcome === 'success' && !selfCertified && updated.archivedAt !== undefined) delete updated.archivedAt
 
   if (failures >= DEPRECATE_AFTER_FAILURES && failures > successes) {
     updated.status = 'deprecated'

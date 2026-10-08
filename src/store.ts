@@ -77,7 +77,7 @@ export const MAX_SUMMARY_CHARS = 2000
 /** 每个作用域保留的情景记录条数上限，超出丢弃最旧的。 */
 export const MAX_EPISODIC_PER_SCOPE = 500
 
-/** 每个作用域保留的技巧记录条数上限，超出丢弃最旧的。 */
+/** 每个作用域保留的技巧记录条数上限，超出按 {@link evictionRank} 淘汰（先丢最没价值的，同龄才丢最旧的）。 */
 export const MAX_TECHNIQUES_PER_SCOPE = 500
 
 /** 每个作用域保留的失败记录条数上限，超出丢弃最旧的。 */
@@ -201,6 +201,33 @@ const DOMAIN_ALIASES: ReadonlyMap<string, string> = new Map([
 ])
 
 /**
+ * P3 领域回填：为一条没有领域的卡，从它的标签里挑一个**该作用域已经在用的领域名**。
+ *
+ * 实测（真库 500 条 / 125 条无领域）：能这样回填的是 33 条（26%）—— 其余 92 条的标签是技术栈
+ * 与版本（`minecraft` 35、`porting` 17、`1.21.1` 13、`gradle` 14…），不是领域名。
+ * 刻意**不**从任意标签造新领域：那会凭空多出几十个只用过一次的领域名，把
+ * `maxActiveDraftsPerDomain` 与 `knownDomainsForMining` 一起稀释掉 —— 留空至少是「不知道」，
+ * 造词是「知道错了」。
+ *
+ * 领域名是这一层的**结构化主键**之一（分领域上限、活跃领域豁免、挖掘词表都读它），
+ * 所以「能从已用词表里认出来的就补上」，认不出来的一律留空。
+ *
+ * @param tags - 卡片标签（保序；取第一个能认出来的）。
+ * @param known - 该作用域**已经在用**的领域名（已归一化）。
+ * @returns 领域名；无可用标签时 `undefined`。
+ */
+export function deriveDomainFromTags(
+  tags: readonly string[],
+  known: ReadonlySet<string>,
+): string | undefined {
+  for (const tag of tags) {
+    const domain = normalizeDomain(tag)
+    if (domain !== undefined && known.has(domain)) return domain
+  }
+  return undefined
+}
+
+/**
  * 归一化业务领域名：去首尾空白、内部空白压成一个空格、转小写，再查 {@link DOMAIN_ALIASES}。
  *
  * 大小写折叠对**合并行为**是零风险的：`techniqueKey` 走的 `semanticKey` 早就转了小写，
@@ -317,6 +344,10 @@ export function emptyMetrics(): ReflectionMetrics {
     duplicateTechniques: 0,
     emptyStreak: 0,
     backoff: false,
+    injections: 0,
+    gateKept: 0,
+    gateDropped: 0,
+    advisories: 0,
   }
 }
 
@@ -356,6 +387,75 @@ export function assignConflicts(records: readonly TechniqueRecord[]): void {
         .slice(0, MAX_CONFLICTS)
     }
   }
+}
+
+/**
+ * 容量淘汰的**保留价值**评分（越大越该留）。只在超出 {@link MAX_TECHNIQUES_PER_SCOPE} 时用来排序。
+ *
+ * 为什么不再按 `ts` 先进先出：真库实测（3 天窗口）500 条上限下每天挤掉约 33 条，而近 3 天**注入过**
+ * 的 100 个卡 id 里已有 13 个不在真源里 —— 时间顺序与「值不值得留」无关，丢掉的是被用过的那批，
+ * 留下的是「从未被检索且从未被采用」的老草稿（实测同口径下 201 条）。
+ *
+ * 四档的依据都是**已经发生过的使用信号**，而不是猜测：
+ *  - 0：已归档 —— 已经走过一次可逆的「退出竞争」（见 `isArchivable`），没人把它救回来，最该让位；
+ *  - 1：从未被检索、被引用、被采用，也没有验收记录 —— 没有任何人问过它；
+ *  - 2：有使用痕迹但从未成功 —— 至少有人查过或验过；
+ *  - 3：`referenced > 0` —— 它的符号/调用名真的出现在模型的动作里；
+ *  - 4：`successes > 0` —— 真的按判据验收成功过，是最强信号。
+ *
+ * @param record - 技巧记录。
+ * @returns 保留价值档位（0–4）。
+ */
+function evictionRank(record: TechniqueRecord): number {
+  if (record.archivedAt !== undefined) return 0
+  if (record.successes > 0) return 4
+  if ((record.referenced ?? 0) > 0) return 3
+  if ((record.retrieveCount ?? 0) > 0 || (record.verifications?.length ?? 0) > 0) return 2
+  return 1
+}
+
+/**
+ * 淘汰排序：**先丢价值低的**；同档内先丢被独立观测到次数少的（`hits` 只在合并时累加，
+ * 更高说明同一知识在别的会话里被重新观察到过）；最后才按 `ts` 丢最旧的。
+ *
+ * @param left - 左侧记录。
+ * @param right - 右侧记录。
+ * @returns 比较结果（升序 = 先淘汰）。
+ */
+function evictionOrder(left: TechniqueRecord, right: TechniqueRecord): number {
+  return evictionRank(left) - evictionRank(right) || left.hits - right.hits || left.ts - right.ts
+}
+
+/**
+ * 把一批技巧收敛到容量上限，返回**存活**的那批。
+ *
+ * 本次调用刚写入的卡（`freshIds`）优先豁免：新知识必须进得来，否则「库满」就等于「库停止生长」。
+ * 只有当可淘汰的旧卡不够时，才轮到刚写入的卡自己让位（保证上限仍是硬约束，而不是可被一次批量写入
+ * 越过的软约束）。
+ *
+ * @param records - 待收敛的全部记录。
+ * @param freshIds - 本次调用新建的记录 id（豁免优先）。
+ * @returns 长度不超过 {@link MAX_TECHNIQUES_PER_SCOPE} 的记录。
+ */
+function trimTechniques(
+  records: readonly TechniqueRecord[],
+  freshIds: ReadonlySet<string>,
+): TechniqueRecord[] {
+  if (records.length <= MAX_TECHNIQUES_PER_SCOPE) return [...records]
+  const excess = records.length - MAX_TECHNIQUES_PER_SCOPE
+  const doomed = new Set<string>()
+  const evictable = records.filter(record => !freshIds.has(record.id)).sort(evictionOrder)
+  for (const record of evictable) {
+    if (doomed.size >= excess) break
+    doomed.add(record.id)
+  }
+  if (doomed.size < excess) {
+    for (const record of records.filter(item => !doomed.has(item.id)).sort(evictionOrder)) {
+      if (doomed.size >= excess) break
+      doomed.add(record.id)
+    }
+  }
+  return records.filter(record => !doomed.has(record.id))
 }
 
 /** 保序并集，可设上限；两侧都为空时返回 `undefined`。 */
@@ -1096,8 +1196,9 @@ export class MemoryStore {
     const now = options.now ?? Date.now()
     const records = await this.readTechniques(scope, cwd, partition)
     const byKey = new Map(records.map(record => [techniqueKey(record.name, record.when, record.domain), record]))
-    let created = 0
     let merged = 0
+    // 本次新建的 id：既用于容量淘汰的豁免（让「新知识进得来」不被「库满」挡掉），也是回报的新建数。
+    const freshIds = new Set<string>()
 
     for (const draft of drafts) {
       const name = draft.name.trim()
@@ -1147,16 +1248,19 @@ export class MemoryStore {
         provenance,
       }
       byKey.set(key, record)
-      created += 1
+      freshIds.add(record.id)
     }
 
-    const next = [...byKey.values()].sort((left, right) => left.ts - right.ts).slice(-MAX_TECHNIQUES_PER_SCOPE)
+    const next = trimTechniques([...byKey.values()], freshIds)
     assignConflicts(next)
     await this.writeAtomic(
       join(this.scopeDir(scope, cwd, partition), TECHNIQUE_FILE),
       next.map(record => JSON.stringify(record)).join('\n') + (next.length > 0 ? '\n' : ''),
     )
-    return { records: next, created, merged }
+    // 上限压力下刚写入的卡也可能被淘汰（可淘汰的旧卡不够时），因此按**存活**的那批回报新建数，
+    // 否则调用方会报「新增 N 条」而库里其实没有。
+    const keptIds = new Set(next.map(record => record.id))
+    return { records: next, created: [...freshIds].filter(id => keptIds.has(id)).length, merged }
   }
 
   /**

@@ -226,8 +226,10 @@ async function setup(
   config: Partial<Config> = {},
   withServices = true,
   extraServices: Record<string, unknown> = {},
+  // 传入已有的存储根 = 同一个记忆库上再装一次插件（P4 用它模拟「热重载/重启」）。
+  existingRoot?: string,
 ): Promise<{ fake: FakeContext; root: string; dispose: () => Promise<void> }> {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-memory-plugin-'))
+  const root = existingRoot ?? await mkdtemp(join(tmpdir(), 'dsh-memory-plugin-'))
   const probe = {
     prompts: [] as PromptEntry[],
     tools: [] as ToolDefinition[],
@@ -250,7 +252,17 @@ async function setup(
     encrypt: false,
     ...config,
   } as Config)
-  return { fake, root, dispose: async () => rm(root, { recursive: true, force: true }) }
+  return {
+    fake,
+    root,
+    // 清理前先把后台写入排空：`rm -rf` 与插件刚发起的写入（如 P4 的遥测落盘）会赛跑，
+    // 输了的那一方报 ENOTEMPTY（目录刚被删又被写入重建）—— 那是测试装置的问题，不是产品缺陷。
+    // 要排几轮：`session/flush` 只 await **调用那一刻**已登记的任务。
+    dispose: async () => {
+      for (let round = 0; round < 3; round += 1) await fake.flush()
+      await rm(root, { recursive: true, force: true })
+    },
+  }
 }
 
 /**
@@ -1144,6 +1156,32 @@ test('扩展名不构成「库已覆盖」：库里出现过 `ts` 时新的 .ts 
  * @param fake - context 替身。
  * @returns 技巧 id。
  */
+/**
+ * 把一张卡变成 `validated`（= 可注入）。**必须换一个会话来验收。**
+ *
+ * P0.2 起，「写这张卡的会话自己报成功」不再计入 `successes`（自证，见
+ * `TechniqueVerification.selfReported`）—— 于是同一会话里 save + apply 得到的仍是草稿，
+ * 注入断言会全部落空。这里的第二个会话不只是为了让用例过：它正是新规则要的形状，
+ * 「独立验收才推动状态」这件事在夹具里也一样成立。
+ *
+ * @param fake - context 替身。
+ * @param id - 技巧 id。
+ * @returns 验收回执。
+ */
+/** 每次独立验收换一个会话（连同会话 id 也要换：同一会话连着验收两张卡，第二张就变成自证了）。 */
+let promoteSeq = 0
+
+async function promoteIndependently(fake: FakeContext, id: string, cwd = '/work/demo'): Promise<string> {
+  promoteSeq += 1
+  const verify = fakeSession(`verify-${promoteSeq}`, cwd)
+  fake.emit('session/created', verify)
+  await fake.flush()
+  fake.emit('session/event', verify, event('turn/start', { turn: 1 }))
+  return String(await toolOf(fake, 'technique_apply').execute(
+    { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+  ))
+}
+
 async function seedValidatedTechnique(fake: FakeContext): Promise<string> {
   const seed = fakeSession('seed', '/work/demo')
   fake.emit('session/created', seed)
@@ -1158,7 +1196,7 @@ async function seedValidatedTechnique(fake: FakeContext): Promise<string> {
   } as never, undefined as never))
   const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
   if (id === undefined) throw new Error(`技巧保存应答里没有 id：${saved}`)
-  await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
+  await promoteIndependently(fake, id)
   return id
 }
 
@@ -1291,9 +1329,7 @@ test('DEF-30 appliesTo 是真闸门：模块对不上就不注入，判不出来
       } as never, undefined as never))
       const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
       assert.ok(id !== undefined, `保存应答里应有 id：${saved}`)
-      await toolOf(fake, 'technique_apply').execute({
-        id, outcome: 'success', evidence: GOOD_EVIDENCE,
-      } as never, undefined as never)
+      await promoteIndependently(fake, id)
     }
 
     const section = (): string => sectionText(fake, 'memory-layer:techniques')
@@ -1517,7 +1553,12 @@ test('注入块必须中和 {{ ：否则 prompt 插值会整轮抛错', async ()
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
     assert.ok(id !== undefined, saved)
-    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
+    await promoteIndependently(fake, id)
+    // 独立验收走的是另一个会话（P0.2），渲染注入前把本会话切回来 —— 否则 `current` 是那个
+    // 只发了 `turn/start`、没有任何用户文本的验收会话，查询为空 → 什么都不注入。
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('salt 线框图的按钮该怎么写'))
 
     const stored = (await new MemoryStore(root).readTechniques('global')).find(item => item.id === id)
     assert.ok(
@@ -1580,9 +1621,7 @@ test('技巧按技术栈过滤：Java 项目写入，TS 项目不注入、另一
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
     assert.ok(id !== undefined, `保存应答应含 id：${saved}`)
-    assert.match(String(await toolOf(fake, 'technique_apply').execute(
-      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
-    )), /validated/u)
+    assert.match(await promoteIndependently(fake, id, javaA), /validated/u)
 
     // 切到 TS 项目：技术栈不匹配 → 不注入（宁可少给，也不给错的）。
     const tsSession = fakeSession('sT', tsProject)
@@ -1665,11 +1704,14 @@ function toolFailure(
   text: string,
   error?: { name: string; code: string },
   args: Record<string, unknown> = {},
+  // 轮次必须能对上：`turnOf` 见到「与当前轮不同」的号会**新建一轮**，
+  // 于是「本会话第几轮犯的」会被记成事件里的号，而不是真实轮次（会话内升级判定就靠它）。
+  turn = 1,
 ): { call: never; result: never } {
   return {
-    call: event('tool/call', { turn: 1, step: 1, callId, name, arguments: JSON.stringify(args) }),
+    call: event('tool/call', { turn, step: 1, callId, name, arguments: JSON.stringify(args) }),
     result: event('tool/result', {
-      turn: 1,
+      turn,
       step: 1,
       message: {
         id: `m-${callId}`,
@@ -1764,6 +1806,129 @@ test('P1-⑤ failure_forgive 在本会话内抑制预警', async () => {
     assert.match(sectionText(fake, 'memory-layer:failures'), /已重复 3 次/u)
   } finally {
     await dispose()
+  }
+})
+
+test('P2 会话内升级：预警之后又犯同一个错，就必须再说一次（且口吻更直接）', async () => {
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  const error = 'TypeError: undefined is not a function at /work/a/x.js:5:1'
+  try {
+    // 历史：另外两个会话各犯一次 → 阈值（2）已到，本会话第一轮就能收到历史预警。
+    await failSession(fake, fakeSession('s1', '/work/demo'), error)
+    await failSession(fake, fakeSession('s2', '/work/demo'), error)
+
+    const session = fakeSession('hot', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    const warned = sectionText(fake, 'memory-layer:failures')
+    assert.match(warned, /已重复 2 次/u, `首轮给历史预警：${warned}`)
+    assert.doesNotMatch(warned, /预警之后又犯/u, '还没复发，不该出现升级行')
+
+    // 本会话自己又撞了一次同一个指纹。
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    const { call, result } = toolFailure('c9', 'bash', error, undefined, {}, 2)
+    fake.emit('session/event', session, call)
+    fake.emit('session/event', session, result)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    const repeated = sectionText(fake, 'memory-layer:failures')
+    assert.match(repeated, /预警之后又犯/u, `复发之后必须再说一次：${repeated}`)
+    assert.match(repeated, /undefined is not a function/u, '要带现象')
+    assert.match(repeated, /不要再原样重试|换掉上一次的做法/u, '要给出可执行的下一步')
+
+    // 同一轮里再渲染一次形态必须一致（惰性渲染可能被调用多次，取后一次结果的路径不能把升级吞掉）。
+    assert.equal(sectionText(fake, 'memory-layer:failures'), repeated, '同一轮内形态必须稳定')
+
+    // 再往后几轮、但**没有新的失败**：不得继续训话。
+    // 「只重发不重犯」不算复发 —— 基线不推进的话这条升级会每轮重发。
+    fake.emit('session/event', session, event('turn/start', { turn: 4 }))
+    assert.doesNotMatch(
+      sectionText(fake, 'memory-layer:failures'),
+      /预警之后又犯/u,
+      '没有新的失败就不该反复重发升级行',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
+test('F3 同一轮内多次复发只升级一次，且次数如实', async () => {
+  // 复审 F3 报的是覆盖缺口：代码用轮次戳防重发（同轮重渲染保持同形态、跨轮推进基线），
+  // 但三条 P2 用例都没覆盖「同一轮里连续撞 N 次」这个真实场景（真库那条指纹回合内复发过 98 次）。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  const error = 'EACCES: permission denied'
+  try {
+    await failSession(fake, fakeSession('s1', '/work/demo'), error)
+    await failSession(fake, fakeSession('s2', '/work/demo'), error)
+    const session = fakeSession('hot', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    assert.match(sectionText(fake, 'memory-layer:failures'), /已重复 2 次/u, '先有历史预警')
+
+    // 同一轮里连撞两次（不同 callId，同指纹）。
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    for (const callId of ['c1', 'c2']) {
+      const { call, result } = toolFailure(callId, 'bash', error, undefined, {}, 2)
+      fake.emit('session/event', session, call)
+      fake.emit('session/event', session, result)
+    }
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    const rendered = sectionText(fake, 'memory-layer:failures')
+    const escalated = rendered.split('\n').filter(line => line.includes('预警之后又犯'))
+    assert.equal(escalated.length, 1, `同一轮两次复发只应给一条升级行：${rendered}`)
+    // 整段里关于这条失败的表述只能有一处（现象串只出现一次）：多印一遍就是刷屏。
+    assert.equal((rendered.match(/EACCES/gu) ?? []).length, 1, `这条失败只应出现一次：${rendered}`)
+    assert.match(escalated[0] ?? '', /本会话第 2 次/u, `次数要如实（本会话观测到 2 次）：${escalated[0]}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('P2 反例面：没复发就不升级；关掉开关即回到「只讲一次」', async () => {
+  // 两个方向都要钉：升级行只在**本会话预警之后又真的犯了**时出现，
+  // 且 `failureRepeatEscalate: false` 能完全关掉它（否则这条改动就成了一条不可关的常驻成本）。
+  const error = 'EACCES: permission denied'
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    await failSession(fake, fakeSession('s1', '/work/demo'), error)
+    await failSession(fake, fakeSession('s2', '/work/demo'), error)
+    const session = fakeSession('cool', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    assert.match(sectionText(fake, 'memory-layer:failures'), /已重复 2 次/u)
+    // 本会话只是又渲染了几轮，什么都没犯 → 不得出现升级行。
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    assert.doesNotMatch(sectionText(fake, 'memory-layer:failures'), /预警之后又犯/u, '没复发就不升级')
+  } finally {
+    await dispose()
+  }
+
+  const off = await setup({ reflectOnSessionEnd: false, failureRepeatEscalate: false })
+  try {
+    await failSession(off.fake, fakeSession('s1', '/work/demo'), error)
+    await failSession(off.fake, fakeSession('s2', '/work/demo'), error)
+    const session = fakeSession('hot-off', '/work/demo')
+    off.fake.emit('session/created', session)
+    off.fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    await off.fake.flush()
+    assert.match(sectionText(off.fake, 'memory-layer:failures'), /已重复 2 次/u)
+    off.fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    const { call, result } = toolFailure('c7', 'bash', error, undefined, {}, 2)
+    off.fake.emit('session/event', session, call)
+    off.fake.emit('session/event', session, result)
+    await off.fake.flush()
+    off.fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    assert.doesNotMatch(
+      sectionText(off.fake, 'memory-layer:failures'),
+      /预警之后又犯/u,
+      '关掉开关后必须回到「每会话每指纹只讲一次」',
+    )
+  } finally {
+    await off.dispose()
   }
 })
 
@@ -2436,9 +2601,7 @@ test('① 内容变化必须恢复全文：改过正文的条目下一轮不再�
       const saved = String(await toolOf(fake, 'technique_save').execute(fields as never, undefined as never))
       const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
       assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
-      await toolOf(fake, 'technique_apply').execute(
-        { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
-      )
+      await promoteIndependently(fake, id)
       return id
     }
     // 主卡：与查询词高度贴合，稳定占住唯一的技巧段名额。
@@ -2464,8 +2627,14 @@ test('① 内容变化必须恢复全文：改过正文的条目下一轮不再�
 
     fake.emit('session/event', session, event('turn/start', { turn: 2 }))
     fake.emit('session/event', session, userMessage('再说一遍 Zqblat 用法'))
-    assert.match(sectionText(fake, 'memory-layer:recall'), /unchanged, full text delivered earlier/u,
-      '第二轮应改发指针形态')
+    const pointer = sectionText(fake, 'memory-layer:recall')
+    assert.match(pointer, /unchanged, index line given earlier in this session/u,
+      `第二轮应改发指针形态：${pointer}`)
+    // 复审 F1：这一条是**技巧**条目从召回段进来的（技巧段被 `techniqueLimit: 1` 占满），
+    // 而它这一路只发过索引行 —— 说成「full text delivered」会让模型以为手里已有 pitfalls/verify。
+    // 必须带 `technique_get` 的入口提示，否则正文再也拿不到。
+    assert.match(pointer, /technique_get for the full card/u, `指针必须给出取正文的入口：${pointer}`)
+    assert.doesNotMatch(pointer, /full text delivered/u, `技巧条目不得声称给过全文：${pointer}`)
 
     // 原地改这条卡的正文（id 不变）→ 下一轮必须恢复全文，而不是继续发「内容没变」的指针。
     await toolOf(fake, 'technique_save').execute({
@@ -3037,6 +3206,191 @@ test('① 反例面：被预算截断的条目不算「已给过」，下一轮�
   }
 })
 
+test('① 技巧段重复条目改发指针：首轮索引行、次轮指针，compaction 之后恢复索引行', async () => {
+  // 依据（3 天实测）：技巧段占插件注入成本 31.8%，其中**同一会话内重复给的索引行**占该段 36.5%
+  // ——「哪条技巧和当前任务相关」在一个会话里是稳定属性，逐轮重印整行是纯付费。
+  // 反例面与召回段同源：长会话里早期注入会被宿主 compaction 裁掉，那时继续发指针就是让模型去找
+  // 一段不存在的文本；另外这一路的「全文」只是索引行，措辞不能照抄召回段那句 full text。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    standingRuleFullEveryTurns: 0, // 关掉「每 N 轮重发」，单独测「已给过 → 指针」
+  })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('integrating the orders client'))
+    const first = sectionText(fake, 'memory-layer:techniques')
+    assert.match(first, /做法: /u, `首轮必须是完整索引行：${first}`)
+    assert.match(first, /何时用: /u, `首轮必须是完整索引行：${first}`)
+    assert.doesNotMatch(first, /unchanged, index line/u, '首轮不可能是指针形态')
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('integrating the orders client'))
+    const second = sectionText(fake, 'memory-layer:techniques')
+    assert.match(second, /unchanged, index line given earlier in this session/u,
+      `第二轮应改发指针形态：${second}`)
+    assert.ok(second.includes(id.slice(0, 11)), `指针要带可寻址的句柄：${second}`)
+    assert.match(second, /authorize before create/u, `指针要带名称（否则模型无从判断是哪条）：${second}`)
+    assert.doesNotMatch(second, /做法: /u, `第二轮不该再印整条索引行：${second}`)
+    // 措辞必须是「索引行已给过」而不是召回段那句「全文已给过」：这一路从没给过正文，
+    // 说成全文会让模型以为手里已有步骤与示例，于是不再 technique_get。
+    assert.doesNotMatch(second, /full text delivered earlier/u, `技巧段不得声称给过全文：${second}`)
+
+    // 反例面：宿主 compaction 之后记账必须整份作废 → 回到完整索引行。
+    fake.emit('session/event', session, event('compaction/end', {}))
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    fake.emit('session/event', session, userMessage('integrating the orders client'))
+    const third = sectionText(fake, 'memory-layer:techniques')
+    assert.match(third, /做法: /u, `compaction 之后必须回到完整索引行：${third}`)
+    assert.doesNotMatch(third, /unchanged, index line/u, '这时不能再是指针')
+  } finally {
+    await dispose()
+  }
+})
+
+test('① 技巧段：改了正文之后下一轮必须恢复完整索引行（内容指纹失效）', async () => {
+  // 「已给过」的判据是**内容未变**。技巧的正文可以就地更新（`technique_save(id=…)`），
+  // 若只按 id 记「已给过」，改过的卡会永远停在指针上，而指针指向的旧文本已经不对了。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    standingRuleFullEveryTurns: 0,
+  })
+  try {
+    const id = await seedValidatedTechnique(fake)
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('integrating the orders client'))
+    assert.match(sectionText(fake, 'memory-layer:techniques'), /做法: /u, '首轮完整索引行')
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('integrating the orders client'))
+    assert.match(sectionText(fake, 'memory-layer:techniques'), /unchanged, index line/u, '第二轮指针')
+
+    // 就地改正文（等价于真库里「纠正措辞」这条路）。
+    await toolOf(fake, 'technique_save').execute({
+      id,
+      summary: 'Call authorize before create; the new gateway requires an idempotency key.',
+    } as never, undefined as never)
+
+    fake.emit('session/event', session, event('turn/start', { turn: 3 }))
+    fake.emit('session/event', session, userMessage('integrating the orders client'))
+    const third = sectionText(fake, 'memory-layer:techniques')
+    assert.doesNotMatch(third, /unchanged, index line/u,
+      `内容变了就不算「已给过」，必须重新给完整索引行：${third}`)
+    assert.match(third, /idempotency key/u, `新正文必须真的进到索引行里：${third}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('① 技巧段反例面：被预算截断的索引行不算「已给过」', async () => {
+  // 与召回段同一条规矩：只有**真的完整落进块里**的行才记账。否则第 2 轮会发一个指向
+  // 「上一轮被截断的半行」的指针 —— 模型手里其实没有那半行之后的内容。
+  //
+  // 预算算术（实测）：技巧块的固定框 = 611 字符（5 行不可信声明 + 2 行采纳提示 + 围栏）。
+  // 取 `techniqueChars: 811` ⇒ 正文预算 199：完整索引行约 390（短名 + 长 gist + 长 when）放不下，
+  // 指针形态约 114（`tq_` + 短名 + 一句说明）放得下 —— 于是「截断后仍然记账」这个 bug
+  // 会在第 2 轮露出指针，正好被抓。
+  const { fake, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    standingRuleFullEveryTurns: 0,
+    techniqueChars: 811,
+  })
+  try {
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'zqblat rotate',
+      when: `zqblat rotate pipeline ${'zqblat gate step '.repeat(12)}`,
+      gist: 'Rotate the zqblat credentials through the gate before any deploy step runs; keep the old key until the new one is confirmed.',
+      summary: 'Rotate the zqblat credentials through the gate before any deploy step runs.',
+      kind: 'procedure',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `保存应答应含 id：${saved}`)
+    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    await fake.flush()
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('zqblat rotate pipeline'))
+    const first = sectionText(fake, 'memory-layer:techniques')
+    // 前提自证：这一轮确实被截断了（`id tq_…` 是索引行的最后一截，截断后必然看不到）。
+    assert.doesNotMatch(first, /id tq_/u, `本用例的前提是「完整索引行放不下」：${first}`)
+    assert.match(first, /zqblat rotate/u, `截断后仍应留下行的开头：${first}`)
+    assert.doesNotMatch(first, /unchanged, index line/u, '首轮不可能是指针形态')
+
+    fake.emit('session/event', session, event('turn/start', { turn: 2 }))
+    fake.emit('session/event', session, userMessage('zqblat rotate pipeline'))
+    const second = sectionText(fake, 'memory-layer:techniques')
+    assert.doesNotMatch(second, /unchanged, index line given earlier/u,
+      `被截断的条目不许记为「已给过」：${second}`)
+  } finally {
+    await dispose()
+  }
+})
+
+test('P3 领域回填：没领域的卡从**已在用的领域名**里认一个，认不出来一律留空', async () => {
+  // 动机（实测）：真库 500 条里 125 条没有 `domain`（99 草稿 / 26 已验证），而领域是这一层的
+  // 结构化主键 —— 分领域草稿上限、活跃领域豁免、挖掘词表全读它，没有领域的卡对这些机制是隐形的。
+  // 可回填的只有 33 条（26%）：它们的标签里有一个「别的卡已经当领域名在用」的词；
+  // 其余 92 条的标签是技术栈与版本（minecraft / porting / 1.21.1），不是领域名。
+  const { fake, root, dispose } = await setup({
+    reflectOnSessionEnd: false,
+    distillOnTurnEnd: false,
+    // 年龄闸门关掉，避免这条用例顺带测到归档（那是另一条用例的事）。
+    archiveAfterDays: 3650,
+  })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const save = async (fields: Record<string, unknown>): Promise<string> => {
+      const saved = String(await toolOf(fake, 'technique_save').execute(fields as never, undefined as never))
+      const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+      assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+      return id
+    }
+    // 词表来源：这张卡显式写着 domain，于是 `gradle` 成为「已在用的领域名」。
+    const anchored = await save({ name: '领域词表锚点', when: '随便', summary: '正文。', domain: 'gradle' })
+    // 可回填：标签里有一个已在用的领域名。
+    const fillable = await save({ name: '可回填样本', when: '随便', summary: '正文。', tags: ['zzz', 'gradle'] })
+    // 不可回填：标签不是任何在用的领域名 —— 不许造新领域。
+    const invented = await save({ name: '不可回填样本', when: '随便', summary: '正文。', tags: ['zzz', 'porting'] })
+    // 撞键护栏：与已有卡同名同触发条件时一律不回填（回填会造出重复身份）。
+    // 这里不能靠 save 回执取 id —— 回执按 name+when 查记录，撞键时会指回第一张卡。
+    await save({ name: '撞键样本', when: '同一个触发', summary: '撞键甲。', domain: 'gradle' })
+    await save({ name: '撞键样本', when: '同一个触发', summary: '撞键乙。', tags: ['gradle'] })
+
+    const s = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', s)
+    fake.emit('session/event', s, event('turn/start', { turn: 1 }))
+    await fake.flush()
+    // 维护在 `refresh` 里跑；显式检索会先 refresh，用它来触发并等待落盘。
+    await toolOf(fake, 'technique_search').execute({ query: '领域回填' } as never, undefined as never)
+
+    const records = await new MemoryStore(root).readTechniques('global')
+    const domainOf = (id: string): string | undefined => records.find(record => record.id === id)?.domain
+    assert.equal(domainOf(anchored), 'gradle', '前列：锚点卡的领域保持不变')
+    assert.equal(domainOf(fillable), 'gradle', '标签里能认出的领域名应被回填')
+    assert.equal(domainOf(invented), undefined, '认不出来就必须留空，不许从任意标签造新领域')
+    const collision = records.filter(record => record.name === '撞键样本')
+    assert.equal(collision.length, 2, `前提：同名同触发的两张卡都在库里（${JSON.stringify(collision)}）`)
+    assert.equal(
+      collision.find(record => record.summary === '撞键乙。')?.domain,
+      undefined,
+      '同名同触发条件的卡不回填（回填会撞合并键，下一次 upsert 会丢一条）',
+    )
+  } finally {
+    await dispose()
+  }
+})
+
 test('死重维护（0.2.10）：归档落盘、退出注入，但检索默认仍可见', async () => {
   // 动机：251/459 条卡「从未被显式检索 + 从未被引用 + 从未成功」，全部是草稿 —— 它们进不了注入，
   // 却把检索语料、领域词表与统计口径搅浑。删掉不可逆，所以改成**归档**：退出竞争，但仍可检索。
@@ -3324,9 +3678,7 @@ test('U1a（0.2.8 修订）：库里的最佳答案若是草稿，就在**同一
         summary: `EnchantmentTable 迁移要点 ${suffix}：资源键改为 ResourceKey。`,
       } as never, undefined as never))
       const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
-      await toolOf(fake, 'technique_apply').execute(
-        { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
-      )
+      await promoteIndependently(fake, id)
     }
     await toolOf(fake, 'technique_save').execute({
       name: '附魔杂记', when: '随便看看', summary: '杂记：EnchantmentTable 相关的零散备注。',
@@ -3544,9 +3896,19 @@ test('P4-① technique_apply 的成功/失败计数驱动状态迁移', async ()
     const before = await new MemoryStore(root).readTechniques('global')
     assert.equal(before[0]?.status, 'draft')
 
-    assert.match(String(await toolOf(fake, 'technique_apply').execute(
+    // P0.2：作者会话自己报成功是**自证**，不加 `successes`、也不提升状态 ——
+    // 所以「计数驱动状态迁移」这条只能靠**另一个会话**的独立验收来演示。
+    const selfCertified = String(await toolOf(fake, 'technique_apply').execute(
       { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
-    )), /validated/u)
+    ))
+    assert.match(selfCertified, /Self-reported/u, `自证必须当场说明：${selfCertified}`)
+    const stillDraft = await new MemoryStore(root).readTechniques('global')
+    assert.equal(stillDraft[0]?.status, 'draft', '自证不得把草稿推成 validated（validated 有注入权）')
+    assert.equal(stillDraft[0]?.successes, 0, '自证不计入 successes')
+    assert.equal(stillDraft[0]?.applied, 1, '回报本身不丢：applied 照记')
+    assert.equal(stillDraft[0]?.verifications?.[0]?.selfReported, true, '验收记录要带自证标记')
+
+    assert.match(await promoteIndependently(fake, id), /validated/u)
     assert.equal((await new MemoryStore(root).readTechniques('global'))[0]?.status, 'validated')
 
     await toolOf(fake, 'technique_apply').execute({ id, outcome: 'failure', evidence: GOOD_EVIDENCE } as never, undefined as never)
@@ -3555,6 +3917,126 @@ test('P4-① technique_apply 的成功/失败计数驱动状态迁移', async ()
     assert.equal(deprecated[0]?.status, 'deprecated', '连续失败应废弃，避免继续误导')
     assert.equal(deprecated[0]?.successes, 1)
     assert.equal(deprecated[0]?.failures, 2)
+  } finally {
+    await dispose()
+  }
+})
+
+test('P0.2 自证的反例面：作者会话先显式检索过这条卡，回报就算独立验收', async () => {
+  // 判据是两条**同时**成立：本会话写了它 **且** 本会话没显式检索过它。
+  // 第二条是刻意留的门：先 `technique_get` 把卡当成一条知识读回来、再验收，是一次独立的
+  // 检索动作（`retrieveCount` 也会 +1，遥测里看得见），不该被当成「顺手给自己盖章」。
+  // 这条门必须有用例钉住：把 `retrievedBySession` 那个条件删掉，这里的断言会失败。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'zqblat 自证反例样本',
+      when: '遇到该主题时',
+      summary: 'Zqblat 正文。',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    // 显式检索（同一个会话）→ 这条卡不再是「没被查过」。
+    await toolOf(fake, 'technique_get').execute({ ids: [id] } as never, undefined as never)
+
+    const reply = String(await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    ))
+    assert.doesNotMatch(reply, /Self-reported/u, `检索过就不是自证：${reply}`)
+    const record = (await new MemoryStore(root).readTechniques('global'))[0]
+    assert.equal(record?.successes, 1, '独立检索之后的成功照常计入')
+    assert.equal(record?.status, 'validated')
+    assert.equal(record?.verifications?.[0]?.selfReported, undefined, '不得留下自证标记')
+  } finally {
+    await dispose()
+  }
+})
+
+test('P0.2 自证只拦成功：作者会话报**失败**照旧计入（对自己不利的证词）', async () => {
+  // 只把「成功」降级，是因为自证的问题在于**系统性抬高**：作者偏好自己的产出。
+  // 失败没有这个偏差，而且它正是「这条卡是错的」最直接的证据 —— 拦掉它反而会留住坏知识。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false })
+  try {
+    fake.emit('session/created', fakeSession('s1', '/work/demo'))
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'zqblat 自证失败样本',
+      when: '遇到该主题时',
+      summary: 'Zqblat 正文。',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+
+    const reply = String(await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'failure', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    ))
+    assert.doesNotMatch(reply, /Self-reported/u, '失败不适用自证降级')
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'failure', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    const record = (await new MemoryStore(root).readTechniques('global'))[0]
+    assert.equal(record?.failures, 2, '作者自报的失败必须计入')
+    assert.equal(record?.successes, 0)
+    assert.equal(record?.status, 'deprecated', '两条失败足以判定这条卡不成立')
+    assert.equal(record?.verifications?.[0]?.selfReported, undefined, '失败记录不带自证标记')
+  } finally {
+    await dispose()
+  }
+})
+
+test('P0.2 自证不撤销归档：归档卡得靠**别人**的成功回来', async () => {
+  // `applyOutcome` 里「成功即撤归档」这条也要受自证约束：否则作者回自己一句 success
+  // 就能把已经退出竞争的卡捞回来，归档这道可逆闸门会被自己顶开。
+  //
+  // 这里必须**先让另一个会话读过它**（`retrieveCount: 1`）：否则维护的年龄判据
+  // （`archiveAfterDays: 0`）会在下一次 refresh 里把刚被错误复活的卡又归档回去，
+  // 于是「有没有被错误撤销」在数据上看不出来 —— 用例就没有判别力了。
+  const { fake, root, dispose } = await setup({ reflectOnSessionEnd: false, archiveAfterDays: 0 })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'zqblat 归档自证样本',
+      when: '遇到该主题时',
+      summary: 'Zqblat 正文。',
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    await fake.flush()
+    assert.ok(
+      (await new MemoryStore(root).readTechniques('global'))[0]?.archivedAt !== undefined,
+      '前提：这条草稿已经因死重被归档',
+    )
+
+    const reader = fakeSession('reader', '/work/demo')
+    fake.emit('session/created', reader)
+    fake.emit('session/event', reader, event('turn/start', { turn: 1 }))
+    await toolOf(fake, 'technique_get').execute({ ids: [id] } as never, undefined as never)
+    assert.equal(
+      (await new MemoryStore(root).readTechniques('global'))[0]?.retrieveCount,
+      1,
+      '前提：它已经被别的会话显式读过，于是不再满足死重判据',
+    )
+
+    // 作者会话自证成功 → 不得复活、也不得计入。切回作者会话再报。
+    fake.emit('session/created', seed)
+    fake.emit('session/event', seed, event('turn/start', { turn: 2 }))
+    await toolOf(fake, 'technique_apply').execute(
+      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
+    )
+    await fake.flush()
+    const afterSelf = (await new MemoryStore(root).readTechniques('global'))[0]
+    assert.ok(afterSelf?.archivedAt !== undefined, '自证不得撤销归档')
+    assert.equal(afterSelf?.successes, 0, '自证不得计入 successes')
+
+    // 另一个会话独立成功 → 才是「真的用成功了」，撤归档。
+    await promoteIndependently(fake, id)
+    const afterIndependent = (await new MemoryStore(root).readTechniques('global'))[0]
+    assert.equal(afterIndependent?.archivedAt, undefined, '独立成功应把它从归档里救回来')
+    assert.equal(afterIndependent?.successes, 1)
   } finally {
     await dispose()
   }
@@ -3845,7 +4327,7 @@ test('P4-② technique_export 产出合法 SKILL.md，描述含可检索的触�
       tags: ['orders'],
     } as never, undefined as never))
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0] ?? ''
-    await toolOf(fake, 'technique_apply').execute({ id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never)
+    await promoteIndependently(fake, id)
 
     const report = String(await toolOf(fake, 'technique_export').execute({ id } as never, undefined as never))
     assert.match(report, /Exported/u, report)
@@ -4651,10 +5133,7 @@ async function seedPlantUmlTechnique(fake: FakeContext): Promise<void> {
   } as never, undefined as never))
   const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
   if (id === undefined) throw new Error(`技巧保存应答里没有 id：${saved}`)
-  await toolOf(fake, 'technique_apply').execute(
-    { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never,
-    undefined as never,
-  )
+  await promoteIndependently(fake, id)
 }
 
 test('门槛只认用户原话：当轮写过的 .puml 路径不得把 PlantUML 技巧拉进注入', async () => {
@@ -4685,6 +5164,50 @@ test('门槛只认用户原话：当轮写过的 .puml 路径不得把 PlantUML 
   }
 })
 
+test('P4 遥测落盘：热重载（同一存储根再装一次）之后累计口径仍在，进程口径从 0 起算', async () => {
+  // 动机：这些计数原先是纯进程内变量，插件一热重载就归零，而 `memory_stats` 报的是
+  // 「since start」—— 于是报出来的永远只是刚起步的那几个数。实测踩过一次：首触 297 条
+  // 看着像突破了每会话上限，其实只是同一进程里攒的多次注入。
+  const config = { reflectOnSessionEnd: false, distillOnTurnEnd: false }
+  const first = await setup(config)
+  const root = first.root
+  let second: Awaited<ReturnType<typeof setup>> | undefined
+  try {
+    await seedPlantUmlTechnique(first.fake)
+    const session = fakeSession('s1', '/work/demo')
+    first.fake.emit('session/created', session)
+    first.fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    first.fake.emit('session/event', session, userMessage('puml 里的中文渲染成问号了'))
+    // 让它真的渲染注入段，触发计数。
+    sectionText(first.fake, 'memory-layer:recall')
+    sectionText(first.fake, 'memory-layer:techniques')
+    sectionText(first.fake, 'memory-layer:guidance')
+    for (let round = 0; round < 3; round += 1) await first.fake.flush()
+
+    const persisted = JSON.parse(await readFile(join(root, 'metrics.json'), 'utf8')) as {
+      injections: number
+      gateKept: number
+      advisories: number
+    }
+    assert.ok(persisted.injections > 0, `注入次数必须落盘：${JSON.stringify(persisted)}`)
+    assert.equal(typeof persisted.gateKept, 'number', '门槛放行数必须落盘')
+    assert.equal(typeof persisted.advisories, 'number', '顾问条数必须落盘')
+
+    // 「重启」：同一个存储根上再装一次插件（新的内存计数，同一份真源）。
+    second = await setup(config, true, {}, root)
+    const report = String(await toolOf(second.fake, 'memory_stats').execute({} as never, undefined as never))
+    assert.match(
+      report,
+      new RegExp(`injections=${persisted.injections}\\b`, 'u'),
+      `累计口径应从上一次落盘继续（不是从 0 开始）：${report}`,
+    )
+    assert.match(report, /this process \+0 injection\(s\)/u, '新进程的增量应从 0 起算')
+  } finally {
+    if (second !== undefined) await second.dispose()
+    await first.dispose()
+  }
+})
+
 test('门槛可观测：memory_stats 报出门槛拦下/放行的条数与最近一次判定', async () => {
   const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
   try {
@@ -4699,8 +5222,12 @@ test('门槛可观测：memory_stats 报出门槛拦下/放行的条数与最近
     await fake.flush()
     // 计数只在**真的渲染过注入**时更新：stats 自己不触发渲染，所以先取一次技巧段。
     sectionText(fake, 'memory-layer:techniques')
+    await fake.flush()
     const report = String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never))
-    assert.match(report, /Injection gate: \d+ dropped \/ \d+ kept since start/u, `应报门槛累计：${report}`)
+    // P4 起有两个口径：`since install` 来自落盘的 `metrics.json`（热重载不清零），
+    // `this process` 是本次进程的计数。两者**必须分开报**，混在一起会互相冒充。
+    assert.match(report, /Injection gate: \d+ dropped \/ \d+ kept since install/u, `应报门槛累计：${report}`)
+    assert.match(report, /this process \d+ dropped \/ \d+ kept/u, '进程内口径也要报')
     assert.match(report, /last request [1-9]\d* dropped/u, '这次轮次应至少拦下一条')
   } finally {
     await dispose()
@@ -4826,6 +5353,58 @@ test('动作点顾问：失败结果、无路径无标识符、目录名/扩展�
       { isError: false },
     )
     assert.equal(advisoryOf(unrelated), '')
+  } finally {
+    await dispose()
+  }
+})
+
+test('F2 反例面：失败的调用既不算引用、也不发「你刚用到了」的回报提示', async () => {
+  // 动机：宿主在 `result.isError === true` 时仍会派发 post-execute，而 L1/L2 原本无条件跑。
+  // 后果有两个，第二个更隐蔽：失败那次若已经把「这张卡本会话已检测过」占掉，
+  // 随后真正成功的那次就再也拿不到回报提示 —— 而那正是「用了但没回报」最该被补上的时刻。
+  const { fake, dispose } = await setup({ reflectOnSessionEnd: false, distillOnTurnEnd: false })
+  try {
+    const seed = fakeSession('seed', '/work/demo')
+    fake.emit('session/created', seed)
+    await fake.flush()
+    const saved = String(await toolOf(fake, 'technique_save').execute({
+      name: 'Zqblat 失败样本',
+      when: '遇到该主题时',
+      summary: 'Zqblat 正文。',
+      apiSymbols: ['zqblatFail'],
+    } as never, undefined as never))
+    const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
+    assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
+    await promoteIndependently(fake, id)
+
+    const session = fakeSession('s1', '/work/demo')
+    fake.emit('session/created', session)
+    fake.emit('session/event', session, event('turn/start', { turn: 1 }))
+    fake.emit('session/event', session, userMessage('Zqblat 失败样本怎么用'))
+    await fake.flush()
+    sectionText(fake, 'memory-layer:techniques')
+
+    const action = {
+      name: 'edit',
+      arguments: JSON.stringify({ file_path: 'src/a.ts', new_string: 'await zqblatFail(1)' }),
+    }
+    // 失败调用：不提示、不记账。
+    const failed = advisoryOf(await fake.postExecute(action, { isError: true }))
+    assert.doesNotMatch(failed, /你刚用到了/u, `失败调用不得劝回报：${failed}`)
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Technique references: 0\/\d+ referenced at least once \(0\.0%\), 0 event\(s\)/u,
+      '失败调用不得计入 referenced',
+    )
+
+    // 同一条参数、这次成功：提示必须补上（说明失败那次没有把「已检测」名额占掉）。
+    const ok = advisoryOf(await fake.postExecute(action, { isError: false }))
+    assert.match(ok, /你刚用到了/u, `成功那次仍应提示回报：${ok}`)
+    assert.match(
+      String(await toolOf(fake, 'memory_stats').execute({} as never, undefined as never)),
+      /Technique references: 1\/\d+ referenced at least once/u,
+      '成功那次应把引用记上',
+    )
   } finally {
     await dispose()
   }
@@ -5561,9 +6140,7 @@ test('L5：检索回执带采纳计数与图例（回报的可见产出）', asy
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
     // 抠出来的 id 必须立刻断言，否则失败会漂到下游的 apply 里。
     assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
-    await toolOf(fake, 'technique_apply').execute(
-      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
-    )
+    await promoteIndependently(fake, id)
     const out = String(await toolOf(fake, 'technique_search').execute(
       { query: 'Zqblat 采纳样本' } as never, undefined as never,
     ))
@@ -5590,9 +6167,7 @@ test('L1 引用检测：模型在参数里用到卡片符号就记一次，且�
     const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
     // 抠出来的 id 必须立刻断言，否则失败会漂到下游的 apply 里。
     assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
-    await toolOf(fake, 'technique_apply').execute(
-      { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
-    )
+    await promoteIndependently(fake, id)
 
     const session = fakeSession('s1', '/work/demo')
     fake.emit('session/created', session)
@@ -5658,9 +6233,7 @@ test('L1 引用检测（评审 F1）：同一个符号在 ≥3 张卡上都成�
       } as never, undefined as never))
       const id = /tq_[0-9a-fA-F-]+/u.exec(saved)?.[0]
       assert.ok(id !== undefined, `technique_save 未回传 id：${saved}`)
-      await toolOf(fake, 'technique_apply').execute(
-        { id, outcome: 'success', evidence: GOOD_EVIDENCE } as never, undefined as never,
-      )
+      await promoteIndependently(fake, id)
     }
 
     const session = fakeSession('s1', '/work/demo')

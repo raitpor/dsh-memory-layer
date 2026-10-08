@@ -46,6 +46,7 @@ import {
   MINE_CACHE_FILE,
   SQLITE_INDEX_FILE,
   emptyMetrics,
+  deriveDomainFromTags,
   normalizeDomain,
   techniqueText,
 } from './store.js'
@@ -95,6 +96,7 @@ import {
   failureDenialReason,
   failureDetail,
   failureLessonLine,
+  failureRepeatLine,
   failureTrigger,
   failureWarningLine,
   guardMatches,
@@ -385,6 +387,13 @@ export interface Config {
   failureInjectRelevantOnly?: boolean
   /** 每个会话最多注入几条失败预警/提醒；`0` 表示不限。默认 `5`。 */
   failureInjectPerSession?: number
+  /**
+   * 本会话**预警之后又犯同一个错**时再讲一次（默认 `true`）。
+   *
+   * 关掉它就回到 0.2.x 的旧行为：历史预警每会话每指纹只说一次，复发之后全程沉默 ——
+   * 实测头部两个指纹在回合内复发过 47 / 29 次，而模型一个字都没再收到提醒。
+   */
+  failureRepeatEscalate?: boolean
   /** 失败预警 section 的排序值。 */
   failurePromptOrder?: number
   /** 判定「防住了」的观察窗口（轮次）。 */
@@ -796,6 +805,10 @@ export const Config: z<Config> = z.object({
   // 每个会话最多注入几条失败预警/提醒（0 = 不限）。逐指纹去重只能保证「同一条不重复」，
   // 保证不了总量：指纹一多，一轮 3 条、连着十几轮就花掉上万字符。
   failureInjectPerSession: z.natural().min(0).max(50).default(5),
+  // 预警之后又犯同一个错（本会话内）：再说一次，而且换成「刚刚又犯」的直接口吻。
+  // 逐指纹只讲一次这条规矩是给「还没犯过」的会话省 token 的；本会话**已经犯过**之后，
+  // 沉默的代价是模型在同一个坑里连撞十次也没人提醒（实测回合内复发 47 / 29 次的头部指纹）。
+  failureRepeatEscalate: z.boolean().default(true),
   failurePromptOrder: z.number().default(255),
   failurePreventWindowTurns: z.natural().min(1).max(20).default(3),
   fingerprintTemplateMaxChars: z.natural().min(40).max(2000).default(200),
@@ -904,6 +917,7 @@ interface Settings {
   failureInjectChars: number
   failureInjectRelevantOnly: boolean
   failureInjectPerSession: number
+  failureRepeatEscalate: boolean
   failurePromptOrder: number
   failurePreventWindowTurns: number
   fingerprintTemplateMaxChars: number
@@ -976,14 +990,34 @@ export function apply(ctx: Context, config: Config): void {
     lastMachineTurn?: number
     lastSeenTurn: Map<string, number>
     warned: Map<string, { turn: number; recordId: string }>
-    /** 本会话已经注入过的预警（按指纹），避免同一段话每轮重发。 */
-    advisoriesSent: Set<string>
+    /**
+     * 本会话已经注入过的预警（按指纹）→ 注入时在第几轮。
+     *
+     * 值必须是**轮次**而不只是「发过」：判断「预警之后又犯了」得比较「这条最近一次被观测到的
+     * 轮次」与「上次讲解它的轮次」。只存一个集合的话，先犯、后讲、再渲染，就会被误判成复发。
+     */
+    advisoriesSent: Map<string, number>
+    /**
+     * 本会话**已升级**讲解过的指纹 → 升级发生在第几轮。
+     *
+     * 只用于「同一轮内重复渲染保持同形态」：宿主每轮的 `text()` 是惰性回调，可能被调用多次，
+     * 若第二次渲染因为「基线已推进」而返回空串，取后一次结果的路径就会把这条升级吞掉。
+     */
+    repeatAt: Map<string, number>
+    /** 本会话观测到该指纹几次（用于「刚刚又犯·本会话第 N 次」的 N）。 */
+    observedCount: Map<string, number>
     forgiven: Set<string>
     /** 本地初筛命中的纠偏候选原文，等模型在反思里定夺（见 `applyCorrections`）。 */
     correctionCandidates: string[]
   }>()
   /** 反思（会话内提炼）的累计指标，用于自适应退避与「经验复利」展示。 */
   let metrics: ReflectionMetrics = emptyMetrics()
+  /** 进程启动时读到的累计值：用来把「本次进程」与「累计」两个口径分开报，互不冒充。 */
+  let metricsBaseline: ReflectionMetrics = emptyMetrics()
+  /** 遥测计数器有改动、尚未落盘。 */
+  let metricsDirty = false
+  /** 上次落盘遥测的时间：注入每请求都会发生，必须节流，否则变成写风暴。 */
+  let metricsSavedAt = 0
   /** 所有后台任务；`session/flush` 会等待它们。 */
   const pending = new Set<Promise<void>>()
 
@@ -994,6 +1028,52 @@ export function apply(ctx: Context, config: Config): void {
     })
     pending.add(guarded)
     void guarded.finally(() => pending.delete(guarded))
+  }
+
+  /**
+   * 遥测落盘（P4）的节流窗口。
+   *
+   * 注入是**每请求**都会发生的事，逐次落盘就是写风暴（`store` 每次写入都要拿跨进程锁）；
+   * 而这一层要的是「热重载后账目不清零」，一分钟的粒度足够。会话收尾与反思落盘会强制写。
+   */
+  const METRICS_FLUSH_MS = 60_000
+
+  /**
+   * 把累计遥测写进 `metrics.json`（P4）。
+   *
+   * 三个调用时机：a) 遥测计数变化后的**节流**落盘；b) 会话收尾时的强制落盘；c) 反思落盘
+   * （那条路本来就在写 metrics，顺带把遥测带上）。失败只记 debug：遥测是增益，不能影响会话。
+   *
+   * @param force - 忽略节流窗口，立即写。
+   * @returns 写入完成时 resolve。
+   */
+  const flushMetrics = async (force = false): Promise<void> => {
+    if (!metricsDirty) return
+    const now = Date.now()
+    if (!force && now - metricsSavedAt < METRICS_FLUSH_MS) return
+    metricsDirty = false
+    metricsSavedAt = now
+    try {
+      await store.saveMetrics(metrics)
+    } catch (error) {
+      logger.debug(`memory: could not persist telemetry: ${describe(error)}`)
+    }
+  }
+
+  /**
+   * 记一次「渲染了非空注入块」，并按节流窗口落盘。
+   *
+   * 包在 section 的 `text()` 外面（而不是在每个渲染函数里各写一遍）：四段的返回形态不同，
+   * 但「非空才算注入」这条判据只有一个。
+   */
+  const countInjection = (render: () => string): string => {
+    const text = render()
+    if (text.length > 0) {
+      metrics.injections += 1
+      metricsDirty = true
+      track(flushMetrics())
+    }
+    return text
   }
 
   /** 某个会话工作目录所属的桶键。 */
@@ -1085,10 +1165,29 @@ export function apply(ctx: Context, config: Config): void {
     const now = Date.now()
     // 补丁按 id 收敛（而不是数组追加）：年龄判据与领域上限可能命中同一条记录，用 Map 就天然幂等。
     const patchById = new Map<string, TechniqueRecord>()
-    let archived = 0
-    let renamed = 0
+    // P3 领域回填：没领域的卡，从标签里认一个**本桶已经在用的领域名**（见 `deriveDomainFromTags`）。
+    // 只认已用词表，因此不会造出新领域；认不出来的一律留空（实测真库 125 条无领域里能认出的 33 条）。
+    // 词表在循环前**一次定死**：边回填边扩充词表会让一条卡的标签把另一个标签变成「已用领域」。
+    const domainVocab = new Set<string>()
     for (const record of records) {
       const domain = normalizeDomain(record.domain)
+      if (domain !== undefined) domainVocab.add(domain)
+    }
+    // 回填会改变合并身份（`techniqueKey` 含领域）：若另一条卡与本条**同名同触发条件**，
+    // 回填之后两者撞键，下一次 upsert 只会留下其中一条（`DOMAIN_ALIASES` 那条注释同款危险）。
+    // 真库当前没有同名同触发的卡（500 条 0 组），但这条护栏必须写死：数据损失不可逆。
+    const nameWhenCount = new Map<string, number>()
+    for (const record of records) {
+      const pair = `${record.name}\u0000${record.when}`
+      nameWhenCount.set(pair, (nameWhenCount.get(pair) ?? 0) + 1)
+    }
+    let archived = 0
+    let renamed = 0
+    let derivedDomains = 0
+    for (const record of records) {
+      const normalized = normalizeDomain(record.domain)
+      const ambiguous = (nameWhenCount.get(`${record.name}\u0000${record.when}`) ?? 0) > 1
+      const domain = normalized ?? (ambiguous ? undefined : deriveDomainFromTags(record.tags, domainVocab))
       const domainChanged = domain !== record.domain
       const archivable = isArchivable(record, now, {
         afterDays: settings.archiveAfterDays,
@@ -1096,6 +1195,7 @@ export function apply(ctx: Context, config: Config): void {
       })
       if (!domainChanged && !archivable) continue
       if (domainChanged) renamed += 1
+      if (normalized === undefined && domain !== undefined) derivedDomains += 1
       if (archivable) archived += 1
       // 逐字段条件构造（而不是 `domain: undefined`）：`exactOptionalPropertyTypes` 下，
       // 「显式写 undefined」与「没有这个字段」不是一回事，后者才是「没有领域」。
@@ -1165,6 +1265,7 @@ export function apply(ctx: Context, config: Config): void {
           `memory: technique maintenance on ${directory ?? '(unknown cwd)'} — ${applied} record(s) rewritten `
           + `(${archived} archived${capped === 0 ? '' : `, ${capped} over per-domain cap`}, `
           + `${renamed} domain name(s) normalized`
+          + `${derivedDomains === 0 ? '' : `, ${derivedDomains} derived from tags`}`
           + `${repairedReferences === 0 ? '' : `, ${repairedReferences} pre-epoch reference count(s) reset to 0 (epoch ${REFERENCE_EPOCH})`})`,
         )
       }
@@ -1341,7 +1442,10 @@ export function apply(ctx: Context, config: Config): void {
    */
   const corpusFor = (cwd?: string): RecallDoc[] => corpora.get(bucketKey(resolveCwd(cwd))) ?? []
 
-  track(store.readMetrics().then(loaded => { metrics = loaded }))
+  track(store.readMetrics().then(loaded => {
+    metrics = loaded
+    metricsBaseline = { ...loaded }
+  }))
   track(refresh())
 
   /** 取出（或新建）一个会话的瞬时层状态，并把它记为「当前会话」。 */
@@ -1455,7 +1559,9 @@ export function apply(ctx: Context, config: Config): void {
     lastMachineTurn?: number
     lastSeenTurn: Map<string, number>
     warned: Map<string, { turn: number; recordId: string }>
-    advisoriesSent: Set<string>
+    advisoriesSent: Map<string, number>
+    repeatAt: Map<string, number>
+    observedCount: Map<string, number>
     forgiven: Set<string>
     /** 本地初筛命中的纠偏**候选**原文；是否真是纠偏由模型定夺，见 `persist`。 */
     correctionCandidates: string[]
@@ -1467,7 +1573,9 @@ export function apply(ctx: Context, config: Config): void {
         callArgs: new Map(),
         lastSeenTurn: new Map(),
         warned: new Map(),
-        advisoriesSent: new Set(),
+        advisoriesSent: new Map(),
+        repeatAt: new Map(),
+        observedCount: new Map(),
         forgiven: new Set(),
         correctionCandidates: [],
       }
@@ -1505,6 +1613,10 @@ export function apply(ctx: Context, config: Config): void {
     const session = failureState(state.sessionId)
     session.warned.delete(observation.fingerprint.key)
     session.lastSeenTurn.set(observation.fingerprint.key, currentTurnOf(state))
+    session.observedCount.set(
+      observation.fingerprint.key,
+      (session.observedCount.get(observation.fingerprint.key) ?? 0) + 1,
+    )
 
     const scope = settings.scopeFailure
     const cwd = scope === 'project' ? state.cwd : undefined
@@ -2052,6 +2164,9 @@ export function apply(ctx: Context, config: Config): void {
     // 计数器当场落盘。只在 `session/disposed` 写的话，长驻会话 —— 正是摊销反思要服务的
     // 那类 —— 重启后会把「前期投入」的账目丢掉，`memory_stats` 的复利指标永远是 0。
     await store.saveMetrics(metrics)
+    // 这一笔把遥测也一起写下去了，节流窗口随之刷新（否则会在 60 秒内再写一次同样的内容）。
+    metricsDirty = false
+    metricsSavedAt = Date.now()
   }
 
   /**
@@ -2091,6 +2206,11 @@ export function apply(ctx: Context, config: Config): void {
     gateTally.dropped += dropped.length
     gateTally.lastKept = kept
     gateTally.lastDropped = dropped.length
+    // P4：同一份计数也落盘，热重载之后「门槛到底有没有在干活」还能回答。
+    metrics.gateKept += kept
+    metrics.gateDropped += dropped.length
+    metricsDirty = true
+    track(flushMetrics())
     const detail = dropped.slice(0, 5)
       .map(item => `${item.id.slice(0, 11)}(matched=${item.matched},strong=${item.strong},generic=${item.generic})`)
       .join(' ')
@@ -2342,12 +2462,60 @@ export function apply(ctx: Context, config: Config): void {
    * @param text - 顾问正文（以 `ADVISORY_MARKER` 起头）。
    * @returns 可直接放进 `additionalContexts` 的消息。
    */
-  const advisoryMessage = (text: string): UserMessage => ({
-    id: `ms_${randomUUID()}` as UserMessage['id'],
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: PLUGIN_MESSAGE_SOURCE as UserMessage['source'],
-  })
+  const advisoryMessage = (text: string): UserMessage => {
+    // P4：顾问是**独立消息**通道，条数只能在这里数（注入块那段计数看不到它们）。
+    metrics.advisories += 1
+    metricsDirty = true
+    track(flushMetrics())
+    return {
+      id: `ms_${randomUUID()}` as UserMessage['id'],
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: PLUGIN_MESSAGE_SOURCE as UserMessage['source'],
+    }
+  }
+
+  /**
+   * ① **技巧**条目的重复形态：技巧的「全文」就是索引行（真正的正文始终要 `technique_get`），
+   * 所以这里省掉的是「做法 / 何时用 / 状态」那一整行，而不是正文。
+   *
+   * 措辞刻意**不沿用**召回段那句「full text delivered」—— 技巧这一路从来没给过正文，只有索引行；
+   * 写成「全文已给」会让模型以为手里已有步骤与示例，于是不再 `technique_get`（评审 F1）。
+   * 召回段与技巧段都调它，因此两段对同一条卡的措辞必然一致。
+   *
+   * @param hit - 命中的技巧（id 与语料正文）。
+   * @param record - 技巧记录；查不到记录时退化成 id + 首句。
+   * @returns 指针行正文。
+   */
+  const repeatTechniquePointer = (hit: { id: string; text: string }, record: TechniqueRecord | undefined): string =>
+    (record !== undefined
+      ? `${record.id.slice(0, 11)} ${record.name}`
+      : `${hit.id.slice(0, 11)} ${compactStandingText(hit.text)}`)
+    + ' — unchanged, index line given earlier in this session (technique_get for the full card)'
+
+  /**
+   * ① 重复条目的指针形态：可寻址的把手 + 首句（上限与常驻紧凑形态同口径，默认 60 字符）。
+   * 技巧给「id + 名称」（正文本来就要 `technique_get`），其余给「id + 首句」—— 有 id 才能被
+   * `memory_search` / `memory_forget` 这类工具对上。
+   *
+   * 放在这里（而不是某个段自己的渲染函数里）是因为**召回段与技巧段共用**这套 ① 记账：
+   * 同一张卡在这一轮可能由任一段渲染（`injectedTechniqueHits` 保证不会两段同时渲染同一条），
+   * 两段必须用同一份 `repeatSent` 与同一句措辞，否则「已给过」这件事在两段之间会各说各话。
+   *
+   * ⚠️ **技巧条目转交 {@link repeatTechniquePointer}**（评审 F1）：召回段里的技巧条目同样只发
+   * 索引行（②c 之后），从没给过 `summary` / `steps` / `pitfalls`。这里若沿用「full text delivered」，
+   * 模型会以为手里已有全文 —— 而这些卡恰恰是技巧段放不下的第 N 条起，`pitfalls` / `verify`
+   * 从未进过上下文，且不带 `technique_get` 的入口提示。生产实证：真会话注入里抓到过
+   * `(technique) tq_7ce809a7 … — unchanged, full text delivered earlier in this session`。
+   *
+   * @param hit - 命中的条目（id 与正文）。
+   * @param record - 技巧记录；非技巧条目为 `undefined`。
+   * @returns 指针行正文。
+   */
+  const repeatPointerLine = (hit: { id: string; text: string }, record: TechniqueRecord | undefined): string =>
+    record !== undefined
+      ? repeatTechniquePointer(hit, record)
+      : `${hit.id.slice(0, 11)} ${compactStandingText(hit.text)} — unchanged, full text delivered earlier in this session`
 
   const renderInjection = (query: string): string => {
     // DEF-12：召回语料里含 `toTechniqueDocs(...)`，而 `recall()` **不看状态** —— 草稿技巧
@@ -2444,16 +2612,9 @@ export function apply(ctx: Context, config: Config): void {
       || (standingTurn !== undefined && shownBefore.turn === standingTurn)
       || (fullEvery > 0 && standingTurn !== undefined && shownBefore.turn !== undefined
         && standingTurn - shownBefore.turn >= fullEvery)
-    // ① 重复条目的指针形态：可寻址的把手 + 首句（上限与常驻紧凑形态同口径，默认 60 字符）。
-    // 技巧给「id + 名称」（正文本来就要 `technique_get`），其余给「id + 首句」—— 有 id 才能被
-    // `memory_search` / `memory_forget` 这类工具对上。
-    const repeatPointerLine = (hit: { id: string; text: string }, record: TechniqueRecord | undefined): string =>
-      (record !== undefined
-        ? `${record.id.slice(0, 11)} ${record.name}`
-        : `${hit.id.slice(0, 11)} ${compactStandingText(hit.text)}`)
-      + ' — unchanged, full text delivered earlier in this session'
     // ①：本会话已完整给过、内容未变的条目改发指针形态。注入块就在对话历史里，模型上一轮已经读过；
     // 逐轮重印是纯付费（实测 674 个条目 / 7,618 次出现，**86.1% 的条目字符是重复**）。
+    // 指针的两种形态（召回段 / 技巧段）与理由见 `repeatPointerLine` / `repeatTechniquePointer`。
     const repeatSession = current?.sessionId
     const sentForSession = settings.recallRepeatCompact && repeatSession !== undefined
       ? repeatSent.get(repeatSession)
@@ -2583,6 +2744,11 @@ export function apply(ctx: Context, config: Config): void {
    * 过滤链：状态（草稿与废弃不注入）→ 分区 → 技术栈 → BM25 + 置信度。
    * 敏感级别不在这里过滤 —— `confidential` 在**写入时**就进不了全局域。
    *
+   * ①（0.2.x）：本会话已经给过索引行、且内容未变的条目改发**指针**（id + 名称 + 去哪儿取正文）。
+   * 依据是实测：技巧段占插件注入成本 31.8%，其中**同一会话内重复给的索引行**占该段 36.5% ——
+   * 「哪条技巧和当前任务相关」在一个会话里是稳定属性，逐轮重印整行是纯付费。同一轮内重复渲染、
+   * 内容变化、以及每 `standingRuleFullEveryTurns` 轮仍给完整索引行（与召回段同一套记账与节奏）。
+   *
    * @param query - 召回查询词（通常是当前会话最近的用户输入）。
    * @returns 注入文本；无可注入内容时为空串。
    */
@@ -2591,14 +2757,48 @@ export function apply(ctx: Context, config: Config): void {
     const hits = injectedTechniqueHits(query)
     if (hits.length === 0) return ''
     noteSurfaced(hits.map(hit => hit.id))
+    const repeatSession = current?.sessionId
+    const sentForSession = settings.recallRepeatCompact && repeatSession !== undefined
+      ? repeatSent.get(repeatSession)
+      : undefined
+    // 与召回段用同一个「第几轮」时钟：两个段共用 `standingRuleFullEveryTurns`，各算各的会不一致。
+    const repeatTurn = current?.turns.at(-1)?.turn
+    const fullEvery = settings.standingRuleFullEveryTurns
+    const entries: { id: string; hash: string; line: string; full: boolean }[] = []
     const lines = hits.map((hit, index) => {
       const record = techniqueById.get(hit.id)
-      const body = record === undefined ? hit.text : techniqueInjectionLine(record)
-      return `${index + 1}. ${sanitizeForInjection(body)}`
+      const hash = contentHash(hit.text)
+      const previous = sentForSession?.get(hit.id)
+      const showFull = previous === undefined
+        || previous.hash !== hash
+        || (repeatTurn !== undefined && previous.fullTurn === repeatTurn)
+        || (fullEvery > 0 && repeatTurn !== undefined && previous.fullTurn !== undefined
+          && repeatTurn - previous.fullTurn >= fullEvery)
+      const body = showFull
+        ? (record === undefined ? hit.text : techniqueInjectionLine(record))
+        : repeatTechniquePointer(hit, record)
+      const line = `${index + 1}. ${sanitizeForInjection(body)}`
+      entries.push({ id: hit.id, hash, line, full: showFull })
+      return line
     })
     // 没注册工具时别提工具名：指向一个不存在的工具只会让模型白试一轮。
     const extraHeader = settings.registerTools ? TECHNIQUE_ADOPTION_NOTICE : []
-    return renderBlock(TECHNIQUE_BLOCK, extraHeader, lines, settings.techniqueChars)
+    const rendered = renderBlock(TECHNIQUE_BLOCK, extraHeader, lines, settings.techniqueChars)
+    // 记账与召回段同一条规矩：只有**真的完整落进块里**的条目才推进，且只有全文那一次推进
+    // `fullTurn`（指针形态若也推进，「每 N 轮给一次完整索引行」会被自己顶掉）。
+    if (repeatSession !== undefined && entries.length > 0) {
+      const state = repeatSent.get(repeatSession) ?? new Map<string, { hash: string; fullTurn: number | undefined }>()
+      for (const entry of entries) {
+        if (!rendered.includes(entry.line)) continue
+        const previous = state.get(entry.id)
+        state.set(entry.id, {
+          hash: entry.hash,
+          fullTurn: entry.full ? repeatTurn : previous?.fullTurn,
+        })
+      }
+      repeatSent.set(repeatSession, state)
+    }
+    return rendered
   }
 
   /**
@@ -2867,14 +3067,30 @@ export function apply(ctx: Context, config: Config): void {
       session?.lastSeenTurn.has(record.fingerprint.key) === true
 
     let skippedIrrelevant = 0
+    // P2：本会话**预警之后又犯了同一个错**的指纹。它们不参与「每会话每指纹只讲一次」的去重 ——
+    // 那条规矩是给「还没犯过」的会话省 token 的；本会话已经犯过之后，沉默只会让模型在同一个
+    // 坑里连撞下去（实测头部两个指纹回合内复发 47 / 29 次，而它一个字都没再收到提醒）。
+    const repeatedKeys = new Set<string>()
+    const isRepeated = (record: FailureRecord): boolean => {
+      if (!settings.failureRepeatEscalate) return false
+      const key = record.fingerprint.key
+      const advisedAt = session?.advisoriesSent.get(key)
+      if (advisedAt === undefined) return false
+      // 同一轮内重渲染：保持同形态（否则取后一次渲染结果的路径会把这条升级吞掉）。
+      if (session?.repeatAt.get(key) === turn) return true
+      // 否则只看「上次讲它之后，又真的犯了一次没有」—— 只重发不重犯不算复发。
+      return (session?.lastSeenTurn.get(key) ?? -1) > advisedAt
+    }
     const candidates = [...failureById.values()].filter(record => {
       if (!(shouldWarn(record, escalation))) return false
       if (session?.forgiven.has(record.fingerprint.key) ?? false) return false
+      const repeated = isRepeated(record)
       // B7：同一条预警在本会话里只发一次。它是给「还没犯这个错」的会话看的；
       // 同一场景每轮重发同一段文字，模型已经读过，只是噪声与开销
       // （最多 3 条 × 1500 字符/请求）。场景真的再次发生时，机械失败会被重新观测到，
       // 那时走的是「你又犯了」的计数路径，而不是重发这条历史预警。
-      if (session?.advisoriesSent.has(record.fingerprint.key) ?? false) return false
+      // P2 起，那个「你又犯了」的路径真的会讲一句（`failureRepeatLine`），不再沉默。
+      if (!repeated && (session?.advisoriesSent.has(record.fingerprint.key) ?? false)) return false
       if (!failureApplies(record, state.stack)) return false
       if (!(record.scope === 'project' || record.partition === settings.partition)) return false
       // 与本会话动作无关的预警不讲当下的事，只是在花 token —— 除非本会话**确实犯过**
@@ -2889,6 +3105,7 @@ export function apply(ctx: Context, config: Config): void {
         skippedIrrelevant += 1
         return false
       }
+      if (repeated) repeatedKeys.add(record.fingerprint.key)
       return true
     })
 
@@ -2912,12 +3129,23 @@ export function apply(ctx: Context, config: Config): void {
       .slice(0, cap)
     const recentFiles = state.turns.at(-1)?.files ?? []
     const warnings = ranked.map(record => {
+      const repeated = repeatedKeys.has(record.fingerprint.key)
       if (session !== undefined && !session.warned.has(record.fingerprint.key)) {
         session.warned.set(record.fingerprint.key, { turn, recordId: record.id })
       }
-      session?.advisoriesSent.add(record.fingerprint.key)
+      // 预警之后又犯：升级成「刚刚又犯」，并**推进** `advisoriesSent` 的轮次戳 ——
+      // 基线不推进的话，这条升级会在之后每一轮重发（模型只是没再犯，不该被反复训话）。
+      if (repeated) session?.repeatAt.set(record.fingerprint.key, turn)
+      session?.advisoriesSent.set(record.fingerprint.key, turn)
       // 只在本会话确实见过这个指纹时才给出现场文件：全局域记录不带项目路径。
       const files = hitThisSession(record) ? recentFiles : []
+      if (repeated) {
+        return sanitizeForInjection(failureRepeatLine(
+          record,
+          session?.observedCount.get(record.fingerprint.key) ?? 2,
+          files,
+        ))
+      }
       return sanitizeForInjection(failureWarningLine(record, files))
     })
     const lessons = renderLessons(state, cap - warnings.length)
@@ -2961,7 +3189,7 @@ export function apply(ctx: Context, config: Config): void {
       .sort((left, right) => right.lastSeen - left.lastSeen)
       .slice(0, budget)
       .map(record => {
-        session?.advisoriesSent.add(record.fingerprint.key)
+        session?.advisoriesSent.set(record.fingerprint.key, currentTurnOf(state))
         return sanitizeForInjection(failureLessonLine(record))
       })
   }
@@ -3511,8 +3739,14 @@ export function apply(ctx: Context, config: Config): void {
           + `(firstContactAdvisoryMax=${settings.firstContactAdvisoryMax}, ${settings.firstContactAdvisory ? 'on' : 'off'})`,
         // 门槛拦下多少条是**看不见的**（不注入就没有痕迹），因此单独报一行：排查
         // 「不相关技巧仍被注入」时，先看这里是不是 0 —— 0 说明门槛根本没在干活。
-        `Injection gate: ${gateTally.dropped} dropped / ${gateTally.kept} kept since start `
-          + `(last request ${gateTally.lastDropped} dropped / ${gateTally.lastKept} kept)`,
+        // P4：累计口径从 `metrics.json` 读（热重载不再清零），进程内口径单独标出 ——
+        // 两个口径混在一行里冒充过（实测把「同一进程攒的 297 条首触」误读成突破每会话上限）。
+        `Injection gate: ${metrics.gateDropped} dropped / ${metrics.gateKept} kept since install `
+          + `(this process ${gateTally.dropped} dropped / ${gateTally.kept} kept; `
+          + `last request ${gateTally.lastDropped} dropped / ${gateTally.lastKept} kept)`,
+        `Telemetry (persisted): injections=${metrics.injections}, advisories=${metrics.advisories}, `
+          + `this process +${metrics.injections - metricsBaseline.injections} injection(s) `
+          + `/+${metrics.advisories - metricsBaseline.advisories} advisory message(s)`,
         `Recurring failures: ${[...failureById.values()].filter(record => record.status !== 'deprecated').length} active, `
           + `${[...failureById.values()].filter(record => record.status === 'deprecated').length} resolved, `
           + `${[...failureById.values()].reduce((sum, record) => sum + record.prevented, 0)} prevented`,
@@ -3545,6 +3779,8 @@ export function apply(ctx: Context, config: Config): void {
     record: TechniqueRecord
     outcome: 'success' | 'failure'
     evidence: string
+    /** 这次成功是作者会话自己报的自证（不计入 `successes`，见 {@link TechniqueVerification.selfReported}）。 */
+    selfReported: boolean
   }
 
   /**
@@ -3588,14 +3824,24 @@ export function apply(ctx: Context, config: Config): void {
     // 私有标识占位 → 区外绝对路径占位），再收敛长度。两者都在校验之后：
     // 校验看全文，避免把写在末尾的具体锚点截掉后反被判为不合格（DEF-15/16）。
     const stored = clampVerificationEvidence(sanitizeForStore(check.value, current, current?.cwd))
+    // P0.2 判据（两条都成立才算自证）：
+    //  1. 这张卡是**本会话**写的 —— `evidence` 里带着本会话的来源会话记录（写入时必盖）；
+    //  2. 本会话**没有显式检索过**它 —— 没走过 `technique_search` / `technique_get`。
+    // 第 2 条是给「先写过、后来在别处的任务里真的查回它并验收」留的门：那是一次独立的检索动作，
+    // 不是顺手给自己刚写的东西盖章。
+    const selfReported = outcome === 'success'
+      && current?.sessionId !== undefined
+      && record.evidence.some(item => item.kind === 'session' && item.sessionId === current?.sessionId)
+      && retrievedBySession.get(current.sessionId)?.has(record.id) !== true
     const updated = applyOutcome(record, {
       outcome,
       evidence: stored,
       at: Date.now(),
       ...(current?.sessionId === undefined ? {} : { sessionId: current.sessionId }),
       ...(current?.cwd === undefined ? {} : { cwd: current.cwd }),
+      ...(selfReported ? { selfReported: true } : {}),
     })
-    return { record: updated, outcome, evidence: stored }
+    return { record: updated, outcome, evidence: stored, selfReported }
   }
 
   /**
@@ -3609,6 +3855,12 @@ export function apply(ctx: Context, config: Config): void {
     const kept = record.verifications?.length ?? 0
     const head = `Recorded ${prepared.outcome} for "${record.name}" `
       + `(status ${record.status}, confidence ${confidenceOf(record).toFixed(2)}).`
+      // 自证必须**当场说清为什么没加分**，否则模型会以为回报生效了、下次照样自报成功；
+      // 同时给出可执行的那一步：换个会话、或先真的检索一次，再报同样的结果。
+      + (prepared.selfReported
+        ? ' Self-reported: this session wrote the technique and never retrieved it, so it is not counted'
+          + ' toward validation or promotion; it counts once another session retrieves it and reports the same result.'
+        : '')
     return withEvidence ? `${head}\nEvidence #${kept}: ${prepared.evidence}` : head
   }
 
@@ -4099,7 +4351,7 @@ export function apply(ctx: Context, config: Config): void {
     // `lastMachineKey` 与纠偏候选，先删会让它新建一个空状态并直接 return（DEF-02）。
     track(
       settleSession(state)
-        .then(() => store.saveMetrics(metrics))
+        .then(() => flushMetrics(true))
         .catch(error => {
           logger.warn(`memory: session ${id} settle failed: ${describe(error)}`)
         })
@@ -4143,20 +4395,20 @@ export function apply(ctx: Context, config: Config): void {
       promptCtx.effect(() => systemPrompt.context({
         name: PROMPT_SECTION_NAME,
         order: settings.promptOrder,
-        text: () => renderInjection(current?.turns.at(-1)?.user ?? ''),
+        text: () => countInjection(() => renderInjection(current?.turns.at(-1)?.user ?? '')),
       }), 'memory-layer:prompt-injection')
       if (settings.techniques) {
         promptCtx.effect(() => systemPrompt.context({
           name: TECHNIQUE_SECTION_NAME,
           order: settings.techniquePromptOrder,
-          text: () => renderTechniqueInjection(current?.turns.at(-1)?.user ?? ''),
+          text: () => countInjection(() => renderTechniqueInjection(current?.turns.at(-1)?.user ?? '')),
         }), 'memory-layer:technique-injection')
       }
       if (settings.failures) {
         promptCtx.effect(() => systemPrompt.context({
           name: FAILURE_SECTION_NAME,
           order: settings.failurePromptOrder,
-          text: () => renderFailureInjection(),
+          text: () => countInjection(() => renderFailureInjection()),
         }), 'memory-layer:failure-injection')
       }
       // 指引段排在最后：它是「该怎么做」的元指令，放在数据块之后离决策点更近。
@@ -4165,7 +4417,7 @@ export function apply(ctx: Context, config: Config): void {
         promptCtx.effect(() => systemPrompt.context({
           name: GUIDANCE_SECTION_NAME,
           order: settings.guidancePromptOrder,
-          text: () => renderGuidance(),
+          text: () => countInjection(() => renderGuidance()),
         }), 'memory-layer:guidance-injection')
       }
     })
@@ -4188,9 +4440,20 @@ export function apply(ctx: Context, config: Config): void {
       // L1：引用检测。**独立于顾问开关** —— 它是观测，不是提示：即使顾问关掉，
       // 也要能回答「推给模型的技巧到底有没有出现在它随后的动作里」。
       // 放在 post-execute（不是 pre-execute）是因为这里能确认这次调用真的发生了。
-      toolCtx.effect(() => toolCtx.on('tools/post-execute', async (exec, _result, next) => {
+      toolCtx.effect(() => toolCtx.on('tools/post-execute', async (exec, result, next) => {
         const decision = await next()
         try {
+          // 评审 F2：**失败调用整条跳过** —— 观测（`referenced`）与提示（L2）都不做。
+          //
+          // 宿主在 `result.isError === true` 时仍会派发本钩子，若照样记账，一次失败的
+          // `edit`/`bash` 会给卡片记一次 `referenced`，并弹出「你刚用到了 X，若确实奏效就回报一下」
+          // —— 后半句是在劝模型为一次没成功的调用背书，与我们「证据必须可证伪」的要求冲突；
+          // 前半句则把「试过」混进「被用上」，而这个计数是要喂 L5 排序的。
+          //
+          // 还有一个只有跳过才躲得掉的副作用：同一会话对同一张卡**只检测一次**
+          // （`referencedBySession` 的去重集合）。失败那次若已经把它标成「已检测」，
+          // 随后真正成功的那次就再也拿不到回报提示了 —— 而那正是「用了但没回报」最该被补上的时刻。
+          if (result.isError === true) return decision
           const referenced = await detectReferences(exec)
           // L2：刚被引用就顺手提示回报 —— 这是"用了但没回报"那个断层唯一的补救点。
           if (!settings.referenceNudge || referenced.length === 0) return decision
@@ -4374,6 +4637,7 @@ function resolveSettings(config: Config): Settings {
     failureInjectChars: config.failureInjectChars ?? 1500,
     failureInjectRelevantOnly: config.failureInjectRelevantOnly ?? true,
     failureInjectPerSession: config.failureInjectPerSession ?? 5,
+    failureRepeatEscalate: config.failureRepeatEscalate ?? true,
     failurePromptOrder: config.failurePromptOrder ?? 255,
     failurePreventWindowTurns: config.failurePreventWindowTurns ?? 3,
     fingerprintTemplateMaxChars: config.fingerprintTemplateMaxChars ?? 200,
@@ -4848,7 +5112,8 @@ function formatTechniqueDetail(record: TechniqueRecord): string {
     lines.push(`Evidence: ${record.evidence.map(item => [item.kind, item.repo, item.role, item.hint].filter(Boolean).join('/')).join(', ')}`)
   }
   for (const verification of record.verifications ?? []) {
-    lines.push(`Verification (${verification.outcome}, ${new Date(verification.at).toISOString()}): ${verification.evidence}`)
+    // 自证的验收要**在正文里就能看出来**：否则读卡的人会把「作者自己报的成功」当成独立验收。
+    lines.push(`Verification (${verification.outcome}${verification.selfReported === true ? ', self-reported by the authoring session, not counted toward validation' : ''}, ${new Date(verification.at).toISOString()}): ${verification.evidence}`)
   }
   return sanitizeForText(lines.join('\n'))
 }

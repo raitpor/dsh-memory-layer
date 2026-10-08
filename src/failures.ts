@@ -403,6 +403,44 @@ export function deriveTrigger(input: {
 }
 
 /**
+ * 渲染「**本会话里又犯了**」的升级行（P2）。
+ *
+ * 与 {@link failureWarningLine} 的分工是**讲过去 vs 讲当下**：那条报的是跨会话累计重复次数
+ * （「已重复 N 次」），这条报的是「你刚刚才被提醒过，又原样撞了一次」。存在的理由是一条实测
+ * 出来的沉默：历史预警按「每会话每指纹一次」去重，复发只更新计数、不改变任何输出 ——
+ * 真库 3 天窗口里头部两个指纹的回合内复发是 47 / 29 次，而模型在这期间一个字都没再收到提醒。
+ * 同一条预警每轮重发确实是噪声，但**复发**不是重发：它是新信息，而且是唯一还能打断循环的信息。
+ *
+ * 因此这条刻意比历史预警更直接：先给「刚刚」与「第几次」，再给「换掉上一次的做法」，
+ * 并把现场文件排在被截断的尾部之前。
+ *
+ * @param record - 失败记录。
+ * @param sessionOccurrences - 本会话观测到这个指纹的次数（≥1）。
+ * @param recentFiles - 最近一次失败现场涉及的文件（工作区相对路径）。
+ * @returns 单行文本。
+ */
+export function failureRepeatLine(
+  record: FailureRecord,
+  sessionOccurrences: number,
+  recentFiles: readonly string[] = [],
+): string {
+  const times = Math.max(1, sessionOccurrences)
+  const parts = [
+    `[预警之后又犯${times > 1 ? `·本会话第 ${times} 次` : ''}] ${record.symptom}`,
+  ]
+  // 有 remedy 时必须说「换掉上一次的做法」而不是泛泛的「正确做法」：此刻模型刚试过一遍，
+  // 它需要的正是「别再照刚才那样做」。
+  parts.push(record.remedy.length > 0
+    ? `换掉上一次的做法：${record.remedy}`
+    : '不要再原样重试：先定位根因，换一种做法再试')
+  if (record.enforcement === 'ask') parts.push('同类调用已升级为派发前询问')
+  if (recentFiles.length > 0) parts.push(`上次现场：${recentFiles.slice(0, 4).join(', ')}`)
+  if (record.fingerprint.tool !== undefined) parts.push(`工具：${record.fingerprint.tool}`)
+  parts.push(`id ${record.id}`)
+  return parts.join(' — ')
+}
+
+/**
  * 渲染一条**已解决**失败的提前提醒。
  *
  * 与 {@link failureWarningLine} 的区别在语气与用途：那条是「你又犯了」，这条是

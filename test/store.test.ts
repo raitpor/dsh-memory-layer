@@ -13,6 +13,7 @@ import {
   EPISODIC_FILE,
   LOCK_STALE_MS,
   MAX_SEMANTIC_PER_SCOPE,
+  MAX_TECHNIQUES_PER_SCOPE,
   MemoryStore,
   SEMANTIC_FILE,
   StoreIntegrityError,
@@ -21,11 +22,12 @@ import {
   semanticKey,
   slugify,
   scopeDirName,
+  deriveDomainFromTags,
   normalizeDomain,
   techniqueKey,
 } from '../src/store.js'
 import { createCodec } from '../src/crypto.js'
-import type { EpisodicRecord, TechniqueDraft } from '../src/types.js'
+import type { EpisodicRecord, TechniqueDraft, TechniqueRecord } from '../src/types.js'
 
 /** 建一个临时记忆库，并在用例结束时清理。 */
 async function withStore(run: (store: MemoryStore, root: string) => Promise<void>): Promise<void> {
@@ -462,6 +464,135 @@ test('updateTechniques：一批更新合并成一次写入', async () => {
     assert.equal(await store.updateTechniques([ghost, { ...before[1]!, name: 'again' }]), 1, '未知 id 跳过')
     assert.equal((await store.readTechniques('global')).find(r => r.id === before[1]!.id)?.name, 'again')
   })
+})
+
+// ---- P0.1：容量淘汰按「保留价值」而不是按时间 ------------------------------
+
+/**
+ * 造 `count` 条同批写入的草稿，把第 `valuable` 条中的前若干条伪装成「有价值的**最老**卡」。
+ *
+ * 伪装只能用 `updateTechniques` 直接改记录：`upsertTechniques` 造出来的新卡一律
+ * `retrieveCount`/`successes` 为 0，而本组用例要检验的正是「有使用痕迹」这一档。
+ *
+ * @param store - 记忆库。
+ * @param count - 记录条数。
+ * @param valuable - 前多少条算「有价值的活卡」。
+ * @returns 全部记录（已按 ts 拉开：有价值的那批**最老**）。
+ */
+async function seedWithValuableHead(
+  store: MemoryStore,
+  count: number,
+  valuable: number,
+): Promise<TechniqueRecord[]> {
+  const created = await store.upsertTechniques(
+    Array.from({ length: count }, (_, i) => draft(i)),
+    { scope: 'global', sessionId: 's1', provenance: 'model', now: 5_000 },
+  )
+  const patched = created.records.map((record, index) => (index < valuable
+    // 头部这批：最老（纯 ts 先进先出必定先丢它们），但被检索过、也验收成功过。
+    ? { ...record, ts: 1_000 + index, status: 'validated' as const, retrieveCount: 1, successes: 1 }
+    : { ...record, ts: 2_000 + index }))
+  assert.equal(await store.updateTechniques(patched), count, '伪装必须先落盘')
+  return patched
+}
+
+test('容量淘汰按价值：库满时丢的是没用过的草稿，而不是最老的活卡', async () => {
+  // 动机（实测）：淘汰原本是 `sort(ts).slice(-500)`，即「时间先进先出」。真库 3 天窗口里每天挤掉
+  // 约 33 条，而近 3 天**注入过**的 100 个卡 id 已有 13 个不在真源里 —— 老 ≠ 没用。
+  await withStore(async (store) => {
+    const seeded = await seedWithValuableHead(store, MAX_TECHNIQUES_PER_SCOPE, 10)
+    const valuableIds = new Set(seeded.slice(0, 10).map(record => record.id))
+
+    const added = await store.upsertTechniques([draft(9_999)], {
+      scope: 'global', sessionId: 's2', provenance: 'model', now: 9_000,
+    })
+    const kept = await store.readTechniques('global')
+    assert.equal(kept.length, MAX_TECHNIQUES_PER_SCOPE, `仍应正好在上限：${kept.length}`)
+    assert.ok(
+      [...valuableIds].every(id => kept.some(record => record.id === id)),
+      '被检索/被验收成功过的老卡一条都不能少（纯 ts 先进先出会先丢这 10 条）',
+    )
+    assert.ok(kept.some(record => record.id === added.records[0]?.id), '新卡必须进得来')
+    // 丢掉的必须是一条**没有使用痕迹**的草稿：它的 ts 比活卡新，所以只有「按价值」才会选中它。
+    const gone = seeded.find(record => !kept.some(item => item.id === record.id))
+    assert.ok(gone !== undefined, '应恰好淘汰一条')
+    assert.equal(gone.retrieveCount, undefined, '被淘汰的那条不得有任何检索记录')
+    assert.equal(gone.successes, 0, '被淘汰的那条不得有成功记录')
+  })
+})
+
+test('容量淘汰按价值：已归档的卡最先让位，即使它是最新写的', async () => {
+  // 归档是**可逆**的「退出竞争」（见 isArchivable），容量淘汰是不可逆的删除：
+  // 先丢已经走过归档这一步、且没人把它救回来的卡，才不会误删还活着的知识。
+  await withStore(async (store) => {
+    const seeded = await seedWithValuableHead(store, MAX_TECHNIQUES_PER_SCOPE, 0)
+    const newest = seeded[seeded.length - 1]!
+    // 把**最新**的那条标成已归档：纯 ts 先进先出永远轮不到它。
+    assert.equal(
+      await store.updateTechniques([{ ...newest, ts: 9_000, archivedAt: 8_000 }]),
+      1,
+    )
+    await store.upsertTechniques([draft(9_999)], {
+      scope: 'global', sessionId: 's2', provenance: 'model', now: 9_500,
+    })
+    const kept = await store.readTechniques('global')
+    assert.equal(kept.length, MAX_TECHNIQUES_PER_SCOPE)
+    assert.ok(kept.some(record => record.id === newest.id) === false, '已归档的卡应最先被淘汰')
+  })
+})
+
+test('容量淘汰：单次批量写入越过上限时，按同一套价值排序丢，且回报的新建数与存活一致', async () => {
+  // 反方向：新卡豁免不能变成「上限可被一次批量写入越过」。库里没有旧卡可丢时，刚写入的卡自己让位。
+  await withStore(async (store) => {
+    const oversized = MAX_TECHNIQUES_PER_SCOPE + 40
+    const result = await store.upsertTechniques(
+      Array.from({ length: oversized }, (_, i) => draft(i)),
+      { scope: 'global', sessionId: 's1', provenance: 'model', now: 1_000 },
+    )
+    assert.equal(result.records.length, MAX_TECHNIQUES_PER_SCOPE, '上限是硬约束')
+    assert.equal(
+      (await store.readTechniques('global')).length,
+      MAX_TECHNIQUES_PER_SCOPE,
+      '落盘也必须正好在上限',
+    )
+    assert.equal(result.created, MAX_TECHNIQUES_PER_SCOPE, '回报的新建数必须是**存活**的条数，不能虚报')
+  })
+})
+
+test('容量淘汰：库里全是活卡时，新写的草稿仍然进得来（让位的是一张活卡，而不是它自己）', async () => {
+  // 「新卡豁免」不是锦上添花：库满且残留的都是有价值的卡时，若按纯价值排序连新卡一起算，
+  // 刚写进来的草稿（价值最低）会**当场**被自己挤掉 —— 库从此停止生长，而调用方还报「新增 1 条」。
+  await withStore(async (store) => {
+    const seeded = await seedWithValuableHead(store, MAX_TECHNIQUES_PER_SCOPE, MAX_TECHNIQUES_PER_SCOPE)
+    const added = await store.upsertTechniques([draft(9_999)], {
+      scope: 'global', sessionId: 's2', provenance: 'model', now: 9_000,
+    })
+    const kept = await store.readTechniques('global')
+    assert.equal(added.created, 1, '新建数应为 1（虚报会让调用方以为写进去了）')
+    assert.ok(
+      kept.some(record => record.id === added.records[0]?.id),
+      '新草稿必须真的在库里',
+    )
+    assert.equal(kept.length, MAX_TECHNIQUES_PER_SCOPE, '上限不变')
+    assert.equal(
+      seeded.filter(record => !kept.some(item => item.id === record.id)).length,
+      1,
+      '恰好让位一张旧卡',
+    )
+  })
+})
+
+test('P3 deriveDomainFromTags：只认已经在用的领域名，别名走同一套归一化', () => {
+  // 规则刻意保守：**不从任意标签造新领域**。真库实测 125 条无领域卡里，能这样认出来的只有 33 条，
+  // 其余 92 条的标签是技术栈与版本（`minecraft` / `porting` / `1.21.1`）—— 拿它们当领域会让
+  // 领域词表凭空多出几十个只用过一次的名字。
+  const known = new Set(['gradle', 'plantuml', 'dsh-plugin'])
+  assert.equal(deriveDomainFromTags(['zzz', 'gradle'], known), 'gradle')
+  assert.equal(deriveDomainFromTags(['puml'], known), 'plantuml', '别名表与 normalizeDomain 同口径')
+  assert.equal(deriveDomainFromTags(['Minecraft', 'Porting'], known), undefined, '栈标签不是领域名')
+  assert.equal(deriveDomainFromTags([], known), undefined)
+  assert.equal(deriveDomainFromTags(['gradle'], new Set()), undefined, '空词表认不出任何东西')
+  assert.equal(deriveDomainFromTags(['plantuml', 'gradle'], known), 'plantuml', '保序：取第一个认得出的')
 })
 
 test('normalizeDomain（0.2.10）：折叠大小写与空白、查别名表、空值即「无领域」', () => {
